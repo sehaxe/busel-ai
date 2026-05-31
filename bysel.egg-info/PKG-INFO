@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: bysel
+Version: 0.1.0
+Summary: Bysel - Sovereign 1-bit Omni-LLM
+Requires-Python: >=3.14
+Description-Content-Type: text/markdown
+Requires-Dist: aiogram>=3.28.2
+Requires-Dist: fastapi>=0.136.3
+Requires-Dist: flash-linear-attention>=0.5.0
+Requires-Dist: maturin>=1.13.3
+Requires-Dist: numpy>=2.4.6
+Requires-Dist: pandas>=3.0.3
+Requires-Dist: pyarrow>=24.0.0
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: torch>=2.12.0
+Requires-Dist: typer>=0.26.4
+Requires-Dist: uvicorn>=0.48.0

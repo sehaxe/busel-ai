@@ -1,0 +1,13 @@
+[package]
+name = "bysel_rust_io"
+version = "3.3.0"
+edition = "2021"
+
+[lib]
+name = "bysel_rust_io"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+rayon = "1.8"
+memmap2 = "0.9"  # Memory-mapped files

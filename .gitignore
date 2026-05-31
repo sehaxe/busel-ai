@@ -1,0 +1,22 @@
+# Виртуальное окружение и кэш Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Кэш компилятора Rust (очень важно)
+target/
+Cargo.lock
+
+# Папки данных и результатов обучения
+data_train/
+checkpoints/
+*.pt
+
+# Временные файлы отладки и профайлера
+profiler_test_data.txt
+debug_nan_dummy.txt
+profile_trace.json
+debug_test.txt
