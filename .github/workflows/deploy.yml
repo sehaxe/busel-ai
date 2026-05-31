@@ -2,9 +2,10 @@ name: Deploy Docs
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ] # 🎯 Поддержка обеих веток (и main, и master)
     paths:
       - 'docs/**' # Запускать сборку только при изменении документации
+  workflow_dispatch: # 🎯 Позволяет запускать сборку вручную одной кнопкой на GitHub!
 
 permissions:
   contents: read
