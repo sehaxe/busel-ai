@@ -5,40 +5,44 @@ global:
   precision: "bf16"
 
 profiles:
-  ziaziulia:
+  shpak:
     model:
-      d_model: 256
-      n_layers: 12
-      n_heads: 4
-      expert_hidden: 512
-      num_experts: 4
+      d_model: 384          
+      n_layers: 8           
+      n_heads: 6            
+      expert_hidden: 768    
+      num_experts: 4        
       top_k: 2
       vocab_size: 259
     data:
       data_path: "data_train"
-      chunk_size: 512
-      batch_size: 4
+      chunk_size: 4096      
+      batch_size: 4        
     training:
-      max_steps: 15000
-      learning_rate_muon: 0.0004
-      learning_rate_adamw: 0.00004
+      max_steps: "auto"        # Автокалькулятор Шиншиллы
+      warmup_steps: "auto"     # Автоматически (5% от max_steps)
+      min_lr_ratio: 0.1        # Минимальный LR на финише — 10% от пикового
+      learning_rate_muon: 0.0006
+      learning_rate_adamw: 0.00006
       weight_decay: 0.1
 
   zubr:
     model:
-      d_model: 1792
-      n_layers: 32
-      n_heads: 16
-      expert_hidden: 2048
-      num_experts: 64
+      d_model: 384          
+      n_layers: 12          
+      n_heads: 6            
+      expert_hidden: 1024   
+      num_experts: 8        
       top_k: 2
       vocab_size: 259
     data:
       data_path: "data_train"
-      chunk_size: 8192
-      batch_size: 32
+      chunk_size: 16384     
+      batch_size: 2         
     training:
-      max_steps: 80000
-      learning_rate_muon: 0.0004
-      learning_rate_adamw: 0.00004
+      max_steps: "auto"        # Автокалькулятор Шиншиллы
+      warmup_steps: "auto"     # Автоматически (5% от max_steps)
+      min_lr_ratio: 0.1        # Минимальный LR на финише — 10% от пикового
+      learning_rate_muon: 0.0006
+      learning_rate_adamw: 0.00006
       weight_decay: 0.1

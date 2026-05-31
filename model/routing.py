@@ -80,19 +80,21 @@ class BulbaTernaryTitanMoE(nn.Module):
         self.w_gate_blackboard = BitLinear_a4_8(d_model, d_model)
         self.w_read_blackboard = BitLinear_a4_8(d_model, d_model)
 
-    def forward(self, x, aux_loss_weight=0.05, z_loss_weight=0.001):  # 🎯 СБАЛАНСИРОВАНО
+    def forward(self, x, progress=0.0, aux_loss_weight=0.05, z_loss_weight=0.001):
         nvtx_range_push("Bysel_MoE_Experts_Forward")
         B, T, D = x.shape
         
-        # 1. SHARED EXPERTS
+        # 🎯 ДИНАМИЧЕСКИЙ ВЕС ШТРАФА БАЛАНСИРОВКИ (Dynamic MoE Scheduling):
+        # На старте (progress < 0.1) даем роутеру полную свободу выбора экспертов (aux_loss = 0.01)
+        # К середине обучения линейно повышаем вес до 0.08 для строгой балансировки
+        if progress < 0.1:
+            current_aux_weight = 0.01
+        else:
+            current_aux_weight = min(0.08, 0.01 + 0.175 * (progress - 0.1))
+            
         h_bb = (self.shared_experts[0](x) + self.shared_experts[1](x)) / 2.0
+        x_enriched = x + torch.sigmoid(self.w_gate_blackboard(x)) * self.w_read_blackboard(h_bb)
         
-        # 2. BLACKBOARD MEMORY
-        gate_signal = torch.sigmoid(self.w_gate_blackboard(x))
-        read_signal = self.w_read_blackboard(h_bb)
-        x_enriched = x + gate_signal * read_signal
-        
-        # 3. ANTICIPATORY ROUTING
         router_logits = self.router(x_enriched.detach()).to(dtype=x_enriched.dtype)
         
         if self.training:
@@ -101,12 +103,10 @@ class BulbaTernaryTitanMoE(nn.Module):
         
         z_loss = z_loss_weight * torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
         
-        # 4. TOP-K SELECTION
         routing_weights = F.softmax(router_logits, dim=-1)
         topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # 5. ROUTED EXPERTS
         routed_output = torch.zeros_like(x_enriched)
         
         expert_masks = []
@@ -127,7 +127,6 @@ class BulbaTernaryTitanMoE(nn.Module):
                 weights = expert_weights_list[i][mask].unsqueeze(-1)
                 routed_output[mask] = out * weights
         
-        # 6. LOAD BALANCING LOSS
         tokens_per_expert = torch.zeros(self.num_experts, device=x.device)
         for i in range(self.num_experts):
             tokens_per_expert[i] = expert_masks[i].sum().float()
@@ -135,7 +134,7 @@ class BulbaTernaryTitanMoE(nn.Module):
         f_i = tokens_per_expert / (B * T * self.top_k)
         P_i = routing_weights.mean(dim=(0, 1))
         
-        load_balance_loss = aux_loss_weight * self.num_experts * torch.sum(f_i * P_i)
+        load_balance_loss = current_aux_weight * self.num_experts * torch.sum(f_i * P_i)
         
         nvtx_range_pop()
         return h_bb + routed_output, load_balance_loss + z_loss

@@ -1,6 +1,6 @@
 """
-⚙️ ОПТИМИЗИРОВАННЫЙ BYSEL LOSS ENGINE v3.6
-Поддерживает вычисления в низком разрешении (bfloat16) и Liger Kernel для CUDA.
+⚙️ BYSEL LOSS ENGINE v4.0 (MTP-4 STABILIZED)
+Вычисляет многоголовый причинный лосс MTP-4 с затухающим взвешиванием.
 """
 
 import torch
@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    # Импорт эффективного Fused Cross Entropy из Liger Kernel для Linux/CUDA
     from liger_kernel.transformers.functional import liger_cross_entropy
     HAS_LIGER = True
 except ImportError:
@@ -22,22 +21,49 @@ class ByselLossEngine:
     def compute_pretrain_loss(self, logits, targets, mtp_logits_list=None, mtp_targets_list=None):
         """
         Вычисление основного лосса в низком разрешении (bfloat16 / float16).
+        Интегрирован расчет потерь для дополнительных предсказательных голов MTP-4.
         """
-        # Гарантируем, что таргеты находятся на одном устройстве с логитами (MPS/CUDA)
         targets_device = targets.to(logits.device).long()
         
+        # 1. Расчет основного лосса для головы t+1 (весовой коэффициент = 1.0)
         if HAS_LIGER and logits.device.type == "cuda":
-            # Быстрое ядро Liger без лишних аллокаций на GPU
             loss = liger_cross_entropy(
                 logits.reshape(-1, self.vocab_size),
                 targets_device.reshape(-1)
             )
         else:
-            # Нативный fallback для Mac (MPS) и CPU в исходной точности
             loss = F.cross_entropy(
                 logits.reshape(-1, self.vocab_size),
                 targets_device.reshape(-1)
             )
+            
+        # 2. 🎯 РАСЧЕТ И ВЗВЕШИВАНИЕ ПОТЕРЬ MTP-4:
+        # Если переданы логиты и таргеты для голов предсказания будущего (t+2, t+3, t+4),
+        # мы рассчитываем лосс для каждой головы и суммируем их с затухающим коэффициентом.
+        if mtp_logits_list is not None and mtp_targets_list is not None:
+            # Веса важности предсказания каждого последующего шага (t+2, t+3, t+4)
+            mtp_weights = [0.5, 0.25, 0.125]
+            
+            for i, (m_logits, m_targets) in enumerate(zip(mtp_logits_list, mtp_targets_list)):
+                if m_logits is None or m_targets is None:
+                    continue
+                
+                m_targets_device = m_targets.to(m_logits.device).long()
+                
+                if HAS_LIGER and m_logits.device.type == "cuda":
+                    m_loss = liger_cross_entropy(
+                        m_logits.reshape(-1, self.vocab_size),
+                        m_targets_device.reshape(-1)
+                    )
+                else:
+                    m_loss = F.cross_entropy(
+                        m_logits.reshape(-1, self.vocab_size),
+                        m_targets_device.reshape(-1)
+                    )
+                
+                # Аккуратно добавляем взвешенную потерю головы к общему лоссу
+                loss = loss + m_loss * mtp_weights[i]
+                
         return loss
 
     def compute_sft_loss(self, logits, targets, thought_mask):

@@ -1,5 +1,6 @@
 """
-📚 BYSEL PIPELINE v3.6 - Stable Cross-Platform Loader
+📚 BYSEL PIPELINE v5.0 - Parallel Stream Interleaving Loader
+Поддерживает динамическую сборку и параллельное перемешивание данных на лету в памяти.
 """
 
 import torch
@@ -20,6 +21,12 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 
 class PythonByteStreamer:
@@ -46,11 +53,12 @@ class PythonByteStreamer:
 
 
 class ByselOmnivoreTextExtractor:
-    def __init__(self, file_path, chunk_size, start_offset=0):
+    def __init__(self, file_path, chunk_size, start_offset=0, img_size=(32, 32)):
         self.file_path = file_path
         self.chunk_size = chunk_size
         self.position = start_offset
-        self.buffer = bytearray()
+        self.img_size = img_size
+        self.raw_bytes = bytearray()
         
         if file_path.endswith('.parquet'):
             if not HAS_PANDAS:
@@ -58,33 +66,50 @@ class ByselOmnivoreTextExtractor:
             df = pd.read_parquet(file_path)
             text_col = self._detect_text_column(df)
             full_text = "\n".join(text_col.astype(str).tolist())
-            self.raw_bytes = full_text.encode('utf-8')
+            self.raw_bytes = bytearray(full_text.encode('utf-8'))
             
         elif file_path.endswith('.jsonl'):
-            extracted_texts = []
             with open(file_path, "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        try:
-                            data = json.loads(line)
-                            text_val = self._recursive_extract(data)
-                            if text_val.strip():
-                                extracted_texts.append(text_val.strip())
-                        except json.JSONDecodeError:
-                            continue
-            full_text = "\n".join(extracted_texts)
-            self.raw_bytes = full_text.encode('utf-8')
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                        
+                        if "image" in data and HAS_PIL:
+                            img_path = data["image"]
+                            if not os.path.isabs(img_path):
+                                img_path = os.path.join(os.path.dirname(file_path), img_path)
+                                
+                            if os.path.exists(img_path):
+                                img = Image.open(img_path).convert("RGB")
+                                img = img.resize(self.img_size)
+                                img_bytes = img.tobytes()
+                                
+                                self.raw_bytes.append(256)  # <IMG_START>
+                                self.raw_bytes.extend(img_bytes)
+                                self.raw_bytes.append(257)  # <IMG_END>
+                                
+                        text_val = self._recursive_extract_excluding_image(data)
+                        if text_val.strip():
+                            self.raw_bytes.extend(text_val.strip().encode('utf-8'))
+                            self.raw_bytes.extend(b"\n")
+                            
+                    except Exception:
+                        continue
         else:
             with open(file_path, "rb") as f:
-                self.raw_bytes = f.read()
+                self.raw_bytes = bytearray(f.read())
 
-    def _recursive_extract(self, obj):
+    def _recursive_extract_excluding_image(self, obj):
         if isinstance(obj, str):
+            if obj.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+                return ""
             return obj
         elif isinstance(obj, dict):
-            return "\n".join([self._recursive_extract(v) for v in obj.values() if v])
+            return "\n".join([self._recursive_extract_excluding_image(v) for k, v in obj.items() if k != "image" and v])
         elif isinstance(obj, list):
-            return "\n".join([self._recursive_extract(item) for item in obj if item])
+            return "\n".join([self._recursive_extract_excluding_image(item) for item in obj if item])
         else:
             return ""
 
@@ -134,29 +159,27 @@ class RustByteStreamDataset(IterableDataset):
             raise ValueError(
                 f"\n❌ [ОШИБКА ДАННЫХ]: В папке '{data_path}' не найдено подходящих файлов для обучения!\n"
             )
-            
-        self.current_file_idx = start_file_idx
-        self.current_byte_offset = start_byte_offset
 
     def __iter__(self):
-        # Безопасное разделение файлов между воркерами
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
             files_to_process = [f for i, f in enumerate(self.files) if i % num_workers == worker_id]
-            start_file = 0
         else:
             files_to_process = self.files
-            start_file = self.start_file_idx
 
-        shuffle_buffer = []
-        buffer_size = 50
-        
-        for file_idx in range(start_file, len(files_to_process)):
-            self.current_file_idx = file_idx
-            file_path = files_to_process[file_idx]
-            offset = self.start_byte_offset if file_idx == start_file else 0
+        if not files_to_process:
+            return
+
+        # Перемешиваем список файлов на старте итерации для разнообразия воркеров
+        random.shuffle(files_to_process)
+
+        # 🎯 ТЕХНОЛОГИЯ ПАРАЛЛЕЛЬНОГО СМЕШИВАНИЯ ПОТОКОВ (Interleaving):
+        # Открываем файловые стримеры для ВСЕХ файлов одновременно.
+        active_streamers = []
+        for file_path in files_to_process:
+            offset = self.start_byte_offset if (self.start_file_idx < len(self.files) and file_path == self.files[self.start_file_idx]) else 0
             
             use_rust_streamer = (
                 not file_path.endswith(('.parquet', '.jsonl')) 
@@ -168,19 +191,35 @@ class RustByteStreamDataset(IterableDataset):
             else:
                 streamer = ByselOmnivoreTextExtractor(file_path, self.chunk_size, offset)
                 
-            while True:
-                chunk = streamer.next_chunk()
-                if chunk is None:
-                    break
-                self.current_byte_offset = streamer.get_position()
-                shuffle_buffer.append((chunk, self.current_file_idx, self.current_byte_offset))
+            active_streamers.append((streamer, file_path))
+
+        shuffle_buffer = []
+        buffer_size = 50
+        
+        # Цикл работает до тех пор, пока есть активные (непустые) файлы
+        while active_streamers:
+            # Случайно выбираем один из активных стримеров (перемешивание на лету)
+            idx = random.randint(0, len(active_streamers) - 1)
+            streamer, file_path = active_streamers[idx]
+            
+            chunk = streamer.next_chunk()
+            if chunk is None:
+                # Файл полностью прочитан — закрываем его стример
+                active_streamers.pop(idx)
+                continue
                 
-                if len(shuffle_buffer) >= buffer_size:
-                    import random
-                    random.shuffle(shuffle_buffer)
-                    yield shuffle_buffer.pop(0)
-                    
-        import random
+            # Определяем глобальный индекс файла для сохранения чекпоинта
+            pseudo_file_idx = self.files.index(file_path) if file_path in self.files else 0
+            byte_offset = streamer.get_position()
+            
+            shuffle_buffer.append((chunk, pseudo_file_idx, byte_offset))
+            
+            # Постепенно выдаем чанки через буфер случайного перемешивания
+            if len(shuffle_buffer) >= buffer_size:
+                random.shuffle(shuffle_buffer)
+                yield shuffle_buffer.pop(0)
+                
+        # Выдаем остатки буфера после прочтения всех файлов
         random.shuffle(shuffle_buffer)
         for item in shuffle_buffer:
             yield item
@@ -190,7 +229,6 @@ def collate_bysel_batch(batch):
     chunks = [item[0] for item in batch]
     file_indices = [item[1] for item in batch]
     byte_offsets = [item[2] for item in batch]
-    # 🎯 КЛЮЧЕВОЙ ФИКС: Создаем тензоры в формате int32 на CPU
     batch_tensors = torch.stack([torch.tensor(c, dtype=torch.int32) for c in chunks])
     return batch_tensors, file_indices[-1], byte_offsets[-1]
 
@@ -199,7 +237,6 @@ def get_bysel_dataloader(data_path, chunk_size, batch_size, start_file_idx=0, st
     dataset = RustByteStreamDataset(data_path, chunk_size, start_file_idx, start_byte_offset)
     use_pin = torch.cuda.is_available()
     
-    # Кроссплатформенное автоопределение воркеров
     if num_workers is None:
         if platform.system() == "Linux" and torch.cuda.is_available():
             num_workers = min(4, os.cpu_count() or 1)

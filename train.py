@@ -1,13 +1,13 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║ BYSEL TRAINING ENGINE v3.6 - Production Cross-Platform Orchestrator      ║
+║ BYSEL TRAINING ENGINE v5.1 - Progress-Driven Auto-Chinchilla Curriculum  ║
 ║                                                                           ║
-║ 🎯 КЛЮЧЕВЫЕ ОПТИМИЗАЦИИ:                                                  ║
-║   • Бескомпромиссная кроссплатформенная стабильность (CUDA / MPS / CPU)    ║
-║   • Исключена утечка данных (Causal Target stride slicing)                ║
-║   • Логирование мгновенной интервальной скорости (без задержек шага 0)    ║
-║   • Нативный float16 на macOS Mac и bfloat16 на NVIDIA CUDA               ║
-║   • Выключение медленного MPS-шума в Autopilot                            ║
+║ 🎯 KEY OPTIMIZATIONS:                                                     ║
+║   • Sequence Length Warmup (Curriculum: 1024 -> 2048 -> 4096)             ║
+║   • Dynamic MoE Router Scheduling (Adaptive aux_loss weighting)           ║
+║   • Dynamic Chinchilla max_steps auto-calculator                          ║
+║   • ByselAutoPilot v6.0 (Predictive Gradient Dampening & Adaptive AGC)    ║
+║   • CUDA-only Gradient Checkpointing (safeguards MPS RNG state bug)       ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,8 +17,10 @@ import time
 import signal
 import argparse
 import yaml
+import json
+import math
 
-# Добавляем корень проекта в sys.path
+# Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
@@ -44,13 +46,18 @@ class ByselConfig:
         self.data_path = profile_dict["data"]["data_path"]
         self.chunk_size = profile_dict["data"]["chunk_size"]
         self.batch_size = profile_dict["data"]["batch_size"]
-        self.max_steps = profile_dict["training"]["max_steps"]
-        self.learning_rate_muon = profile_dict["training"]["learning_rate_muon"]
-        self.learning_rate_adamw = profile_dict["training"]["learning_rate_adamw"]
         self.weight_decay = profile_dict["training"]["weight_decay"]
         
+        # Безопасно загружаем параметры планировщика с дефолтами
+        self.max_steps = profile_dict["training"].get("max_steps", "auto")
+        self.warmup_steps = profile_dict["training"].get("warmup_steps", "auto")
+        self.min_lr_ratio = float(profile_dict["training"].get("min_lr_ratio", 0.1))
+        
+        self.learning_rate_muon = profile_dict["training"].get("learning_rate_muon", 0.0006)
+        self.learning_rate_adamw = profile_dict["training"].get("learning_rate_adamw", 0.00006)
+        
         if self.d_model % self.n_heads != 0:
-            raise ValueError(f"Размерность d_model ({self.d_model}) должна делиться на n_heads ({self.n_heads})!")
+            raise ValueError(f"d_model dimension ({self.d_model}) must be divisible by n_heads ({self.n_heads})!")
 
 
 def enforce_stability(seed=42):
@@ -63,7 +70,7 @@ def enforce_stability(seed=42):
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         print("   ⚙️  CUDA: TF32=ON, cuDNN.benchmark=ON")
     elif torch.backends.mps.is_available():
-        print("   ⚙️  MPS: Ускорение Metal Performance Shaders активно")
+        print("   ⚙️  MPS: Metal Performance Shaders acceleration is active")
 
 
 def detect_device():
@@ -75,17 +82,12 @@ def detect_device():
 
 
 def build_targets(byte_batch, input_length, stride=4):
-    """
-    Создает казуально корректные таргеты для MTP-4 без утечки данных.
-    Использует векторизованный шаг среза по тензору.
-    """
     targets = byte_batch[:, stride::stride][:, :input_length]
     
     if targets.shape[1] < input_length:
         pad_size = input_length - targets.shape[1]
         targets = torch.nn.functional.pad(targets, (0, pad_size), value=0)
     
-    # Сдвинутые таргеты для дополнительных голов MTP
     mtp_targets = []
     for shift in [1, 2, 3]:
         mtp_target = byte_batch[:, (stride + shift)::stride][:, :input_length]
@@ -98,70 +100,85 @@ def build_targets(byte_batch, input_length, stride=4):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bysel v3.6 - Production Training")
-    parser.add_argument("--resume", type=str, default=None, help="Путь к чекпоинту")
-    parser.add_argument("--profile", type=str, default="ziaziulia", help="Профиль из YAML")
-    parser.add_argument("--no-compile", action="store_true", help="Отключить torch.compile")
-    parser.add_argument("--no-checkpointing", action="store_true", help="Отключить gradient checkpointing")
+    parser = argparse.ArgumentParser(description="Bysel v5.1 - Production Training")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming")
+    parser.add_argument("--profile", type=str, default="shpak", help="Profile name from default.yaml")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--no-checkpointing", action="store_true", help="Disable gradient checkpointing")
     args = parser.parse_args()
 
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  BYSEL TRAINING ENGINE v3.6 - Stable Cross-Platform Production║")
+    print("║  BYSEL TRAINING ENGINE v5.1 - Adaptive Curriculum Active      ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
     
     enforce_stability()
     
-    # === ЗАГРУЗКА КОНФИГА ===
     with open("configs/default.yaml", "r") as f:
         full_config = yaml.safe_load(f)
     
     if args.profile not in full_config["profiles"]:
-        raise ValueError(f"Профиль '{args.profile}' не найден в configs/default.yaml")
+        raise ValueError(f"Profile '{args.profile}' not found in configs/default.yaml")
     
     cfg = ByselConfig(full_config["profiles"][args.profile])
     device = detect_device()
     
-    print(f"\n🚀 Запуск [Bysel-{args.profile}] на {device.upper()}")
+    print(f"\n🚀 Launching [Bysel-{args.profile}] on {device.upper()}")
     print(f"📚 Vocab: {cfg.vocab_size}, d_model: {cfg.d_model}, layers: {cfg.n_layers}")
-    print(f"🧠 Experts: {cfg.num_experts}, Batch: {cfg.batch_size}, Chunk: {cfg.chunk_size}")
+    print(f"🧠 Experts: {cfg.num_experts}, Batch: {cfg.batch_size}, Target Context: {cfg.chunk_size}")
     
     if not os.path.exists(cfg.data_path):
-        raise FileNotFoundError(f"Путь '{cfg.data_path}' не существует")
+        raise FileNotFoundError(f"Path '{cfg.data_path}' does not exist")
 
     start_step = 0
     start_file_idx = 0
     start_byte_offset = 0
 
-    # === ИНИЦИАЛИЗАЦИЯ МОДЕЛИ ===
-    print("\n🔧 Инициализация модели...")
+    # === MODEL INITIALIZATION ===
+    print("\n🔧 Initializing model...")
     patcher = StridedFastBLTPatcher(d_model=cfg.d_model).to(device)
     model = ByselModel(cfg).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"   ✅ {total_params:,} параметров ({total_params * 2 / 1024**2:.2f} MB)")
+    print(f"   ✅ {total_params:,} parameters ({total_params * 2 / 1024**2:.2f} MB)")
     
-    # Gradient Checkpointing (только на CUDA)
+    # === DYNAMIC MAX STEPS CALCULATION ===
+    if cfg.max_steps == "auto" or cfg.max_steps is None:
+        tokens_per_step = cfg.batch_size * cfg.chunk_size
+        chinchilla_target_tokens = 80 * total_params
+        cfg.max_steps = math.ceil(chinchilla_target_tokens / tokens_per_step)
+        print(f"   📊 [CHINCHILLA AUTO-PLANNER] Activated:")
+        print(f"      • Target Volume: {chinchilla_target_tokens:,} byte-tokens")
+        print(f"      • Planned Steps: {cfg.max_steps:,}")
+    else:
+        cfg.max_steps = int(cfg.max_steps)
+
+    # Gradient Checkpointing (CUDA only)
+    # На macOS/MPS отключаем из-за бага PyTorch с сохранением генератора шума MoE-роутера
     if device == "cuda" and not args.no_checkpointing:
         model.enable_gradient_checkpointing()
     
-    # torch.compile (только на CUDA)
     if device == "cuda" and not args.no_compile:
         print("🔧 torch.compile (max-autotune)...")
         try:
             model = torch.compile(model, mode="max-autotune", fullgraph=False)
             patcher = torch.compile(patcher, mode="max-autotune", fullgraph=False)
-            print("   ✅ Компиляция успешна")
+            print("   ✅ Compilation successful")
         except Exception as e:
             print(f"   ⚠️  Compile failed: {e}")
     
-    # === ОПТИМИЗАТОРЫ И СИСТЕМА ПИТАНИЯ ===
     opt_engine = ByselOptimizerEngine(model, lr_muon=cfg.learning_rate_muon, lr_adamw=cfg.learning_rate_adamw)
-    autopilot = ByselAutoPilot(opt_engine)
+    autopilot = ByselAutoPilot(
+        opt_engine,
+        max_lr_muon=cfg.learning_rate_muon,
+        max_lr_adamw=cfg.learning_rate_adamw,
+        target_wd=cfg.weight_decay,
+        warmup_steps=cfg.warmup_steps,
+        min_lr_ratio=cfg.min_lr_ratio
+    )
     loss_engine = ByselLossEngine(cfg.vocab_size)
 
-    # Восстановление из чекпоинта
     if args.resume and os.path.exists(args.resume):
-        print(f"\n💾 Восстановление чекпоинта: {args.resume}")
+        print(f"\n💾 Resuming checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         patcher.load_state_dict(checkpoint['patcher_state_dict'])
@@ -171,11 +188,15 @@ def main():
             start_file_idx = checkpoint.get('file_idx', 0)
             start_byte_offset = checkpoint.get('byte_offset', 0)
 
-    # === ДАТАЛОАДЕР ===
-    print("\n📚 Инициализация DataLoader...")
+    # === DATALOADER PREPARATION ===
+    print("\n📚 Initializing Curriculum DataLoader...")
+    # Обучение по расписанию длины контекста (Sequence Length Warmup):
+    # Начинаем с 1/4 от целевого размера контекста
+    current_chunk_size = cfg.chunk_size // 4
+    
     dataloader = get_bysel_dataloader(
         cfg.data_path, 
-        chunk_size=cfg.chunk_size, 
+        chunk_size=current_chunk_size, 
         batch_size=cfg.batch_size,
         start_file_idx=start_file_idx,
         start_byte_offset=start_byte_offset
@@ -185,9 +206,8 @@ def main():
     global_current_byte_offset = start_byte_offset
     global_current_step = start_step
 
-    # Обработчики аварийной остановки (SIGINT)
     def save_emergency_checkpoint(signum, frame):
-        print("\n\n💾 [SIGINT] Аварийное сохранение состояния...")
+        print("\n\n💾 [SIGINT] Emergency saving state...")
         os.makedirs("checkpoints", exist_ok=True)
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -201,32 +221,27 @@ def main():
     signal.signal(signal.SIGINT, save_emergency_checkpoint)
     signal.signal(signal.SIGTERM, save_emergency_checkpoint)
 
-    # === ОПРЕДЕЛЕНИЕ ТОЧНОСТИ AUTOCAST ===
     autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float16
     autocast_enabled = (device in ["cuda", "mps"])
     
-    # === CUDA STREAM PREFETCH ===
     use_cuda_stream = (device == "cuda")
     prefetch_stream = None
     dataloader_iter = iter(dataloader)
     current_batch = None
     
     if use_cuda_stream:
-        print("\n⚡ CUDA Stream prefetch активирован")
         prefetch_stream = torch.cuda.Stream()
         try:
             current_batch = next(dataloader_iter)
         except StopIteration:
             return
     else:
-        print("\n📥 Загрузка первого батча...")
         try:
             current_batch = next(dataloader_iter)
         except StopIteration:
             return
 
-    # === СТАРТ ТРЕНИРОВОЧНОГО ЦИКЛА ===
-    print("\n🔥 Обучение запущено.")
+    print("\n🔥 Training started.")
     print("=" * 100)
     
     start_time = time.time()
@@ -237,7 +252,35 @@ def main():
         step = start_step + step_offset
         global_current_step = step
         
-        # Шаг 1. Предвыборка (Prefetch)
+        progress = float(step) / float(cfg.max_steps)
+        
+        # 🎯 ДИНАМИЧЕСКИЙ CURRICULUM ДЛИНЫ КОНТЕКСТА:
+        new_chunk_size = current_chunk_size
+        if progress < 0.15:
+            new_chunk_size = cfg.chunk_size // 4
+        elif progress < 0.35:
+            new_chunk_size = cfg.chunk_size // 2
+        else:
+            new_chunk_size = cfg.chunk_size
+            
+        # Если пришел момент смены фазы — переинициализируем DataLoader, сохраняя позицию в датасете
+        if new_chunk_size != current_chunk_size:
+            print(f"\n📈 [CURRICULUM UPGRADE]: Progress {progress*100:.1f}% -> Scaling context window from {current_chunk_size} to {new_chunk_size}!")
+            current_chunk_size = new_chunk_size
+            dataloader = get_bysel_dataloader(
+                cfg.data_path, 
+                chunk_size=current_chunk_size, 
+                batch_size=cfg.batch_size,
+                start_file_idx=global_current_file_idx,
+                start_byte_offset=global_current_byte_offset
+            )
+            dataloader_iter = iter(dataloader)
+            try:
+                current_batch = next(dataloader_iter)
+            except StopIteration:
+                print("📝 Dataset ended during Curriculum switch.")
+                break
+        
         next_batch = None
         if use_cuda_stream:
             with torch.cuda.stream(prefetch_stream):
@@ -252,12 +295,10 @@ def main():
                 next_batch = None
         
         if current_batch is None:
-            print("\n🎉 Датасет полностью пройден.")
+            print("\n🎉 Dataset completely processed.")
             break
             
         byte_batch, last_file_idx, last_byte_offset = current_batch
-        
-        # 🎯 УНИВЕРСАЛЬНЫЙ ФИКС: Перенос батча на MPS/CUDA/CPU во избежание Placeholder-ошибок
         byte_batch = byte_batch.to(device, non_blocking=True)
         
         global_current_file_idx = last_file_idx
@@ -266,7 +307,7 @@ def main():
         opt_engine.zero_grad(set_to_none=True)
         input_bytes = byte_batch[:, :-patcher.stride] if byte_batch.shape[1] > patcher.stride else byte_batch
         
-        # Шаг 2. Прямой проход (Forward)
+        # Step 2. Forward pass (передаем текущий прогресс для MoE-роутера)
         with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=autocast_enabled):
             patches = patcher(input_bytes)
             T_patches = patches.shape[1]
@@ -275,7 +316,7 @@ def main():
                 byte_batch, T_patches, stride=patcher.stride
             )
             
-            (logits_t1, logits_t2, logits_t3, logits_t4), aux_loss = model(patches, mtp_targets)
+            (logits_t1, logits_t2, logits_t3, logits_t4), aux_loss = model(patches, mtp_targets, progress=progress)
             
             loss = loss_engine.compute_pretrain_loss(
                 logits_t1, targets,
@@ -283,29 +324,28 @@ def main():
                 mtp_targets
             ) + aux_loss.float()
         
-        # Шаг 3. Обратный проход (Backward)
+        # Step 3. Backward pass
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
-        # Накладываем шум только на CUDA (на MPS randn_like критически медленный)
+        # Адаптивный клиппинг и превентивное подавление взрывов
+        dynamic_clip = autopilot.before_step(model, step, cfg.max_steps)
+        
         if device == "cuda":
             autopilot.inject_noise(model)
             
         current_lr, noise_scale = autopilot.update_parameters(step, loss.item(), cfg.max_steps)
         opt_engine.step()
         
-        # Ожидание асинхронного стрима
         if use_cuda_stream:
             torch.cuda.current_stream().wait_stream(prefetch_stream)
         
         current_batch = next_batch
         
-        # Шаг 4. Быстрое интервальное логирование
+        # Step 4. Fast interval logging
         if step % 10 == 0:
             current_time = time.time()
-            tokens_processed = (step_offset + 1) * cfg.batch_size * cfg.chunk_size
+            tokens_processed = (step_offset + 1) * cfg.batch_size * current_chunk_size
             
-            # Вычисление чистой мгновенной скорости (без задержек шага 0)
             if step_offset == 0:
                 elapsed_interval = current_time - start_time
                 tokens_interval = tokens_processed
@@ -322,6 +362,7 @@ def main():
             aux_val = aux_loss.item()
             
             vram = ""
+            vram_mb = 0.0
             if device == "cuda":
                 vram_mb = torch.cuda.max_memory_allocated() / 1024**2
                 vram = f" | VRAM: {vram_mb:.0f}MB"
@@ -330,14 +371,27 @@ def main():
                 vram = f" | VRAM: {vram_mb:.0f}MB"
             
             print(
-                f"Step {step:05d} | "
+                f"Step {step:05d}/{cfg.max_steps:05d} | "
                 f"Total: {loss_val:.2f} | "
                 f"Aux: {aux_val:.2f} | "
                 f"LR: {current_lr:.5f} | "
-                f"{speed:.0f} tok/s{vram}"
+                f"Clip: {dynamic_clip:.2f} | "
+                f"{speed:.0f} tokens/s{vram}"
             )
 
-        # Шаг 5. Плановый чекпоинт
+            metrics = {
+                "step": step,
+                "loss": loss_val,
+                "aux_loss": aux_val,
+                "lr": current_lr,
+                "speed": speed,
+                "vram": vram_mb
+            }
+            os.makedirs("checkpoints", exist_ok=True)
+            with open("checkpoints/metrics.jsonl", "a", encoding="utf-8") as log_f:
+                log_f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+
+        # Step 5. Scheduled checkpoint
         if step % 1000 == 0 and step > 0:
             os.makedirs("checkpoints", exist_ok=True)
             checkpoint_path = f"checkpoints/bysel_{args.profile}_step_{step}.pt"
@@ -351,19 +405,19 @@ def main():
                 'lr_muon': current_lr,
                 'profile': args.profile,
             }, checkpoint_path)
-            print(f"💾 Плановый чекпоинт сохранен: {checkpoint_path}")
+            print(f"💾 Scheduled checkpoint saved: {checkpoint_path}")
 
-    # === ФИНАЛ ===
+    # === FINAL ===
     total_time = time.time() - start_time
     total_tokens = (step_offset + 1) * cfg.batch_size * cfg.chunk_size
     avg_speed = total_tokens / total_time if total_time > 0 else 0
     
     print("\n" + "=" * 100)
-    print("🎉 ОБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО")
+    print("🎉 TRAINING COMPLETED SUCCESSFULLY")
     print("=" * 100)
-    print(f"   Общее время:   {total_time/3600:.2f} ч")
-    print(f"   Всего токенов: {total_tokens:,}")
-    print(f"   Ср. скорость:  {avg_speed:.1f} токенов/сек")
+    print(f"   Total time:   {total_time/3600:.2f} h")
+    print(f"   Total tokens: {total_tokens:,}")
+    print(f"   Avg speed:    {avg_speed:.1f} tokens/sec")
     
     os.makedirs("checkpoints", exist_ok=True)
     final_path = f"checkpoints/bysel_{args.profile}_FINAL.pt"
@@ -376,7 +430,7 @@ def main():
         'profile': args.profile,
         'config': vars(cfg),
     }, final_path)
-    print(f"💾 Финальный чекпоинт: {final_path}")
+    print(f"💾 Final checkpoint: {final_path}")
 
 
 if __name__ == "__main__":

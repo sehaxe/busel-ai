@@ -1,5 +1,6 @@
 """
-⚙️ BYSEL LAYERS v3.6 - Autocast Safe & Fused GLU
+⚙️ BYSEL LAYERS v4.0 - Autocast Safe, Fused GLU & Fused Native RMSNorm
+Оптимизирован для нативного ускорения на CUDA (RTX 5060 Ti Blackwell) и MPS.
 """
 
 import torch
@@ -32,15 +33,16 @@ class BitLinear_a4_8(nn.Linear):
         nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
-        # Квантование весов
+        # 🎯 ОПТИМИЗИРОВАННОЕ КВАНТОВАНИЕ ВЕСОВ:
         w = self.weight
+        # Избегаем создания лишних градиентных связей при расчете масштаба весов
         alpha = w.abs().mean().detach() + 1e-5
         
         w_scaled = w / alpha
         w_clipped = torch.clamp(w_scaled, -1, 1)
         w_quant = w_clipped + (RoundSTE.apply(w_clipped) - w_clipped)
 
-        # Квантование активаций
+        # КВАНТОВАНИЕ АКТИВАЦИЙ (4-bit или 8-bit):
         if not self.is_intermediate:
             beta = x.abs().mean(dim=-1, keepdim=True).detach() + 1e-5
             x_scaled = x * (2.6457 / beta)
@@ -84,6 +86,7 @@ class LearnableClampSTE(torch.autograd.Function):
 class RMSNorm(nn.Module):
     """
     Кастомный, аппаратно устойчивый класс нормализации RMSNorm.
+    Автоматически переключается на нативный Fused-кёрнел на поддерживаемых системах.
     """
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -91,7 +94,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # Автоматическое приведение веса к точности тензора (Half/Float)
+        # 🎯 ОПТИМИЗАЦИЯ NATIVE FUSED RMSNORM (PyTorch 2.4+):
+        # Если версия PyTorch поддерживает нативный rms_norm, используем его C++/CUDA-кёрнел.
+        # Это исключает аллокацию промежуточных тензоров в Python, экономя VRAM и ускоряя шаг.
+        if hasattr(torch.nn.functional, "rms_norm"):
+            return torch.nn.functional.rms_norm(x, (x.shape[-1],), self.weight.to(x.dtype), self.eps)
+        
+        # Фолбек-расчет для старых версий PyTorch / CPU
         variance = x.pow(2).mean(-1, keepdim=True)
         return x * torch.rsqrt(variance + self.eps) * self.weight.to(x.dtype)
 
@@ -102,16 +111,12 @@ class ReLU2GLUClamped(nn.Module):
     """
     def __init__(self, d_model, d_ffn):
         super().__init__()
-        # 🎯 LAYER FUSION: Объединяем w_gate и w_up
         self.w_gate_up = BitLinear_a4_8(d_model, 2 * d_ffn)
         self.w_down = BitLinear_a4_8(d_ffn, d_model, is_intermediate=True)
         self.clipping_bounds = nn.Parameter(torch.ones(d_ffn) * 10.0)
 
     def forward(self, x):
-        # Одно крупное матричное умножение вместо двух
         gate_up = self.w_gate_up(x)
-        
-        # Разрезаем пополам
         gate_raw, up = gate_up.chunk(2, dim=-1)
         
         gate = LearnableClampSTE.apply(

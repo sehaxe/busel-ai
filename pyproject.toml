@@ -1,9 +1,9 @@
 [project]
 name = "bysel"
-version = "0.1.0"
+version = "4.0.0"
 description = "Bysel - Sovereign 1-bit Omni-LLM"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.28.2",
     "fastapi>=0.136.3",
@@ -16,13 +16,13 @@ dependencies = [
     "torch>=2.12.0",
     "typer>=0.26.4",
     "uvicorn>=0.48.0",
+    "pillow"
 ]
 
-# ДОБАВЬТЕ ЭТУ СЕКЦИЮ:
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["data*", "model*", "training*", "tests*"]
-
 [build-system]
-requires = ["setuptools>=61.0", "maturin>=1.13.3"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.13.3,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "bysel_rust_io"
+features = ["pyo3/extension-module"]

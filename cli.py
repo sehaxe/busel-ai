@@ -1,31 +1,33 @@
+"""
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                            BYSEL OMNI-LLM v4.0                            ║
+║                 Sovereign 1-bit Any-to-Text AI Framework                  ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+"""
+
 import typer
-import os
-import uvicorn
-from tests.profiler_run import run_profile_test
+from tools.data_manager import download_all, download_vision, download_text, download_sft, label_vision
+from tools.orchestrator import autopilot, train, profile, serve, bot
 
-app = typer.Typer(help="Bysel CLI Engine - Sovereign 1-bit Omni-LLM")
+app = typer.Typer(
+    help="Bysel Master CLI Engine - Sovereign 1-bit Omni-LLM",
+    rich_markup_mode="markdown"
+)
 
-@app.command()
-def train(
-    mode: str = typer.Option(..., "--mode", "-m", help="Стадия: pretrain, sft или dpo"),
-    config: str = typer.Option("configs/default.yaml", "--config", "-c", help="Конфиг"),
-    dataset: str = typer.Option(..., "--dataset", "-d", help="Имя датасета"),
-    autopilot: bool = typer.Option(True, help="Включить автопилот")
-):
-    typer.echo(typer.style(f"🚀 Запуск обучения [{mode.upper()}] для bysel...", fg=typer.colors.GREEN, bold=True))
+# 📥 Регистрация команд подготовки данных
+app.command(name="download-all", help="📥 Bulk download and prepare ALL standard datasets (Text, SFT, Vision) at once.")(download_all)
+app.command(name="download-vision", help="📥 Stream and convert a ready-made vision dataset (COCO) from Hugging Face.")(download_vision)
+app.command(name="download-text", help="📥 Stream and convert text pretrain datasets (TinyStories/FineWeb-Edu) from Hugging Face.")(download_text)
+app.command(name="download-sft", help="📥 Download and prepare English instruction-following dataset (Alpaca).")(download_sft)
+app.command(name="label-vision", help="🤖 Auto-label a local directory of images using a local Ollama vision model.")(label_vision)
 
-@app.command()
-def profile():
-    typer.echo(typer.style("📊 Запуск профилировщика...", fg=typer.colors.CYAN, bold=True))
-    run_profile_test()
+# 🚀 Регистрация команд обучения и сервисов
+app.command(name="autopilot", help="🛸 ULTIMATE ONE-CLICK AUTOPILOT: Verifies env, downloads data, profiles hardware, and launches training.")(autopilot)
+app.command(name="train", help="🔥 Manually start the core training loop.")(train)
+app.command(name="profile", help="📊 Run the ultra-stable step-by-step performance profiler (v2.0) on Mac/CUDA.")(profile)
+app.command(name="serve", help="⚡ Start the high-performance FastAPI inference API server.")(serve)
+app.command(name="bot", help="🤖 Start the sovereign Telegram Bot (requires TELEGRAM_BOT_TOKEN in .env).")(bot)
 
-@app.command()
-def serve(
-    host: str = typer.Option("127.0.0.1", help="Хост"),
-    port: int = typer.Option(8000, help="Порт")
-):
-    typer.echo(typer.style(f"🔥 Запуск сервера на http://{host}:{port}", fg=typer.colors.MAGENTA, bold=True))
-    uvicorn.run("services.inference_api:app", host=host, port=port, reload=False)
 
 if __name__ == "__main__":
     app()
