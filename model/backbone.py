@@ -1,12 +1,11 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║ BYSEL BACKBONE v5.0 - Stable Progress-Driven Architecture                 ║
+║ BYSEL BACKBONE v5.2 - Mathematically Exact mAR (DeepSeek mHC + Kimi)      ║
 ║                                                                           ║
 ║ Компоненты:                                                               ║
-║  • ByselDecoderLayer: Attention + MoD + MoE Blackboard (w/ Progress)      ║
-║  • ManifoldConstrainedAttnRes (mAR): Sinkhorn Birkhoff Polytope residual  ║
-║  • ByselMTP4Pipeline: Multi-Token Prediction (4 heads)                    ║
-║  • ByselModel: safe gradient checkpointing for CUDA and MPS               ║
+║  • ByselDecoderLayer: Returns pure, unaccumulated f_l(h_l) transformation  ║
+║  • ManifoldConstrainedAttnRes (mAR): Exact Birkhoff Attention over depth  ║
+║  • ByselModel: Proper sequential routing of unaccumulated layer outputs   ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -14,13 +13,13 @@ import torch
 import torch.nn as nn
 from model.layers import BitLinear_a4_8, RMSNorm, nvtx_range_push, nvtx_range_pop
 from model.attention import BulbaGDN2SeRoPEBlock, MultiHeadLatentAttention
-from model.routing import MoDSequenceRouter, BulbaTernaryTitanMoE
+from model.routing import MoDSequenceRouter, BulbaTernaryTitantMoE
 
 
 class ManifoldConstrainedAttnRes(nn.Module):
     """
-    mAR с проекцией на Birkhoff Polytope.
-    Вычисляет логиты слоев без промежуточного выделения крупных тензоров.
+    mAR: Скрещение Kimi Attention Residuals и DeepSeek mHC.
+    Вычисляет чистую взвешенную сумму по всем предшествующим неаккумулированным выходам v_i.
     """
     def __init__(self, d_model):
         super().__init__()
@@ -29,9 +28,11 @@ class ManifoldConstrainedAttnRes(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, current_x, all_prev_outputs):
-        if not all_prev_outputs:
-            return current_x
+        # Если это первый слой, доступен только один источник (эмбеддинги h_1)
+        if len(all_prev_outputs) <= 1:
+            return all_prev_outputs[0]
         
+        # Вычисляем сырые логиты внимания (AttnRes) по всем неаккумулированным выходам v_i
         logits_list = []
         proj_weight = self.proj.weight.squeeze()
         
@@ -40,24 +41,21 @@ class ManifoldConstrainedAttnRes(nn.Module):
             logit_part = torch.einsum('d, b t d -> b t', proj_weight, K_part)
             logits_list.append(logit_part)
         
-        # Стек логитов [L, B, T]
-        M = torch.stack(logits_list, dim=0)
+        M = torch.stack(logits_list, dim=0) # [L, B, T]
         
-        # Стабилизация экспоненты под float16
+        # Проекция матрицы внимания на Birkhoff Polytope (DeepSeek mHC)
         M_stable = M - M.max(dim=0, keepdim=True)[0]
         M = torch.exp(M_stable)
-        
-        # 3 итерации Sinkhorn-Knopp
         for _ in range(3):
             M = M / (M.sum(dim=0, keepdim=True) + 1e-8)
             M = M / (M.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Взвешенная сумма
+        # Чистая взвешенная сумма h_l = \sum \alpha_i * v_i (Формула 4)
         h = torch.zeros_like(current_x)
         for l in range(len(all_prev_outputs)):
             h = h + M[l].unsqueeze(-1) * all_prev_outputs[l]
             
-        return current_x + h
+        return h
 
 
 class ByselDecoderLayer(nn.Module):
@@ -76,11 +74,15 @@ class ByselDecoderLayer(nn.Module):
         self.moe_norm = RMSNorm(d_model)
 
     def forward(self, x, progress=0.0):
-        # Если маршрутизатор MoD отключен (capacity_factor == 1.0)
+        # MoD-маршрутизация при емкости >= 1.0
         if self.mod_router.capacity_factor >= 1.0:
             attn_out = self.attn(self.attn_norm(x))
             moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
-            return x + moe_out, aux_loss
+            
+            # 🎯 КРИТИЧЕСКИЙ ФИКС ATTNRES:
+            # Мы больше не складываем выход с входом (x + moe_out).
+            # Слой возвращает строго чистый неаккумулированный выход преобразования f_l(h_l).
+            return moe_out, aux_loss
             
         # Пакетная маршрутизация MoD при capacity_factor < 1.0
         B, T, C = x.shape
@@ -88,7 +90,7 @@ class ByselDecoderLayer(nn.Module):
         
         k = int(T * self.mod_router.capacity_factor)
         if k == 0:
-            return x, torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            return torch.zeros_like(x), torch.tensor(0.0, device=x.device, dtype=x.dtype)
             
         active_tokens = x[mask].view(B, k, C)
         
@@ -97,17 +99,13 @@ class ByselDecoderLayer(nn.Module):
         
         gated_out = moe_out * torch.sigmoid(logits[mask]).view(B, k, 1)
         
-        out = x.clone()
-        out[mask] = (out[mask].view(B, k, C) + gated_out).view(-1, C)
+        out = torch.zeros_like(x)
+        out[mask] = gated_out.view(-1, C)
         
         return out, aux_loss
 
 
 class ByselMTP4Pipeline(nn.Module):
-    """
-    Multi-Token Prediction с 4 параллельными головами.
-    Использует прямую индексацию для стабильности на MPS.
-    """
     def __init__(self, config):
         super().__init__()
         
@@ -186,27 +184,35 @@ class ByselModel(nn.Module):
     def forward(self, x, next_token_ids=None, progress=0.0):
         nvtx_range_push("ByselModel_Forward")
         
-        prev_outputs = []
+        # 🎯 ИНИЦИАЛИЗАЦИЯ ИСТОЧНИКОВ ATTNRES:
+        # Изначально список содержит только h_1 (выход патчера)
+        prev_outputs = [x]
         total_aux_loss = 0.0
         
         for i, layer in enumerate(self.layers):
             m_res = self.m_residuals[i]
             
+            # Расчет входа h_i для текущего слоя через взвешивание mAR по всем прошлым выходам v_i
+            h_i = m_res(x, prev_outputs)
+            
             # Чекпоинтинг с поддержкой CUDA и MPS (через reentrant=False)
             if self.training and self.use_gradient_checkpointing and x.device.type in ["cuda", "mps"]:
-                attn_out, aux_loss = torch.utils.checkpoint.checkpoint(
-                    layer, x, progress,
+                layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
+                    layer, h_i, progress,
                     use_reentrant=False
                 )
             else:
-                attn_out, aux_loss = layer(x, progress=progress)
+                layer_out, aux_loss = layer(h_i, progress=progress)
             
             total_aux_loss += aux_loss
-            prev_outputs.append(attn_out)
-            x = m_res(attn_out, prev_outputs)
+            # Накапливаем чистый неаккумулированный выход f_i(h_i)
+            prev_outputs.append(layer_out)
+            # Обновляем базовый указатель x для следующей итерации
+            x = h_i
             
-        hidden_states = self.final_norm(x)
-        mtp_outputs = self.mtp_pipeline(hidden_states, next_token_ids)
+        # Финальное скрытое состояние h_{L+1} собирается как взвешенная сумма по ВСЕМ выходам
+        final_hidden = self.final_norm(m_res(x, prev_outputs))
+        mtp_outputs = self.mtp_pipeline(final_hidden, next_token_ids)
         
         nvtx_range_pop()
         return mtp_outputs, total_aux_loss
