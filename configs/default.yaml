@@ -119,13 +119,14 @@ profiles:
 
   zubr:
     model:
-      d_model: 384          
-      n_layers: 12          
-      n_heads: 6            
-      expert_hidden: 1024   
-      num_experts: 8        
+      d_model: 384
+      n_layers: 12
+      n_heads: 6
+      expert_hidden: 1024
+      num_experts: 8
       top_k: 2
       vocab_size: 259
+      n_hyper: 4
     data:
       data_path: "data_train"
       chunk_size: 16384     

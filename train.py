@@ -70,12 +70,16 @@ class buselConfig:
         self.max_steps = profile_dict["training"].get("max_steps", "auto")
         self.warmup_steps = profile_dict["training"].get("warmup_steps", "auto")
         self.min_lr_ratio = float(profile_dict["training"].get("min_lr_ratio", 0.1))
-        
+
         # Накопление градиентов
         self.grad_accum_steps = int(profile_dict["training"].get("grad_accum_steps", 1))
-        
+
         self.learning_rate_muon = profile_dict["training"].get("learning_rate_muon", 0.0006)
         self.learning_rate_adamw = profile_dict["training"].get("learning_rate_adamw", 0.00006)
+
+        self.n_hyper = int(profile_dict["model"].get("n_hyper", 2))
+        if self.d_model % self.n_hyper != 0:
+            raise ValueError(f"d_model ({self.d_model}) must be divisible by n_hyper ({self.n_hyper})!")
         
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model dimension ({self.d_model}) must be divisible by n_heads ({self.n_heads})!")
