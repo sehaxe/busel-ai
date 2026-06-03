@@ -148,6 +148,9 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming")
     parser.add_argument("--profile", type=str, default="shpak", help="Profile name from default.yaml")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--compile-mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode (default=balanced, reduce-overhead=+CUDA graphs, max-autotune=auto-tune kernels, slow compile)")
     parser.add_argument("--no-checkpointing", action="store_true", help="Disable gradient checkpointing")
     args = parser.parse_args()
 
@@ -233,15 +236,35 @@ def main():
     # Gradient Checkpointing (CUDA only)
     if device == "cuda" and not args.no_checkpointing:
         model.enable_gradient_checkpointing()
-    
+
+    _compile_in_progress = {"value": False}
+    _emergency_save_requested = {"value": False}
+
     if device == "cuda" and not args.no_compile:
-        print("🔧 torch.compile (default)...")
+        compile_mode = args.compile_mode
+        print(f"🔧 torch.compile (mode={compile_mode})...")
+        _compile_in_progress["value"] = True
         try:
-            model = torch.compile(model, fullgraph=False)
-            patcher = torch.compile(patcher, fullgraph=False)
-            print("   ✅ Compilation successful")
+            model = torch.compile(model, fullgraph=False, dynamic=None, mode=compile_mode)
+            patcher = torch.compile(patcher, fullgraph=False, dynamic=None, mode=compile_mode)
+            print(f"   ✅ Compilation successful (mode={compile_mode})")
         except Exception as e:
-            print(f"   ⚠️  Compile failed: {e}")
+            err_str = str(e)
+            if "CUDAGraphs" in err_str or "FakeTensor" in err_str or "overwritten" in err_str:
+                print(f"   ⚠️  {compile_mode} mode failed ({type(e).__name__}); falling back to default")
+                try:
+                    model = torch.compile(model, fullgraph=False, dynamic=None)
+                    patcher = torch.compile(patcher, fullgraph=False, dynamic=None)
+                    print("   ✅ Fallback to default-mode compile succeeded")
+                except Exception as e2:
+                    print(f"   ❌ Compile failed entirely: {type(e2).__name__}: {e2}")
+            else:
+                print(f"   ⚠️  Compile failed: {type(e).__name__}: {e}")
+        finally:
+            _compile_in_progress["value"] = False
+            if _emergency_save_requested["value"]:
+                print("💾 Running deferred emergency checkpoint save...")
+                save_emergency_checkpoint(2, None)
     
     opt_engine = buselOptimizerEngine(model, lr_muon=cfg.learning_rate_muon, lr_adamw=cfg.learning_rate_adamw)
     autopilot = buselAutoPilot(
@@ -283,22 +306,18 @@ def main():
     global_current_step = start_step
 
     def save_emergency_checkpoint(signum, frame):
-        print("\n\n💾 [SIGINT] Emergency saving state...")
-        os.makedirs("checkpoints", exist_ok=True)
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'patcher_state_dict': patcher.state_dict(),
-            'step': global_current_step,
-            'file_idx': global_current_file_idx,
-            'byte_offset': global_current_byte_offset,
-        }, "checkpoints/latest_crash_backup.pt")
-        log_event(
-            "emergency_checkpoint",
-            step=global_current_step,
-            path="checkpoints/latest_crash_backup.pt",
-            signal=signum,
-        )
-        sys.exit(0)
+        if _compile_in_progress["value"] or _emergency_save_requested["value"]:
+            return
+        _emergency_save_requested["value"] = True
+        print("\n\n💾 [SIGINT] Emergency save requested — will save at next safe step boundary.")
+        try:
+            log_event(
+                "emergency_save_requested",
+                step=global_current_step,
+                signal=signum,
+            )
+        except Exception:
+            pass
 
     signal.signal(signal.SIGINT, save_emergency_checkpoint)
     signal.signal(signal.SIGTERM, save_emergency_checkpoint)
@@ -467,9 +486,35 @@ def main():
             autopilot.inject_noise(model)
             
         current_lr, noise_scale = autopilot.update_parameters(step, accumulated_loss, cfg.max_steps)
-        
+
         # Обновляем веса один раз за шаг оптимизатора
         opt_engine.step()
+
+        # 🎯 SAFE-POINT: Handle deferred emergency save (set by SIGINT handler).
+        # At this point we are past forward/backward/step and not inside torch.compile
+        # tracing, so calling model.state_dict() is safe (returns real tensors).
+        if _emergency_save_requested["value"]:
+            try:
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save({
+                    'model_state_dict': _strip_compile_prefix(model.state_dict()),
+                    'patcher_state_dict': _strip_compile_prefix(patcher.state_dict()),
+                    'step': global_current_step,
+                    'file_idx': global_current_file_idx,
+                    'byte_offset': global_current_byte_offset,
+                }, "checkpoints/latest_crash_backup.pt")
+                log_event(
+                    "emergency_checkpoint",
+                    step=global_current_step,
+                    path="checkpoints/latest_crash_backup.pt",
+                )
+                print("💾 Emergency checkpoint saved (deferred).")
+            except Exception as save_err:
+                print(f"❌ Emergency save failed: {type(save_err).__name__}: {save_err}")
+            finally:
+                _emergency_save_requested["value"] = False
+            print("Exiting after emergency save.")
+            sys.exit(0)
         
         # Step 4. Fast interval logging
         if step % 10 == 0:
