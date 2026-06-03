@@ -25,6 +25,11 @@ from model.backbone import buselModel, ManifoldConstrainedAttnRes
 from training.optimizer import _compiled_newton_schulz, buselOptimizerEngine, Muon, _newton_schulz_core
 from training.recipe import buselLossEngine
 
+from busel_registry import register, get, list_registered, is_registered, unregister, clear_registry
+from busel_logging import setup_logging, log_event, get_logger, JSONFormatter
+from ui.teto import frame as teto_frame, frames as teto_frames, states as teto_states
+from ui import cli as ui_cli
+
 
 class _MockConfig:
     def __init__(self, **kw):
@@ -595,6 +600,192 @@ class TestbuselFramework(unittest.TestCase):
         late_b = patches_b[0, 4]
         self.assertFalse(torch.allclose(late_a, late_b, atol=1e-3),
                          "Changing byte at pos 16 SHOULD affect patch 4 (which covers that position)")
+
+    def test_registry_decorator_basic(self):
+        """🛸 busel REGISTRY — basic @register/get/is_registered/list_registered."""
+        print("🧪 [REG-1] busel Registry — basic register/get API...")
+        clear_registry()
+        try:
+            @register("test_kind", "demo_cls")
+            class _Demo:
+                pass
+
+            self.assertTrue(is_registered("test_kind", "demo_cls"))
+            self.assertIs(get("test_kind", "demo_cls"), _Demo)
+            self.assertIn("demo_cls", list_registered("test_kind"))
+            self.assertEqual(list_registered("test_kind"), ["demo_cls"])
+            print("   ✅ Registry register/get/is_registered/list_registered pass.")
+        finally:
+            unregister("test_kind", "demo_cls")
+
+    def test_registry_collision_raises(self):
+        """🛸 busel REGISTRY — duplicate (kind, name) without override raises KeyError."""
+        print("🧪 [REG-2] busel Registry — collision detection...")
+        clear_registry()
+        try:
+            @register("test_kind", "dup")
+            class _A:
+                pass
+
+            with self.assertRaises(KeyError) as ctx:
+                @register("test_kind", "dup")
+                class _B:
+                    pass
+
+            msg = str(ctx.exception)
+            self.assertIn("collision", msg.lower())
+            self.assertIn("override=True", msg)
+            self.assertIs(get("test_kind", "dup"), _A)
+            print("   ✅ Registry collision correctly raised KeyError with override hint.")
+        finally:
+            unregister("test_kind", "dup")
+
+    def test_registry_override_allowed(self):
+        """🛸 busel REGISTRY — override=True replaces existing entry."""
+        print("🧪 [REG-3] busel Registry — override=True works...")
+        clear_registry()
+        try:
+            @register("test_kind", "ovr")
+            class _First:
+                pass
+
+            @register("test_kind", "ovr", override=True)
+            class _Second:
+                pass
+
+            self.assertIs(get("test_kind", "ovr"), _Second)
+            print("   ✅ Registry override=True correctly replaced entry.")
+        finally:
+            unregister("test_kind", "ovr")
+
+    def test_registry_attention_and_optimizer_registered(self):
+        """🛸 busel REGISTRY — model.attention + training.optimizer register themselves on import."""
+        print("🧪 [REG-4] busel Registry — production entries (attention, optimizer) are registered...")
+        attn = list_registered("attention")
+        opt = list_registered("optimizer")
+        self.assertIn("gdn2", attn, "BulbaGDN2SeRoPEBlock must register as 'gdn2'")
+        self.assertIn("mla", attn, "MultiHeadLatentAttention must register as 'mla'")
+        self.assertIn("muon", opt, "Muon must register as 'muon'")
+        self.assertIn("hybrid_muon_adamw", opt, "buselOptimizerEngine must register as 'hybrid_muon_adamw'")
+
+        from model.attention import BulbaGDN2SeRoPEBlock, MultiHeadLatentAttention
+        from training.optimizer import Muon as _Muon, buselOptimizerEngine
+        self.assertIs(get("attention", "gdn2"), BulbaGDN2SeRoPEBlock)
+        self.assertIs(get("attention", "mla"), MultiHeadLatentAttention)
+        self.assertIs(get("optimizer", "muon"), _Muon)
+        self.assertIs(get("optimizer", "hybrid_muon_adamw"), buselOptimizerEngine)
+        print("   ✅ Production attention + optimizer entries are correctly registered.")
+
+    def test_json_logger_writes_valid_jsonl(self):
+        """📚 busel LOGGING — JSONFormatter produces valid one-line JSON per record."""
+        print("🧪 [LOG-1] busel Logging — JSON formatter emits valid JSONL...")
+        import io
+        import logging as _logging
+        from busel_logging import JSONFormatter
+
+        buf = io.StringIO()
+        handler = _logging.StreamHandler(buf)
+        handler.setFormatter(JSONFormatter())
+        logger = _logging.getLogger("busel_test_json")
+        logger.handlers.clear()
+        logger.setLevel(_logging.INFO)
+        logger.addHandler(handler)
+        logger.propagate = False
+
+        logger.info("step_complete", extra={"step": 42, "loss": 3.14, "lr": 0.0001, "vram_mb": 1024.5, "extra_field": "hi"})
+
+        line = buf.getvalue().strip()
+        self.assertTrue(line.startswith("{") and line.endswith("}"), f"Line not JSON: {line!r}")
+        self.assertNotIn("\n", line, "JSONL must be single line per record")
+        parsed = json.loads(line)
+        self.assertEqual(parsed["event"], "step_complete")
+        self.assertEqual(parsed["level"], "INFO")
+        self.assertIn("ts", parsed)
+        self.assertEqual(parsed["step"], 42)
+        self.assertAlmostEqual(parsed["loss"], 3.14, places=4)
+        self.assertEqual(parsed["extra"]["extra_field"], "hi")
+        print("   ✅ JSON logger emits valid single-line JSON with hoisted fields.")
+
+    def test_json_logger_writes_to_file(self):
+        """📚 busel LOGGING — setup_logging appends to a real file (one JSON per line)."""
+        print("🧪 [LOG-2] busel Logging — setup_logging writes to checkpoints/busel.log.jsonl...")
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = setup_logging(log_dir=tmp, log_filename="test.jsonl")
+            log_event("test_event", step=1, loss=2.5)
+            log_event("training_complete", step=100, total_time_s=42.0)
+
+            log_path = Path(tmp) / "test.jsonl"
+            self.assertTrue(log_path.exists())
+            lines = log_path.read_text(encoding="utf-8").strip().split("\n")
+            self.assertEqual(len(lines), 2)
+            for ln in lines:
+                obj = json.loads(ln)
+                self.assertIn("ts", obj)
+                self.assertIn("event", obj)
+                self.assertIn("level", obj)
+            self.assertEqual(json.loads(lines[0])["event"], "test_event")
+            self.assertEqual(json.loads(lines[1])["event"], "training_complete")
+        print("   ✅ setup_logging appends valid JSONL to disk.")
+
+    def test_teto_frames_nonempty_strings(self):
+        """🎵 busel TETO — every state returns a non-empty string; all idle frames are distinct."""
+        print("🧪 [TETO-1] busel Teto — frames are non-empty and distinct...")
+        all_states = teto_states()
+        self.assertGreaterEqual(len(all_states), 4, "Need at least 4 states (idle, blink, smile, ...)")
+        for state in all_states:
+            f = teto_frame(state, 0)
+            self.assertIsInstance(f, str, f"frame({state!r}) must be str")
+            self.assertGreater(len(f), 0, f"frame({state!r}) must be non-empty")
+
+        idle = teto_frames()
+        self.assertGreaterEqual(len(idle), 6, "Need at least 6 idle emoticon frames")
+        self.assertEqual(len(idle), len(set(idle)), "Idle frames must all be distinct")
+        for f in idle:
+            self.assertGreater(len(f), 0)
+            self.assertIsInstance(f, str)
+        print(f"   ✅ Teto: {len(all_states)} states, {len(idle)} distinct idle frames — all non-empty.")
+
+    def test_teto_idle_cycles_through_frames(self):
+        """🎵 busel TETO — frame('idle', tick) cycles through the 12-frame emoticon set."""
+        print("🧪 [TETO-2] busel Teto — idle cycle wraps correctly at modulo 12...")
+        cycle_a = [teto_frame("idle", i) for i in range(12)]
+        cycle_b = [teto_frame("idle", i + 12) for i in range(12)]
+        self.assertEqual(cycle_a, cycle_b, "frame('idle', tick+12) must equal frame('idle', tick) for all 12 ticks")
+        self.assertEqual(len(set(cycle_a)), 12, "All 12 idle frames must be distinct within one cycle")
+        print(f"   ✅ Idle cycle of {len(cycle_a)} distinct emoticons wraps cleanly modulo 12.")
+
+    def test_cli_helpers_do_not_crash(self):
+        """💡 busel CLI — every public helper runs without raising (with or without rich)."""
+        print("🧪 [CLI-1] busel CLI — all helpers run without raising...")
+        ui_cli.header("TEST HEADER", "subtitle here")
+        ui_cli.status_panel("test", key1="value1", key2=42)
+        ui_cli.log("info message", level="info")
+        ui_cli.log("warn message", level="warn")
+        ui_cli.log("error message", level="error")
+        ui_cli.log("ok message", level="ok")
+        line = ui_cli.step_line(10, 100, 3.14, 0.5, 0.001, 1.5, 8, 1234.5, 256.0)
+        self.assertIn("Step 00010/00100", line)
+        self.assertIn("1234", line)
+        self.assertIn("VRAM: 256MB", line)
+        self.assertIn("Total", line)
+        ui_cli.safe_print("hello\n")
+        print("   ✅ All ui.cli helpers execute without raising.")
+
+    def test_cli_animated_header_runs(self):
+        """💡 busel CLI — animated_header + project_tree + spinner + progress_bar all execute."""
+        print("🧪 [CLI-2] busel CLI — animated_header, spinner, progress_bar, project_tree...")
+        ui_cli.animated_header("busel TEST", cycles=2, palette="teto")
+        ui_cli.animated_header("busel TEST", cycles=1, palette="cycle")
+        ui_cli.project_tree()
+        with ui_cli.spinner("working") as _:
+            pass
+        with ui_cli.progress_bar(total=10, description="test") as handle:
+            if handle is not None:
+                handle.update(advance=5)
+        print("   ✅ Animated header, spinner, progress bar, project tree all execute cleanly.")
 
 
 if __name__ == "__main__":
