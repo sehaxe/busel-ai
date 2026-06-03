@@ -1,11 +1,10 @@
 [project]
-name = "bysel"
+name = "busel"
 version = "4.0.0"
-description = "Bysel - Sovereign 1-bit Omni-LLM"
+description = "busel - Sovereign 1-bit Omni-LLM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "aiogram>=3.28.2",
     "fastapi>=0.136.3",
     "flash-linear-attention>=0.5.0",
     "maturin>=1.13.3",
@@ -16,7 +15,8 @@ dependencies = [
     "torch>=2.12.0",
     "typer>=0.26.4",
     "uvicorn>=0.48.0",
-    "pillow"
+    "pillow",
+    "datasets>=4.8.5",
 ]
 
 [build-system]
@@ -24,5 +24,7 @@ requires = ["maturin>=1.13.3,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-module-name = "bysel_rust_io"
+module-name = "busel"
 features = ["pyo3/extension-module"]
+manifest-path = "busel_rust_io/Cargo.toml"
+python-source = "busel_rust_io"
