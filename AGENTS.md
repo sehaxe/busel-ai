@@ -14,7 +14,6 @@ busel-ai/
 ├── training/           # Muon+AdamW hybrid optimizer, AutoPilot v6.0, MTP-4 loss
 ├── data/               # Stream-interleaving byte loader (Rust mmap or Python fallback)
 ├── tools/              # Typer CLI, data_manager, orchestrator, plotter, inference
-├── services/           # FastAPI inference server (uvicorn)
 ├── tests/              # unittest suite + ultra-stable profiler v2.0
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
 ├── configs/            # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest profiles
@@ -33,7 +32,6 @@ busel-ai/
 | Modify training loop | [train.py](file:///home/sehaxe/busel-ai/train.py) + [training/](file:///home/sehaxe/busel-ai/training/AGENTS.md) | Cybernetic curriculum is here |
 | Add CLI command | [cli.py](file:///home/sehaxe/busel-ai/cli.py) → register in `tools.orchestrator` | Typer-based |
 | Modify data loader | [data/pipeline.py](file:///home/sehaxe/busel-ai/data/pipeline.py) | Prefers Rust `ByteStreamer`; Python fallback exists |
-| Add API endpoint | [services/inference_api.py](file:///home/sehaxe/busel-ai/services/inference_api.py) | FastAPI + uvicorn |
 | Tune model size | [configs/default.yaml](file:///home/sehaxe/busel-ai/configs/default.yaml) | Profile: shpak/zubr/chyzh/micro_test/quick_test |
 | Profile step perf | [tests/profiler_run.py](file:///home/sehaxe/busel-ai/tests/profiler_run.py) | No torch.profiler (MPS hangs) |
 | Edit docs site | [site/](file:///home/sehaxe/busel-ai/site/) | `bun install && bun run build` |
@@ -53,15 +51,14 @@ busel-ai/
 - **Device:** Auto-detect (CUDA → MPS → CPU). MPS uses `bf16`/`fp16`, CUDA uses `bf16`
 - **Stability:** Seed 42, TF32 on, cuDNN benchmark on, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 - **NVTX:** All major ops wrapped in `nvtx_range_push/pop` for profiling (CUDA only)
-- **Env vars:** `INFERENCE_API_URL` (default `http://127.0.0.1:8000`), `DEFAULT_PROFILE`
+- **Env vars:** `DEFAULT_PROFILE`
 - **Config loading:** profiles from `configs/default.yaml`; `max_steps`/`warmup_steps` support `"auto"`
 - **License:** CC BY-NC-SA 4.0 (NC clause — NO commercial use)
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - **NEVER** use BPE/tokenizers — model is byte-level (vocab=259 only)
 - **NEVER** add new `nn.Linear` to model — must use `BitLinear_a4_8` or `H_BitLinear`
-- **NEVER** add `Lock` in `state_manager.py` — use `RLock` (re-entrant) to avoid deadlock
-- **NEVER** checkpoint `*.pt < 10MB` — auto-rejected as corrupted by `services/inference_api.py`
+- **NEVER** checkpoint `*.pt < 10MB` — auto-rejected as corrupted by `tools/inference.py`
 - **NEVER** use `torch.profiler` on macOS — known to hang; use `tests/profiler_run.py` instead
 - **NEVER** set `PYTORCH_MPS_HIGH_WATERMARK_RATIO` > 0.0 — `train.py` enforces 0.0
 - **NEVER** mix `H_BitLinear` for non-`o_proj` outputs — reserved for output projection per BitNet v2 spec
@@ -92,15 +89,12 @@ uv run python cli.py autopilot --profile shpak   # one-click: data + profiler + 
 uv run train.py --profile shpak                   # manual
 uv run python cli.py profile                      # hardware profiler only
 
-# Serve
-uv run python cli.py serve --port 8000            # FastAPI
-
 # Docs
 cd site && bun install && bun run build           # GitHub Pages deploy
 ```
 
 ## NOTES
-- **Checkpoint size guard:** Reject `<10MB` `.pt` (corrupt) in both `services/inference_api.py` and `tools/inference.py`
+- **Checkpoint size guard:** Reject `<10MB` `.pt` (corrupt) in `tools/inference.py`
 - **Target bit size:** 11MB (Shpak) / 30MB (Zubr) — 1.58-bit weights compress ~10x vs fp16
 - **Metrics log:** `checkpoints/metrics.jsonl` (one JSON per step, for ETA calc)
 - **macOS Rust flag:** `.cargo/config.toml` uses `link-arg=-undefined,dynamic_lookup` for macOS

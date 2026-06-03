@@ -5,7 +5,7 @@
 ## STRUCTURE
 ```
 tools/
-├── orchestrator.py    # Typer: autopilot/train/profile/serve (all shell out via subprocess)
+├── orchestrator.py    # Typer: autopilot/train/profile (all shell out via subprocess)
 ├── data_manager.py    # Typer: download-all/-vision/-text/-sft, label-vision (HF datasets, COCO)
 ├── inference.py       # Standalone CLI chat (subprocess entry from cli.py chat)
 └── plotter.py         # matplotlib loss/lr/metrics visualization
@@ -18,7 +18,7 @@ tools/
 | Change dataset presets | `tools/data_manager.py:PRESETS` | shpak/chyzh defined; per-Chinchilla 80 bytes/param |
 | Change auto-download behavior | `tools/orchestrator.py:autopilot` | Downloads if `data_train/` empty; profiles HW first |
 | Add plot type | `tools/plotter.py` | Reads `checkpoints/metrics.jsonl` |
-| Standalone inference | `tools/inference.py` | Mirrors `services/inference_api.py:resolve_config` |
+| Standalone inference | `tools/inference.py` | Checkpoint-first, profile-fallback config loading |
 
 ## KEY FUNCTIONS
 | Symbol | Type | Location | Role |
@@ -26,12 +26,11 @@ tools/
 | `autopilot` | Typer command | orchestrator.py | One-click: load .env → ensure data → profile HW → launch train.py |
 | `train` | Typer command | orchestrator.py | Shell-out: `python train.py --profile X [--resume Y]` |
 | `profile` | Typer command | orchestrator.py | Shell-out: `python tests/profiler_run.py` |
-| `serve` | Typer command | orchestrator.py | `uvicorn.run("services.inference_api:app", ...)` |
 | `load_env` | function | orchestrator.py | `.env` file parser (no dotenv lib) |
 | `download_all`/`-text`/`-sft`/`-vision` | Typer command | data_manager.py | HF streaming → Parquet/JSONL in `data_train/` |
 | `label_vision` | Typer command | data_manager.py | Auto-label local image dir via local Ollama vision model |
 | `_download_vision` (COCO fix) | function | data_manager.py | Auto-rewrites `HuggingFaceM4/COCO` → `jxie/coco_captions` (has PIL) |
-| `InferenceConfig` | class | inference.py | Mirror of `services.inference_api.InferenceConfig` |
+| `InferenceConfig` | class | inference.py | Checkpoint-first, profile-fallback config loading (self-contained) |
 | `resolve_config` | function | inference.py | Checkpoint-first, profile-fallback config loading |
 
 ## CONVENTIONS
@@ -58,9 +57,7 @@ tools/
 ## NOTES
 - **`autopilot` data bootstrap:** If `data_train/` empty, downloads text/SFT/vision in sequence before profiling
 - **Profile gate:** `subprocess.run(profiler)` MUST return 0 or `autopilot` exits with code 1
-- **`serve` is blocking:** `uvicorn.run(..., reload=False)` — for dev use `uvicorn services.inference_api:app --reload` directly
 - **`chat` CLI command:** Defined in `cli.py` directly (subprocesses `tools/inference.py`)
 - **Data path:** `data_train/` is both source and processed output; PDFs auto-converted by `data/pipeline.py` via Docling
-- **Inference parity:** `tools/inference.py` and `services/inference_api.py` share `InferenceConfig` shape but are separate classes (intentional, to keep CLI lightweight)
 - **Plotter file:** See `tools/plotter.py` for exact metrics.jsonl schema (loss, lr, step, grad_norm, moe_aux)
 - **Typer `help`:** All commands have emoji-prefixed `help="..."` for rich output
