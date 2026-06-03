@@ -1,24 +1,18 @@
-# ==========================================
-# 🦁 BUSEL AI - GITIGNORE CONFIG
-# ==========================================
+# busel — gitignore
 
-# 📦 Обучающие данные и контрольные точки (КРИТИЧЕСКИ)
-# Игнорируем скачанные гигабайтные датасеты и чекпоинты весов
+# --- Build artifacts & data ---
 data_train/
 checkpoints/
 *.bin
-!README.md
-!INFO.md
-
-# Игнорируем временные файлы тестов и логов
-dummy_bel.txt
-test_diagnose.txt
+.python-version
+Cargo.lock
+uv.lock
 profiler_test_data.txt
 temp_test_*
 checkpoints/*.png
 checkpoints/*.jsonl
 
-# 🐍 Python & Виртуальные окружения
+# --- Python ---
 .venv/
 __pycache__/
 *.pyc
@@ -28,19 +22,21 @@ __pycache__/
 build/
 dist/
 
-# 🦀 Rust (Компиляция Cargo)
-# Игнорируем тяжелую папку компиляции Rust-кода
+# --- Rust ---
 target/
 
-# ⚡ Bun & Astro (Документация Starlight)
-node_modules/
-.astro/
-docs/dist/
-docs/.astro/
-docs/node_modules/
+# --- Starlight docs (site/) ---
+site/dist/
+site/.astro/
+site/node_modules/
+site/.vscode/
 bun.lockb
+
+# --- Editors / OS ---
+.vscode/
+.idea/
 .DS_Store
 
-# 🔑 Секреты и Переменные окружения
+# --- Secrets ---
 .env
 .env.*
