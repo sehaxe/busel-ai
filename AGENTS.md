@@ -13,12 +13,15 @@ busel-ai/
 ├── model/              # BitNet v2 architecture (patching/layers/attention/routing/backbone)
 ├── training/           # Muon+AdamW hybrid optimizer, AutoPilot v6.0, MTP-4 loss
 ├── data/               # Stream-interleaving byte loader (Rust mmap or Python fallback)
+├── ui/                 # 🎵 Teto Vocaloid emoticon avatar + max-beauty rich terminal helpers
+├── busel_registry.py   # 🛸 Plug-in extension-point registry (attention/optimizer/...)
+├── busel_logging.py    # 📚 Structured JSONL event stream (checkpoints/busel.log.jsonl)
 ├── tools/              # Typer CLI, data_manager, orchestrator, plotter, inference
 ├── tests/              # unittest suite + ultra-stable profiler v2.0
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
 ├── configs/            # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest profiles
 ├── site/               # Astro+Starlight docs (GitHub Pages)
-├── checkpoints/        # *.pt training state (gitignored)
+├── checkpoints/        # *.pt training state + busel.log.jsonl (gitignored)
 ├── data_train/         # Raw training data (gitignored)
 ├── train.py            # Cybernetic training orchestrator (curriculum + Chinchilla auto-planner)
 ├── cli.py              # Typer entrypoint (all user commands)
@@ -35,6 +38,9 @@ busel-ai/
 | Tune model size | [configs/default.yaml](file:///home/sehaxe/busel-ai/configs/default.yaml) | Profile: shpak/zubr/chyzh/micro_test/quick_test |
 | Profile step perf | [tests/profiler_run.py](file:///home/sehaxe/busel-ai/tests/profiler_run.py) | No torch.profiler (MPS hangs) |
 | Edit docs site | [site/](file:///home/sehaxe/busel-ai/site/) | `bun install && bun run build` |
+| Add a new attention/optimizer/... | `@register("kind", "name")` in [busel_registry.py](file:///home/sehaxe/busel-ai/busel_registry.py) | Plug-in point; auto-registered on import |
+| Customise terminal UX | [ui/](file:///home/sehaxe/busel-ai/ui/) | Teto emoticon + rich panels, spinners, progress bars, trees |
+| Consume training event stream | [busel_logging.py](file:///home/sehaxe/busel-ai/busel_logging.py) | `checkpoints/busel.log.jsonl` — one JSON per event |
 
 ## ARCHITECTURE (1-bit LLM)
 - **Weights:** 1.58-bit ternary `{-1, 0, +1}` via STE (`BitLinear_a4_8` in [model/layers.py](file:///home/sehaxe/busel-ai/model/layers.py))
@@ -97,5 +103,15 @@ cd site && bun install && bun run build           # GitHub Pages deploy
 - **Checkpoint size guard:** Reject `<10MB` `.pt` (corrupt) in `tools/inference.py`
 - **Target bit size:** 11MB (Shpak) / 30MB (Zubr) — 1.58-bit weights compress ~10x vs fp16
 - **Metrics log:** `checkpoints/metrics.jsonl` (one JSON per step, for ETA calc)
+- **Event stream:** `checkpoints/busel.log.jsonl` — structured JSON for downstream (TG bot, web)
+- **Registry kinds:** `attention` (`gdn2`, `mla`), `optimizer` (`muon`, `hybrid_muon_adamw`) — add more via `@register("kind", "name")` decorator
+- **Teto emoticon cycle:** 12-frame kawaii idle loop (e.g. `ξ(｡•̀ᴗ-)✧ξ`, `▼ᗜˬᗜ▼`, `ξ(≧◡≦)ξ`) — see `ui.teto.frames()`
 - **macOS Rust flag:** `.cargo/config.toml` uses `link-arg=-undefined,dynamic_lookup` for macOS
 - **License:** Commercial use requires written permission from `sehaxe`
+
+## UI / REGISTRY / LOGGING ARCHITECTURE
+- **`ui/teto.py`** — Kasane Teto 12-frame emoticon cycle (`(ᗜˬᗜ)`, `ξ(｡•̀ᴗ-)✧ξ`, `ξ(≧◡≦)ξ`, `▼ᗜˬᗜ▼`, …). States: `idle`, `blink`, `smile`, `think`, `wave`, `training`, `done`.
+- **`ui/animation.py`** — `teto_animate()` context manager wrapping `rich.live.Live`; state-coloured panel (green idle → cyan think → yellow training → gold done). No-op in non-TTY / CI / when rich absent.
+- **`ui/cli.py`** — Rich helpers: `gradient_text()`, `animated_header()`, `spinner()`, `progress_bar()`, `stats_table()`, `project_tree()`, `safe_print()`. All auto-fall back to plain print without rich.
+- **`busel_registry.py`** — `@register(kind, name)` decorator + `get/list_registered/is_registered/unregister/clear_registry` API. Thread-safe, collision-detect, `override=True` opt-in. Use to plug in new attention/optimizer/activation/... when a new paper drops.
+- **`busel_logging.py`** — `JSONFormatter` + `setup_logging()` writing one JSON object per line to `checkpoints/busel.log.jsonl`. Schema: `ts`, `level`, `event`, plus hoisted step fields (`step`, `loss`, `lr`, `aux_loss`, `tokens_per_s`, `vram_mb`) and a freeform `extra` dict. Idempotent — re-running `train.py` appends to the same file.
