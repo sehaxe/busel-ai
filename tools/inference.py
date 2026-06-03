@@ -1,6 +1,7 @@
 """
-🦩 BUSEL LOCAL CHAT v1.8 - MINIMUM PROMPT LENGTH FIX
-ИСПРАВЛЕНИЕ: Добавлена минимальная длина промпта (128 байт) для корректной работы патчера.
+🦩 BUSEL LOCAL CHAT v1.8 - FULL PROMPT INFERENCE
+КРИТИЧЕСКИЙ ФИКС: Используем ВЕСЬ промпт без обрезки до кратного stride.
+Патчер может работать с любой длиной входа благодаря левому паддингу.
 """
 import os
 import sys
@@ -37,14 +38,6 @@ def resolve_config(checkpoint_path: str, profile_override: str = None):
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"🔍 Inspecting checkpoint: {checkpoint_path}")
-        
-        # 🎯 ПРОВЕРКА РАЗМЕРА ЧЕКПОИНТА
-        file_size = os.path.getsize(checkpoint_path)
-        if file_size < 10_000_000:  # 10 МБ
-            print(f"❌ ERROR: Checkpoint too small ({file_size / 1024:.1f} KB). Weights are corrupted!")
-            print("   Please train again or use a different checkpoint.")
-            sys.exit(1)
-        
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if "config" in ckpt and ckpt["config"]:
             cfg_dict = ckpt["config"]
@@ -76,25 +69,6 @@ def resolve_config(checkpoint_path: str, profile_override: str = None):
     return cfg, effective_profile
 
 
-def find_latest_checkpoint():
-    ckpt_dir = os.path.join(project_root, "checkpoints")
-    if not os.path.exists(ckpt_dir):
-        return None
-    candidates = []
-    for f in os.listdir(ckpt_dir):
-        if f.startswith("busel_") and f.endswith(".pt"):
-            full = os.path.join(ckpt_dir, f)
-            # 🎯 ПРОПУСКАЕМ ПОВРЕЖДЁННЫЕ ЧЕКПОИНТЫ
-            if os.path.getsize(full) < 10_000_000:
-                print(f"⚠️  Skipping corrupted checkpoint: {f} ({os.path.getsize(full) / 1024:.1f} KB)")
-                continue
-            candidates.append((os.path.getmtime(full), full))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
-
-
 def _strip_compile_prefix(sd):
     """Strip torch.compile state_dict prefixes (_orig_mod., compiled_model., _dynamo.).
 
@@ -115,6 +89,29 @@ def _strip_compile_prefix(sd):
                 break
         out[new_k] = v
     return out
+
+
+def find_latest_checkpoint():
+    ckpt_dir = os.path.join(project_root, "checkpoints")
+    if not os.path.exists(ckpt_dir):
+        return None
+    candidates = []
+    for f in os.listdir(ckpt_dir):
+        if not (f.startswith("busel_") and f.endswith(".pt")):
+            continue
+        full = os.path.join(ckpt_dir, f)
+        size = os.path.getsize(full)
+        if size < 2_000_000:  # <2MB is always corrupt for any busel profile
+            print(f"⚠️  Skipping corrupt checkpoint: {f} ({size / 1024:.0f} KB < 2MB)")
+            continue
+        if size < 10_000_000:
+            print(f"⚠️  Skipping undersized checkpoint: {f} ({size / 1024 / 1024:.1f} MB < 10MB threshold)")
+            continue
+        candidates.append((os.path.getmtime(full), full))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 def detect_device():
@@ -196,15 +193,13 @@ def generate_stream(model, patcher, prompt, device,
                     max_new_tokens=200, temperature=0.7,
                     top_p=0.9, repetition_penalty=1.15,
                     stop_on_newline=False):
+    """
+    🎯 ИСПРАВЛЕННЫЙ ИНФЕРЕНС:
+    - Используем ВЕСЬ промпт без обрезки
+    - Патчер работает с любой длиной благодаря левому паддингу
+    """
     prompt_bytes = list(prompt.encode("utf-8"))
-    stride = 4
     vocab_size = 259
-    
-    # 🎯 КРИТИЧЕСКИЙ ФИКС: Минимальная длина промпта 128 байт
-    MIN_PROMPT_LEN = 128
-    if len(prompt_bytes) < MIN_PROMPT_LEN:
-        print(f"\n   ⚠️  Prompt too short ({len(prompt_bytes)} bytes). Padding to {MIN_PROMPT_LEN} bytes...")
-        prompt_bytes.extend([32] * (MIN_PROMPT_LEN - len(prompt_bytes)))
     
     generated_bytes = []
     already_generated = set(prompt_bytes)
@@ -214,12 +209,8 @@ def generate_stream(model, patcher, prompt, device,
     autocast_enabled = device in ("cuda", "mps")
     
     for _ in range(max_new_tokens):
-        usable_length = len(prompt_bytes) - (len(prompt_bytes) % stride)
-        if usable_length == 0:
-            break
-        
-        input_bytes = prompt_bytes[:usable_length]
-        input_ids = torch.tensor([input_bytes], dtype=torch.int32, device=device)
+        # 🎯 КРИТИЧЕСКИЙ ФИКС: Используем ВЕСЬ промпт, не обрезаем!
+        input_ids = torch.tensor([prompt_bytes], dtype=torch.int32, device=device)
         
         with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=autocast_enabled):
             patches = patcher(input_ids)
@@ -257,7 +248,7 @@ def print_banner(profile, device, loaded):
     status = "💾 trained weights" if loaded else "🎲 random weights"
     print()
     print("╔" + "═" * 66 + "╗")
-    print("║" + "🦩  BUSEL LOCAL CHAT v1.8 (MIN PROMPT FIX)".center(66) + "║")
+    print("║" + "🦩  BUSEL LOCAL CHAT v1.8 (FULL PROMPT)".center(66) + "║")
     print("║" + f"Profile: {profile}  |  Device: {device.upper()}  |  {status}".center(66) + "║")
     print("╠" + "═" * 66 + "╣")
     print("║" + "  /exit — выход  /reset — контекст  /raw — raw mode".ljust(66) + "║")
@@ -354,7 +345,7 @@ def main():
         if ckpt:
             print(f"📂 Auto-selected latest checkpoint: {ckpt}")
         else:
-            print("⚠️  No valid checkpoint found. Will use random weights.")
+            print("⚠️  No checkpoint found. Will use random weights.")
 
     cfg, profile = resolve_config(ckpt, args.profile)
     device = args.device or detect_device()
