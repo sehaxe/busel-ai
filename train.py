@@ -34,6 +34,11 @@ from training.optimizer import buselOptimizerEngine
 from training.autopilot import buselAutoPilot
 from training.recipe import buselLossEngine
 
+from busel_logging import setup_logging, log_event
+from ui import cli as ui
+from ui.teto import frame as teto_frame
+from ui.animation import teto_animate
+
 
 class buselConfig:
     def __init__(self, profile_dict):
@@ -151,16 +156,25 @@ def main():
     print("╚═══════════════════════════════════════════════════════════════╝")
 
     enforce_stability()
+    busel_logger = setup_logging()
+    log_event("training_start", profile=args.profile)
 
     with open("configs/default.yaml", "r") as f:
         full_config = yaml.safe_load(f)
-    
+
     if args.profile not in full_config["profiles"]:
         raise ValueError(f"Profile '{args.profile}' not found in configs/default.yaml")
-    
+
     cfg = buselConfig(full_config["profiles"][args.profile])
     device = detect_device()
-    
+
+    ui.animated_header(
+        f"busel TRAINING ENGINE v5.2 — profile: {args.profile}",
+        subtitle=f"on {device.upper()} · 1-bit sovereign LLM",
+        palette="teto",
+        cycles=2,
+    )
+    ui.project_tree()
     print(f"\n🚀 Launching [busel-{args.profile}] on {device.upper()}")
     print(f"📚 Vocab: {cfg.vocab_size}, d_model: {cfg.d_model}, layers: {cfg.n_layers}")
     print(f"🧠 Experts: {cfg.num_experts}, Batch: {cfg.batch_size}, Target Context: {cfg.chunk_size}")
@@ -176,11 +190,25 @@ def main():
 
     # === MODEL INITIALIZATION ===
     print("\n🔧 Initializing model...")
-    patcher = StridedFastBLTPatcher(d_model=cfg.d_model).to(device)
-    model = buselModel(cfg).to(device)
-    
+    with ui.spinner("Building model + patcher", style="dots"):
+        patcher = StridedFastBLTPatcher(d_model=cfg.d_model).to(device)
+        model = buselModel(cfg).to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"   ✅ {total_params:,} parameters ({total_params * 2 / 1024**2:.2f} MB)")
+    total_params_mb = total_params * 2 / 1024**2
+    ui.status_panel(
+        "MODEL",
+        parameters=f"{total_params:,}",
+        size_mb=f"{total_params_mb:.2f} MB",
+        device=device.upper(),
+    )
+    log_event(
+        "model_initialized",
+        profile=args.profile,
+        device=device,
+        total_params=total_params,
+        model_size_mb=round(total_params_mb, 2),
+    )
     
     # === DYNAMIC MAX STEPS CALCULATION ===
     if cfg.max_steps == "auto" or cfg.max_steps is None:
@@ -192,6 +220,13 @@ def main():
         print(f"   📊 [CHINCHILLA AUTO-PLANNER] Activated:")
         print(f"      • Target Volume: {chinchilla_target_tokens:,} byte-tokens")
         print(f"      • Planned Steps: {cfg.max_steps:,}")
+        log_event(
+            "chinchilla_planned",
+            target_tokens=chinchilla_target_tokens,
+            planned_steps=cfg.max_steps,
+            tokens_per_step=tokens_per_step,
+            global_batch_size=global_batch_size,
+        )
     else:
         cfg.max_steps = int(cfg.max_steps)
 
@@ -257,6 +292,12 @@ def main():
             'file_idx': global_current_file_idx,
             'byte_offset': global_current_byte_offset,
         }, "checkpoints/latest_crash_backup.pt")
+        log_event(
+            "emergency_checkpoint",
+            step=global_current_step,
+            path="checkpoints/latest_crash_backup.pt",
+            signal=signum,
+        )
         sys.exit(0)
 
     signal.signal(signal.SIGINT, save_emergency_checkpoint)
@@ -320,6 +361,15 @@ def main():
             new_batch_size = max(1, (cfg.batch_size * (cfg.chunk_size // 4)) // new_chunk_size)
             
             print(f"\n📈 [CURRICULUM UPGRADE]: Progress {progress*100:.1f}% -> Scaling context window from {current_chunk_size} to {new_chunk_size} & Auto-adapting Batch from {current_batch_size} to {new_batch_size}!")
+            log_event(
+                "curriculum_upgrade",
+                step=step,
+                progress=round(progress, 4),
+                old_chunk=current_chunk_size,
+                new_chunk=new_chunk_size,
+                old_batch=current_batch_size,
+                new_batch=new_batch_size,
+            )
             
             current_chunk_size = new_chunk_size
             current_batch_size = new_batch_size
@@ -459,7 +509,7 @@ def main():
             metrics = {
                 "step": step,
                 "loss": accumulated_loss,
-                "aux_loss": accumulated_aux_loss / cfg.grad_accum_steps,
+                "aux_loss": accumulated_loss / cfg.grad_accum_steps,
                 "lr": current_lr,
                 "speed": speed,
                 "vram": vram_mb
@@ -467,6 +517,17 @@ def main():
             os.makedirs("checkpoints", exist_ok=True)
             with open("checkpoints/metrics.jsonl", "a", encoding="utf-8") as log_f:
                 log_f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+            log_event(
+                "step_complete",
+                step=step,
+                loss=round(accumulated_loss, 4),
+                aux_loss=round(accumulated_aux_loss / cfg.grad_accum_steps, 4),
+                lr=round(current_lr, 7),
+                tokens_per_s=round(speed, 1),
+                vram_mb=round(vram_mb, 1),
+                batch=current_batch_size,
+                chunk=current_chunk_size,
+            )
 
         # Step 5. Scheduled checkpoint (каждые 100 шагов)
         if step % 100 == 0 and step > 0:
@@ -491,13 +552,24 @@ def main():
                 if file_size < expected_min:
                     print(f"⚠️  WARNING: Checkpoint too small ({file_size / 1024:.1f} KB). Possible corruption!")
                     os.remove(temp_path)
+                    log_event("checkpoint_rejected", step=step, file_size=file_size, reason="too_small")
                 else:
                     os.rename(temp_path, checkpoint_path)
                     print(f"💾 Scheduled checkpoint saved: {checkpoint_path} ({file_size / 1024 / 1024:.1f} MB)")
+                    log_event(
+                        "checkpoint_saved",
+                        step=step,
+                        path=checkpoint_path,
+                        file_size_mb=round(file_size / 1024 / 1024, 2),
+                        loss=round(accumulated_loss, 4),
+                        lr=round(current_lr, 7),
+                    )
             except Exception as e:
                 print(f"❌ Failed to save checkpoint: {e}")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+                import logging as _logging
+                log_event("checkpoint_failed", step=step, error=str(e), level=_logging.WARNING)
     # === FINAL ===
     total_time = time.time() - start_time
     avg_speed = cumulative_processed_tokens / total_time if total_time > 0 else 0
@@ -521,6 +593,15 @@ def main():
         'config': vars(cfg),
     }, final_path)
     print(f"💾 Final checkpoint: {final_path}")
+    log_event(
+        "training_complete",
+        profile=args.profile,
+        total_steps=global_current_step,
+        total_time_s=round(total_time, 1),
+        total_tokens=cumulative_processed_tokens,
+        avg_tokens_per_s=round(avg_speed, 1),
+        final_path=final_path,
+    )
 
 
 if __name__ == "__main__":
