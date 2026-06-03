@@ -1,19 +1,15 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║                            BYSEL OMNI-LLM v4.0                            ║
+║                            BUSEL OMNI-LLM v4.1                            ║
 ║                 Sovereign 1-bit Any-to-Text AI Framework                  ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
-
 import typer
 from tools.data_manager import download_all, download_vision, download_text, download_sft, label_vision
-from tools.orchestrator import autopilot, train, profile, serve, bot
-from telegram_bot.setup_wizard import run_setup_wizard
-
-
+from tools.orchestrator import autopilot, train, profile, serve
 
 app = typer.Typer(
-    help="Bysel Master CLI Engine - Sovereign 1-bit Omni-LLM",
+    help="busel Master CLI Engine - Sovereign 1-bit Omni-LLM",
     rich_markup_mode="markdown"
 )
 
@@ -29,12 +25,26 @@ app.command(name="autopilot", help="🛸 ULTIMATE ONE-CLICK AUTOPILOT: Verifies 
 app.command(name="train", help="🔥 Manually start the core training loop.")(train)
 app.command(name="profile", help="📊 Run the ultra-stable step-by-step performance profiler (v2.0) on Mac/CUDA.")(profile)
 app.command(name="serve", help="⚡ Start the high-performance FastAPI inference API server.")(serve)
-app.command(name="bot", help="🤖 Start the sovereign Telegram Bot (requires TELEGRAM_BOT_TOKEN in .env).")(bot)
-app.command(name="setup", help="🧙 Run interactive .env setup wizard")
 
-def setup_command():
-    run_setup_wizard(force=True)
+# 💬 НОВАЯ КОМАНДА: Локальный интерактивный чат
+@app.command(name="chat", help="💬 Start interactive console chat with a trained model (auto-detects architecture).")
+def chat(
+    checkpoint: str = typer.Option(None, "--checkpoint", "-c", help="Path to .pt checkpoint (auto-detects latest if omitted)"),
+    profile: str = typer.Option(None, "--profile", "-p", help="Force profile from configs/default.yaml"),
+    device: str = typer.Option(None, "--device", "-d", help="Force device: cuda / mps / cpu"),
+):
+    import subprocess
+    import sys
 
+    args = [sys.executable, "tools/inference.py"]
+    if checkpoint:
+        args.extend(["--checkpoint", checkpoint])
+    if profile:
+        args.extend(["--profile", profile])
+    if device:
+        args.extend(["--device", device])
+
+    subprocess.run(args)
 
 if __name__ == "__main__":
     app()
