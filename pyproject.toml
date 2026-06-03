@@ -15,6 +15,7 @@ dependencies = [
     "typer>=0.26.4",
     "pillow",
     "datasets>=4.8.5",
+    "rich>=13.0.0",
 ]
 
 [build-system]
