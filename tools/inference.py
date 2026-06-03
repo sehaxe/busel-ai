@@ -168,12 +168,19 @@ def load_model(cfg, checkpoint_path, device):
 
 
 def apply_sampling(logits, temperature, top_p, repetition_penalty, already_generated):
+    # Mask special tokens [256:259] (image/pad/eos per AGENTS.md) — they are not raw bytes and would crash bytearray.append() downstream.
+    logits[256:] = -float("inf")
+
     for tok in already_generated:
         if tok < logits.shape[-1]:
             if logits[tok] > 0:
                 logits[tok] /= repetition_penalty
             else:
                 logits[tok] *= repetition_penalty
+
+    # temperature==0 → greedy argmax restricted to byte range [0:256] (specials already masked above).
+    if temperature < 1e-6:
+        return int(logits[:256].argmax().item())
 
     logits = logits / (temperature + 1e-8)
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -185,7 +192,13 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, already_gener
     logits[indices_to_remove] = -float("inf")
 
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).item()
+
+    # Guard against `invalid multinomial distribution` if top_p + temperature collapse every valid token.
+    probs_sum = probs.sum().item()
+    if not (probs_sum > 0) or not torch.isfinite(probs).any():
+        return int(logits[:256].argmax().item())
+
+    return int(torch.multinomial(probs, num_samples=1).item())
 
 
 @torch.no_grad()
@@ -221,6 +234,10 @@ def generate_stream(model, patcher, prompt, device,
         
         if next_token >= vocab_size:
             break
+        if next_token >= 256:
+            already_generated.add(next_token)
+            prompt_bytes.append(next_token)
+            continue
         if stop_on_newline and next_token == 10 and generated_bytes:
             break
         
