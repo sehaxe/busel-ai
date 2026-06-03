@@ -435,7 +435,7 @@ def main():
                     byte_batch, T_patches, stride=patcher.stride
                 )
                 
-                (logits_t1, logits_t2, logits_t3, logits_t4), aux_loss = model(patches, mtp_targets, progress=progress)
+                (logits_t1, logits_t2, logits_t3, logits_t4), aux_loss = model(patches, [targets] + mtp_targets[:-1], progress=progress)
                 
                 loss = loss_engine.compute_pretrain_loss(
                     logits_t1, targets,
