@@ -1,6 +1,6 @@
 """
 ⚙️ busel ORCHESTRATOR v6.0 (PATH FIX)
-Содержит команды запуска обучения, автопилота, профайлера и API-сервера.
+Содержит команды запуска обучения, автопилота и профайлера.
 """
 
 import os
@@ -71,12 +71,3 @@ def train(
 
 def profile():
     subprocess.run([sys.executable, "tests/profiler_run.py"])
-
-
-def serve(
-    host: str = typer.Option("127.0.0.1", help="Server host"),
-    port: int = typer.Option(8000, help="Server port")
-):
-    import uvicorn  # Lazy import
-    typer.echo(typer.style(f"🔥 Starting API server on http://{host}:{port}", fg=typer.colors.MAGENTA, bold=True))
-    uvicorn.run("services.inference_api:app", host=host, port=port, reload=False)
