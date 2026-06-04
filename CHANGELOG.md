@@ -6,6 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [5.7.0] — 2026-06-04 — "Tool Executor in REPL with Per-Call Confirmation" 🔧
+
+### Added
+
+- **`tools/tool_executor.py`** — Promoted from Phase-7 skeleton to full
+  REPL integration (v5.7.0). New public API:
+  - `format_tool_call_for_user(call, max_value_len=120)` — pretty-print a
+    single tool call for the confirmation prompt (truncated, ANSI-stripped).
+  - `interactive_confirm(call, auto_approve=False)` — sync `input()` with
+    `[y/N]` prompt. **Default is N (deny).** Always asks unless
+    `/auto on` is set, per the user's safety requirement:
+    *"make sure to ask each time to apply it or not"*.
+  - `denied_result(call)` — synthetic `{name, params, output}` dict with
+    `output="ERROR: tool execution denied by user"`, ready to be passed
+    to `format_tool_results`. Lets the model see the rejection and pivot.
+  - `strip_ansi(text)` — removes CSI / OSC / lone-ESC sequences from
+    tool output (prevents terminal escape injection via malicious tool
+    responses).
+  - `MAX_TOOL_CALLS_PER_TURN = 5` — hard cap on tool calls per user turn
+    (loop guard).
+  - `MAX_TOOL_OUTPUT_BYTES = 8192` — output cap per tool call (8 KB).
+  - Fixed `parse_tool_calls` to handle **multi-invoke envelopes** (the
+    old single-regex implementation missed all invokes after the first
+    inside a `<function_calls>` block). New `ENVELOPE_PATTERN` is split
+    from `INVOKE_PATTERN`.
+- **`tools/inference.py`** — REPL v1.9 (TOOL EXECUTOR). Multi-pass
+  `interactive_loop`:
+  1. Model generates a turn (with `stop_on_newline=False` to allow
+     tool-call envelopes that span multiple lines).
+  2. After the turn, `parse_tool_calls` looks for `<function_calls>`
+     envelopes.
+  3. If found: ask the user about each `<invoke>` individually
+     (`[?] Execute TOOL_BASH(command="ls -la") ? [y/N]: `).
+  4. On approve: execute via `ToolRegistry`, strip ANSI, cap output,
+     pretty-print result. On deny: inject synthetic error result.
+  5. Append `<function_results>...</function_results>` to the
+     conversation. Re-prompt and continue generating (the model now sees
+     its own call + the result + the prior context).
+  6. Loop up to `MAX_TOOL_CALLS_PER_TURN` times, then return to user.
+- **New REPL commands:**
+  - `/tools` — list available tools, current loop guard, auto-approve state.
+  - `/auto [on|off]` (or just `/auto` to toggle) — session-level
+    auto-approve. When ON, skips the `[?]` prompt. **Default is OFF**
+    (always ask). The user can flip this per-session if they trust the
+    model's tool choices.
+
+### Tests
+
+- **16 new tests** (TOOL-1..14, TOOL-9b, TOOL-4b) in
+  `tests/test_suite.py::TestbuselToolExecutor`:
+  - Single-invoke and multi-invoke envelope parsing (the bug fix).
+  - 4 negative parse cases (no envelope, unclosed, etc.).
+  - `format_tool_call_for_user` truncation + empty-params handling.
+  - `strip_ansi` CSI / OSC / plain-text coverage.
+  - `denied_result` shape + integration with `format_tool_results`.
+  - `format_tool_results` empty-list edge case.
+  - `default_tool_registry` exposes `TOOL_BASH` + `TOOL_READ`.
+  - End-to-end `execute_tool_calls` (echo, unknown tool → ERROR).
+  - `interactive_confirm` with `auto_approve=True` (skips prompt).
+  - `interactive_confirm` 8-case truth table for `'y'/'yes'/'Y'/'YES'`
+    vs `'n'/'no'/'N'/'NO'/''/'  '/'random'/'maybe'`.
+  - `interactive_confirm` returns `False` on `EOFError` and
+    `KeyboardInterrupt` (safe default).
+  - `MAX_TOOL_CALLS_PER_TURN` + `MAX_TOOL_OUTPUT_BYTES` invariants.
+- **Total: 137/137 passing** (was 121, +16 for v5.7.0).
+
+### Safety Notes
+
+- The "always ask, default deny" UX is the project's answer to the user's
+  "ask each time to apply it or not" requirement. The model can NEVER
+  execute a tool without explicit user approval, unless `/auto on` is set
+  for the session.
+- `TOOL_BASH` runs via `subprocess.run(shell=True)` with a 10s timeout —
+  this is the same risk surface as any shell tool. A production deployment
+  would need either a sandbox (e.g. bubblewrap) or a tool-allowlist mode.
+- `strip_ansi` is a defensive measure against the model itself being
+  manipulated into outputting escape codes via a malicious tool response.
+  In practice the SFT data should never produce escapes, but the model
+  is a learned function and this is a cheap belt-and-suspenders.
+
+---
+
 ## [5.6.0] — 2026-06-04 — "Full Multi-Stage Framework" 🤖
 
 ### Added
