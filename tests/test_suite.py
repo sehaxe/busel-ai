@@ -2065,5 +2065,230 @@ class TestbuselFramework(unittest.TestCase):
         print(f"   ✅ {len(all_names)} presets: {all_names}")
 
 
+class TestbuselToolExecutor(unittest.TestCase):
+    """🔧 [TOOL-*] busel tool executor v5.7.0 — REPL integration tests."""
+
+    def test_parse_single_invoke(self):
+        """🔧 [TOOL-1] parse_tool_calls finds a single <invoke> in an envelope."""
+        print("🧪 [TOOL-1] parse_tool_calls: single invoke...")
+        from tools.tool_executor import parse_tool_calls
+        text = (
+            "I'll list the files:\n"
+            "<function_calls>\n"
+            "<invoke name=\"TOOL_BASH\">\n"
+            "<parameter name=\"command\">ls -la</parameter>\n"
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "TOOL_BASH")
+        self.assertEqual(calls[0]["params"], {"command": "ls -la"})
+        print(f"   ✅ parsed {len(calls)} call: {calls[0]['name']}({list(calls[0]['params'].keys())})")
+
+    def test_parse_multiple_invokes(self):
+        """🔧 [TOOL-2] parse_tool_calls finds multiple <invoke>s in one envelope."""
+        print("🧪 [TOOL-2] parse_tool_calls: multiple invokes in one envelope...")
+        from tools.tool_executor import parse_tool_calls
+        text = (
+            "<function_calls>\n"
+            "<invoke name=\"TOOL_BASH\">\n"
+            "<parameter name=\"command\">ls</parameter>\n"
+            "</invoke>\n"
+            "<invoke name=\"TOOL_READ\">\n"
+            "<parameter name=\"path\">/etc/hostname</parameter>\n"
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c["name"] for c in calls], ["TOOL_BASH", "TOOL_READ"])
+        self.assertEqual(calls[0]["params"], {"command": "ls"})
+        self.assertEqual(calls[1]["params"], {"path": "/etc/hostname"})
+        print(f"   ✅ parsed {len(calls)} calls in document order")
+
+    def test_parse_no_envelope(self):
+        """🔧 [TOOL-3] parse_tool_calls returns [] when no envelope present."""
+        print("🧪 [TOOL-3] parse_tool_calls: empty/no-envelope cases...")
+        from tools.tool_executor import parse_tool_calls
+        self.assertEqual(parse_tool_calls("Just a normal response."), [])
+        self.assertEqual(parse_tool_calls("<function_calls>"), [])  # unclosed
+        self.assertEqual(parse_tool_calls(""), [])
+        self.assertEqual(parse_tool_calls("</function_calls>"), [])  # no opening
+        print("   ✅ 4 negative cases all return []")
+
+    def test_format_tool_call_for_user_truncates(self):
+        """🔧 [TOOL-4] format_tool_call_for_user truncates long values with '...'."""
+        print("🧪 [TOOL-4] format_tool_call_for_user: long values truncated...")
+        from tools.tool_executor import format_tool_call_for_user
+        long_path = "/etc/" + "x" * 200
+        rendered = format_tool_call_for_user({"name": "TOOL_READ", "params": {"path": long_path}})
+        self.assertTrue(rendered.startswith('TOOL_READ(path="'))
+        self.assertTrue(rendered.endswith('...")'))
+        self.assertLess(len(rendered), 200, f"expected truncation, got {len(rendered)} chars: {rendered!r}")
+        # Short values should NOT be truncated
+        short = format_tool_call_for_user({"name": "TOOL_BASH", "params": {"command": "ls"}})
+        self.assertEqual(short, 'TOOL_BASH(command="ls")')
+        print(f"   ✅ long value truncated to {len(rendered)} chars, short value preserved verbatim")
+
+    def test_format_tool_call_for_user_no_params(self):
+        """🔧 [TOOL-4b] format_tool_call_for_user handles empty/missing params."""
+        print("🧪 [TOOL-4b] format_tool_call_for_user: empty params...")
+        from tools.tool_executor import format_tool_call_for_user
+        self.assertEqual(format_tool_call_for_user({"name": "TOOL_X", "params": {}}), "TOOL_X()")
+        self.assertEqual(format_tool_call_for_user({"name": "TOOL_X"}), "TOOL_X()")
+        print("   ✅ empty params → name()")
+
+    def test_strip_ansi_removes_csi(self):
+        """🔧 [TOOL-5] strip_ansi removes CSI sequences (colors / cursor moves)."""
+        print("🧪 [TOOL-5] strip_ansi: CSI escape removal...")
+        from tools.tool_executor import strip_ansi
+        text = "\x1b[31mERROR\x1b[0m: \x1b[1;32mfile not found\x1b[0m"
+        self.assertEqual(strip_ansi(text), "ERROR: file not found")
+        # Also strips cursor movement
+        self.assertEqual(strip_ansi("\x1b[2J\x1b[Hclear screen\x1b[0m"), "clear screen")
+        # Plain text untouched
+        self.assertEqual(strip_ansi("plain text"), "plain text")
+        self.assertEqual(strip_ansi(""), "")
+        print("   ✅ CSI / OSC / plain text handled correctly")
+
+    def test_denied_result_shape(self):
+        """🔧 [TOOL-6] denied_result produces a synthetic error in execute_tool_calls shape."""
+        print("🧪 [TOOL-6] denied_result: synthetic error output...")
+        from tools.tool_executor import denied_result, DENIED_RESULT_OUTPUT
+        result = denied_result({"name": "TOOL_BASH", "params": {"command": "rm -rf /"}})
+        self.assertEqual(result["name"], "TOOL_BASH")
+        self.assertEqual(result["params"], {"command": "rm -rf /"})
+        self.assertEqual(result["output"], DENIED_RESULT_OUTPUT)
+        self.assertTrue(result["output"].startswith("ERROR:"))
+        # Should be directly passable to format_tool_results
+        from tools.tool_executor import format_tool_results
+        block = format_tool_results([result])
+        self.assertIn("ERROR: tool execution denied by user", block)
+        print(f"   ✅ denied_result: name={result['name']}, output starts with 'ERROR:'")
+
+    def test_format_tool_results_wraps(self):
+        """🔧 [TOOL-7] format_tool_results produces <function_results>...</function_results> block."""
+        print("🧪 [TOOL-7] format_tool_results: wraps results in envelope...")
+        from tools.tool_executor import format_tool_results
+        results = [{"name": "TOOL_BASH", "params": {"command": "ls"}, "output": "file1\nfile2"}]
+        block = format_tool_results(results)
+        self.assertTrue(block.startswith("<function_results>\n"))
+        self.assertTrue(block.endswith("</function_results>"))
+        self.assertIn('name="TOOL_BASH"', block)
+        self.assertIn("file1", block)
+        # Empty list → empty string
+        self.assertEqual(format_tool_results([]), "")
+        print(f"   ✅ {len(block)}-char block wraps {len(results)} result(s)")
+
+    def test_default_registry_has_bash_and_read(self):
+        """🔧 [TOOL-8] default_tool_registry exposes TOOL_BASH + TOOL_READ."""
+        print("🧪 [TOOL-8] default_tool_registry: TOOL_BASH + TOOL_READ registered...")
+        from tools.tool_executor import default_tool_registry
+        r = default_tool_registry()
+        names = r.names()
+        self.assertIn("TOOL_BASH", names)
+        self.assertIn("TOOL_READ", names)
+        # Each tool is callable
+        self.assertTrue(callable(r._tools["TOOL_BASH"]))
+        self.assertTrue(callable(r._tools["TOOL_READ"]))
+        print(f"   ✅ {len(names)} tools registered: {names}")
+
+    def test_execute_tool_calls_runs_bash(self):
+        """🔧 [TOOL-9] execute_tool_calls actually runs TOOL_BASH and returns stdout."""
+        print("🧪 [TOOL-9] execute_tool_calls: TOOL_BASH echoes 'hello'...")
+        from tools.tool_executor import execute_tool_calls
+        results = execute_tool_calls(
+            '<function_calls>\n'
+            '<invoke name="TOOL_BASH">\n'
+            '<parameter name="command">echo hello</parameter>\n'
+            '</invoke>\n'
+            '</function_calls>'
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "TOOL_BASH")
+        self.assertIn("hello", results[0]["output"])
+        print(f"   ✅ TOOL_BASH('echo hello') → {results[0]['output']!r}")
+
+    def test_execute_tool_calls_unknown_tool(self):
+        """🔧 [TOOL-9b] execute_tool_calls returns error for unknown tool names."""
+        print("🧪 [TOOL-9b] execute_tool_calls: unknown tool → ERROR result...")
+        from tools.tool_executor import execute_tool_calls
+        results = execute_tool_calls(
+            '<function_calls>\n'
+            '<invoke name="TOOL_NONEXISTENT">\n'
+            '<parameter name="x">1</parameter>\n'
+            '</invoke>\n'
+            '</function_calls>'
+        )
+        self.assertEqual(len(results), 1)
+        self.assertIn("ERROR", results[0]["output"])
+        self.assertIn("unknown tool", results[0]["output"])
+        print(f"   ✅ unknown tool → {results[0]['output'][:60]!r}")
+
+    def test_interactive_confirm_auto_approve_skips_prompt(self):
+        """🔧 [TOOL-10] interactive_confirm with auto_approve=True returns True without prompting."""
+        print("🧪 [TOOL-10] interactive_confirm: auto_approve=True skips prompt...")
+        from unittest.mock import patch
+        from tools.tool_executor import interactive_confirm
+        with patch("builtins.input", side_effect=AssertionError("must not prompt when auto_approve=True")):
+            approved = interactive_confirm(
+                {"name": "TOOL_BASH", "params": {"command": "rm -rf /"}},
+                auto_approve=True,
+            )
+        self.assertTrue(approved)
+        print("   ✅ auto_approve=True → True (no prompt)")
+
+    def test_interactive_confirm_user_says_y(self):
+        """🔧 [TOOL-11] interactive_confirm returns True when user types 'y' or 'yes'."""
+        print("🧪 [TOOL-11] interactive_confirm: 'y' / 'yes' → True...")
+        from unittest.mock import patch
+        from tools.tool_executor import interactive_confirm
+        for ans in ("y", "yes", "Y", "YES", " yes "):
+            with patch("builtins.input", return_value=ans):
+                self.assertTrue(
+                    interactive_confirm({"name": "TOOL_BASH", "params": {}}, auto_approve=False),
+                    f"expected True for input {ans!r}",
+                )
+        print("   ✅ 'y', 'yes', 'Y', 'YES' all approve")
+
+    def test_interactive_confirm_user_says_n(self):
+        """🔧 [TOOL-12] interactive_confirm returns False for 'n', empty, or random input (default = deny)."""
+        print("🧪 [TOOL-12] interactive_confirm: 'n' / '' / random → False (default deny)...")
+        from unittest.mock import patch
+        from tools.tool_executor import interactive_confirm
+        for ans in ("n", "no", "N", "NO", "", "  ", "random", "maybe"):
+            with patch("builtins.input", return_value=ans):
+                self.assertFalse(
+                    interactive_confirm({"name": "TOOL_BASH", "params": {}}, auto_approve=False),
+                    f"expected False for input {ans!r} (default must be DENY)",
+                )
+        print("   ✅ 'n', '', 'random' all deny (default N)")
+
+    def test_interactive_confirm_eof_returns_false(self):
+        """🔧 [TOOL-13] interactive_confirm returns False on EOF (no input available)."""
+        print("🧪 [TOOL-13] interactive_confirm: EOF → False (safe default)...")
+        from unittest.mock import patch
+        from tools.tool_executor import interactive_confirm
+        with patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(interactive_confirm({"name": "TOOL_BASH", "params": {}}, auto_approve=False))
+        # KeyboardInterrupt also falls through to False
+        with patch("builtins.input", side_effect=KeyboardInterrupt):
+            self.assertFalse(interactive_confirm({"name": "TOOL_BASH", "params": {}}, auto_approve=False))
+        print("   ✅ EOFError + KeyboardInterrupt both → False (deny is the safe default)")
+
+    def test_max_tool_calls_and_output_constants(self):
+        """🔧 [TOOL-14] MAX_TOOL_CALLS_PER_TURN + MAX_TOOL_OUTPUT_BYTES are positive ints (loop guard + cap)."""
+        print("🧪 [TOOL-14] MAX_TOOL_CALLS_PER_TURN + MAX_TOOL_OUTPUT_BYTES invariants...")
+        from tools.tool_executor import MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_OUTPUT_BYTES
+        self.assertIsInstance(MAX_TOOL_CALLS_PER_TURN, int)
+        self.assertGreater(MAX_TOOL_CALLS_PER_TURN, 0, "loop guard must be > 0")
+        self.assertLessEqual(MAX_TOOL_CALLS_PER_TURN, 20, "loop guard should be sane (not 1000)")
+        self.assertIsInstance(MAX_TOOL_OUTPUT_BYTES, int)
+        self.assertGreater(MAX_TOOL_OUTPUT_BYTES, 0, "output cap must be > 0")
+        self.assertLessEqual(MAX_TOOL_OUTPUT_BYTES, 1_000_000, "output cap should be sane (not 1GB)")
+        print(f"   ✅ MAX_TOOL_CALLS_PER_TURN={MAX_TOOL_CALLS_PER_TURN}, MAX_TOOL_OUTPUT_BYTES={MAX_TOOL_OUTPUT_BYTES}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,13 +1,24 @@
 """
-🔧 busel TOOL EXECUTOR v1.0 — Phase 7 (skeleton)
+🔧 busel TOOL EXECUTOR v1.1 — Phase 7 + REPL integration (v5.7.0)
 
 Parses `<function_calls>...<invoke>...<parameter>...<result>` envelopes
 emitted by the SFT/DPO model, executes the named tool, and re-injects the
-result as `ROLE_TOOL ... TOOL_RESULTS_END` so the model can continue.
+result as `<function_results>...</function_results>` so the model can
+continue.
 
-This is the **skeleton** — full integration with the opencode-style tool
-vocabulary (`TOOL_BASH`, `TOOL_READ`, `TOOL_WRITE`, `TOOL_EDIT`, etc.) is
-a follow-up. For now we support a small, sandboxed subset.
+**v5.7.0 additions** (REPL integration):
+- `format_tool_call_for_user(call)` — pretty-print a single call for the
+  confirmation prompt (truncated, ANSI-free).
+- `interactive_confirm(call, auto_approve=False)` — sync `input()` with
+  `[y/N]` prompt. Default is N (deny). The user is always asked unless
+  `/auto on` is set.
+- `strip_ansi(text)` — remove terminal escape codes from tool output
+  (prevents escape injection from malicious tool responses).
+- `MAX_TOOL_CALLS_PER_TURN` — hard cap on tool calls per user turn to
+  prevent infinite loops (5 by default).
+
+The default registry exposes `TOOL_BASH` (sandboxed shell) and
+`TOOL_READ` (text file read, 32 KB cap).
 """
 from __future__ import annotations
 
@@ -20,15 +31,28 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Safety / UX constants
+# ---------------------------------------------------------------------------
+
+MAX_TOOL_CALLS_PER_TURN: int = 5
+"""Hard cap on tool calls per user turn. Prevents infinite tool-call loops."""
+
+MAX_TOOL_OUTPUT_BYTES: int = 8192
+"""Max bytes of a single tool's stdout/stderr to inject back to the model."""
+
+
+# ---------------------------------------------------------------------------
 # Envelope detection
 # ---------------------------------------------------------------------------
 
+ENVELOPE_PATTERN = re.compile(
+    r"<function_calls>(?P<body>.*?)</function_calls>",
+    re.DOTALL,
+)
 INVOKE_PATTERN = re.compile(
-    r"<function_calls>\s*"
     r"<invoke\s+name=\"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\">\s*"
     r"(?P<params>.*?)"
-    r"</invoke>\s*"
-    r"</function_calls>",
+    r"</invoke>",
     re.DOTALL,
 )
 PARAM_PATTERN = re.compile(
@@ -40,16 +64,20 @@ PARAM_PATTERN = re.compile(
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Extract tool calls from a model output string.
 
+    Handles both single-invoke and multi-invoke envelopes (one or more
+    `<invoke>...</invoke>` blocks inside a single `<function_calls>...</function_calls>`).
     Returns a list of {name, params} dicts, in document order.
     Returns an empty list if no <function_calls> envelope is present.
     """
     calls: list[dict[str, Any]] = []
-    for m in INVOKE_PATTERN.finditer(text):
-        name = m.group("name")
-        params: dict[str, str] = {}
-        for p in PARAM_PATTERN.finditer(m.group("params")):
-            params[p.group("key")] = p.group("value").strip()
-        calls.append({"name": name, "params": params})
+    for env_match in ENVELOPE_PATTERN.finditer(text):
+        body = env_match.group("body")
+        for inv_match in INVOKE_PATTERN.finditer(body):
+            name = inv_match.group("name")
+            params: dict[str, str] = {}
+            for p in PARAM_PATTERN.finditer(inv_match.group("params")):
+                params[p.group("key")] = p.group("value").strip()
+            calls.append({"name": name, "params": params})
     return calls
 
 
@@ -96,7 +124,7 @@ def _bash_tool(command: str, timeout: str = "10") -> str:
             timeout=timeout_s,
             check=False,
         )
-        return (out.stdout + out.stderr)[:8192]
+        return (out.stdout + out.stderr)[:MAX_TOOL_OUTPUT_BYTES]
     except subprocess.TimeoutExpired:
         return f"ERROR: command timed out after {timeout_s}s"
     except Exception as e:
@@ -141,7 +169,7 @@ def execute_tool_calls(text: str, registry: ToolRegistry | None = None) -> list[
 
 
 def format_tool_results(results: list[dict[str, Any]]) -> str:
-    """Format results as a `ROLE_TOOL ... TOOL_RESULTS_END` block (for re-injection)."""
+    """Format results as a `<function_results>...</function_results>` block (for re-injection)."""
     blocks = []
     for r in results:
         try:
@@ -158,12 +186,102 @@ def format_tool_results(results: list[dict[str, Any]]) -> str:
     return "<function_results>\n" + "\n".join(blocks) + "\n</function_results>"
 
 
+# ---------------------------------------------------------------------------
+# v5.7.0 — REPL integration: confirmation prompt + ANSI stripper
+# ---------------------------------------------------------------------------
+
+# ANSI escape code pattern: covers CSI sequences, OSC sequences, and lone ESC.
+# Belt-and-suspenders: prevents the model from injecting terminal escapes via
+# tool output (e.g. a malicious `TOOL_BASH` response that tries to clear screen).
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\))"
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from `text` (CSI, OSC, lone ESC)."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def format_tool_call_for_user(call: dict[str, Any], max_value_len: int = 120) -> str:
+    """Pretty-print a single tool call for the confirmation prompt.
+
+    Long parameter values are truncated with '...' to keep the prompt
+    readable. ANSI is stripped from the values.
+    """
+    name = call.get("name", "<unknown>")
+    params = call.get("params", {}) or {}
+    if not params:
+        return f"{name}()"
+    rendered = []
+    for k, v in params.items():
+        v_clean = strip_ansi(str(v))
+        if len(v_clean) > max_value_len:
+            v_clean = v_clean[: max_value_len - 3] + "..."
+        rendered.append(f'{k}="{v_clean}"')
+    return f"{name}(" + ", ".join(rendered) + ")"
+
+
+def interactive_confirm(call: dict[str, Any], auto_approve: bool = False) -> bool:
+    """Ask the user via stdin whether to execute a single tool call.
+
+    Always asks (per user requirement: "ask each time to apply it or not")
+    unless `auto_approve=True` (toggled via the `/auto on` REPL command).
+
+    The default answer is **N** (deny) — the user must explicitly type
+    'y' or 'yes' to approve. Any other input (including empty Enter) is
+    treated as deny.
+
+    Returns:
+        True if the user approved execution, False if denied or on EOF.
+    """
+    if auto_approve:
+        return True
+    rendered = format_tool_call_for_user(call)
+    prompt = f"\n[?] Execute {rendered} ? [y/N]: "
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()  # newline so the next prompt isn't glued to the [?]
+        return False
+    return ans in ("y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# v5.7.0 — Denial result (synthetic "<function_results>" block)
+# ---------------------------------------------------------------------------
+
+DENIED_RESULT_OUTPUT: str = "ERROR: tool execution denied by user"
+"""The synthetic output injected when the user denies a tool call.
+
+The model sees this as if the tool had returned an error, so it can
+gracefully pivot (e.g. apologize, suggest an alternative, give up).
+"""
+
+
+def denied_result(call: dict[str, Any]) -> dict[str, Any]:
+    """Build a synthetic result dict for a denied tool call.
+
+    Returns: {name, params, output} — same shape as `execute_tool_calls`,
+    so it can be passed straight to `format_tool_results`.
+    """
+    return {**call, "output": DENIED_RESULT_OUTPUT}
+
+
 __all__ = [
     "parse_tool_calls",
     "execute_tool_calls",
     "format_tool_results",
+    "format_tool_call_for_user",
+    "interactive_confirm",
+    "denied_result",
+    "strip_ansi",
     "ToolRegistry",
     "default_tool_registry",
     "INVOKE_PATTERN",
     "PARAM_PATTERN",
+    "ENVELOPE_PATTERN",
+    "MAX_TOOL_CALLS_PER_TURN",
+    "MAX_TOOL_OUTPUT_BYTES",
+    "DENIED_RESULT_OUTPUT",
 ]

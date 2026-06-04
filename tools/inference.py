@@ -18,6 +18,18 @@ sys.path.insert(0, project_root)
 from model.patching import StridedFastBLTPatcher
 from model.backbone import buselModel
 from multimodal.special_tokens import vocab_size as _vocab_size
+from tools.tool_executor import (
+    default_tool_registry,
+    parse_tool_calls,
+    execute_tool_calls,
+    format_tool_results,
+    format_tool_call_for_user,
+    interactive_confirm,
+    denied_result,
+    strip_ansi,
+    MAX_TOOL_CALLS_PER_TURN,
+    MAX_TOOL_OUTPUT_BYTES,
+)
 
 
 class InferenceConfig:
@@ -266,10 +278,10 @@ def print_banner(profile, device, loaded):
     status = "💾 trained weights" if loaded else "🎲 random weights"
     print()
     print("╔" + "═" * 66 + "╗")
-    print("║" + "🦩  BUSEL LOCAL CHAT v1.8 (FULL PROMPT)".center(66) + "║")
+    print("║" + "🦩  BUSEL LOCAL CHAT v1.9 (TOOL EXECUTOR)".center(66) + "║")
     print("║" + f"Profile: {profile}  |  Device: {device.upper()}  |  {status}".center(66) + "║")
     print("╠" + "═" * 66 + "╣")
-    print("║" + "  /exit — выход  /reset — контекст  /raw — raw mode".ljust(66) + "║")
+    print("║" + "  /exit /reset /raw  /tools  /auto on|off".ljust(66) + "║")
     print("║" + "  /temp 0.7  /topp 0.9  /rep 1.15  /max 150".ljust(66) + "║")
     print("╚" + "═" * 66 + "╝")
     print()
@@ -279,6 +291,8 @@ def interactive_loop(model, patcher, device, profile, loaded):
     print_banner(profile, device, loaded)
     temperature, top_p, repetition_penalty, max_new_tokens = 0.7, 0.9, 1.15, 150
     raw_mode, context = False, ""
+    auto_approve = False
+    tool_registry = default_tool_registry()
 
     while True:
         try:
@@ -299,6 +313,25 @@ def interactive_loop(model, patcher, device, profile, loaded):
         if user_input.lower() == "/raw":
             raw_mode = not raw_mode
             print(f"🔀 Raw mode: {'ON' if raw_mode else 'OFF'}")
+            continue
+        if user_input.lower() == "/tools":
+            names = tool_registry.names()
+            print(f"🔧 Available tools ({len(names)}): {', '.join(names)}")
+            print(f"   Max tool calls per turn: {MAX_TOOL_CALLS_PER_TURN}")
+            print(f"   Auto-approve: {'ON' if auto_approve else 'OFF'}")
+            continue
+        if user_input.lower().startswith("/auto"):
+            parts = user_input.split()
+            if len(parts) == 1:
+                auto_approve = not auto_approve
+            elif parts[1].lower() in ("on", "1", "yes", "y", "true"):
+                auto_approve = True
+            elif parts[1].lower() in ("off", "0", "no", "n", "false"):
+                auto_approve = False
+            else:
+                print("❌ usage: /auto [on|off]")
+                continue
+            print(f"🤖 Auto-approve tool calls: {'ON' if auto_approve else 'OFF'}")
             continue
         if user_input.lower().startswith("/temp"):
             try:
@@ -331,21 +364,62 @@ def interactive_loop(model, patcher, device, profile, loaded):
 
         prompt = (context + user_input) if raw_mode else (context + f"User: {user_input}\nAssistant: ")
 
-        print("\033[1;33mBusel>\033[0m ", end="", flush=True)
-        generated_text = ""
-        try:
-            for chunk in generate_stream(
-                model, patcher, prompt, device,
-                max_new_tokens=max_new_tokens, temperature=temperature,
-                top_p=top_p, repetition_penalty=repetition_penalty,
-                stop_on_newline=not raw_mode,
-            ):
-                print(chunk, end="", flush=True)
-                generated_text += chunk
-        except KeyboardInterrupt:
-            print(" [прервано]")
-        print()
-        context = (prompt + generated_text) if raw_mode else (prompt + generated_text + "\n")
+        # Multi-pass: model can emit tool calls, get results, continue generating.
+        # Each pass is one `generate_stream` call. Up to MAX_TOOL_CALLS_PER_TURN
+        # tool-call rounds per user turn (loop guard).
+        for pass_idx in range(MAX_TOOL_CALLS_PER_TURN + 1):
+            print("\033[1;33mBusel>\033[0m ", end="", flush=True)
+            generated_text = ""
+            try:
+                for chunk in generate_stream(
+                    model, patcher, prompt, device,
+                    max_new_tokens=max_new_tokens, temperature=temperature,
+                    top_p=top_p, repetition_penalty=repetition_penalty,
+                    # Tool-call envelopes span multiple lines; the model must
+                    # not be cut off at the first newline mid-envelope.
+                    stop_on_newline=False,
+                ):
+                    print(chunk, end="", flush=True)
+                    generated_text += chunk
+            except KeyboardInterrupt:
+                print(" [прервано]")
+                break
+            print()
+
+            context = (prompt + generated_text) if raw_mode else (prompt + generated_text + "\n")
+
+            calls = parse_tool_calls(generated_text)
+            if not calls:
+                # No tool calls → this is the final assistant turn for this user message.
+                break
+
+            if pass_idx >= MAX_TOOL_CALLS_PER_TURN:
+                print(
+                    f"⚠️  Max tool calls per turn ({MAX_TOOL_CALLS_PER_TURN}) reached. "
+                    f"Stopping tool loop — returning to you."
+                )
+                break
+
+            # Per-call confirmation: default N = deny. The user can flip the
+            # session default to "always approve" via /auto on.
+            results = []
+            for call in calls:
+                confirmed = interactive_confirm(call, auto_approve=auto_approve)
+                if confirmed:
+                    raw_output = tool_registry.call(call["name"], call["params"])
+                    output = strip_ansi(str(raw_output))[:MAX_TOOL_OUTPUT_BYTES]
+                    print(f"   ✅ {format_tool_call_for_user(call)}")
+                    print(f"      → {output[:300]}{'...' if len(output) > 300 else ''}")
+                    results.append({**call, "output": output})
+                else:
+                    print(f"   🚫 Denied: {format_tool_call_for_user(call)}")
+                    results.append(denied_result(call))
+
+            # Next pass sees `<function_results>...</function_results>` appended
+            # to the conversation and continues with the final response.
+            results_block = format_tool_results(results)
+            context = context + results_block + "\n"
+            prompt = context
 
 
 def main():
