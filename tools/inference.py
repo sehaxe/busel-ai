@@ -111,8 +111,8 @@ def detect_device():
     return "cpu"
 
 
-def load_model(cfg, checkpoint_path, device):
-    print(f"\n⚙️  Building model on {device.upper()}...")
+def load_model(cfg, checkpoint_path, device, compile_inference: bool = False):
+    print(f"\n⚙️  Building model on {device.upper()}..." + ("  (compile ON)" if compile_inference else ""))
     patcher = StridedFastBLTPatcher(d_model=cfg.d_model).to(device)
     model = buselModel(cfg).to(device)
 
@@ -155,6 +155,11 @@ def load_model(cfg, checkpoint_path, device):
 
     model.eval()
     patcher.eval()
+
+    if compile_inference:
+        model = torch.compile(model, fullgraph=False, dynamic=True, mode="default")
+        patcher = torch.compile(patcher, fullgraph=False, dynamic=True, mode="default")
+
     return model, patcher, loaded
 
 
@@ -408,6 +413,8 @@ def main():
     parser.add_argument("--checkpoint", "-c", type=str, default=None)
     parser.add_argument("--profile", "-p", type=str, default=None)
     parser.add_argument("--device", "-d", type=str, default=None)
+    parser.add_argument("--compile-inference", action="store_true",
+                        help="Wrap model+patcher in torch.compile (dynamic=True, mode=default) for ~1.2x gen loop speedup")
     args = parser.parse_args()
 
     ckpt = args.checkpoint
@@ -423,7 +430,7 @@ def main():
     cfg, profile = resolve_config(ckpt, args.profile)
     device = args.device or detect_device()
     print(f"🖥️  Device: {device.upper()}")
-    model, patcher, loaded = load_model(cfg, ckpt, device)
+    model, patcher, loaded = load_model(cfg, ckpt, device, compile_inference=args.compile_inference)
 
     try:
         interactive_loop(model, patcher, device, profile, loaded)
