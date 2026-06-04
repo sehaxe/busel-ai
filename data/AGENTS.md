@@ -1,6 +1,6 @@
 # data/ — Stream-Interleaving Token Loader
 
-**Scope:** IterableDataset + DataLoader that mixes multiple files in `data_train/` on the fly. Rust-accelerated when available. Streams are `list[int]` with values in `[0, 259)` so multimodal marker tokens (256, 257, 258) can ride alongside real bytes.
+**Scope:** IterableDataset + DataLoader that mixes multiple files in `data_train/` on the fly. Rust-accelerated when available. Streams are `list[int]` with values in `[0, 326)` so multimodal marker tokens (256-325) can ride alongside real bytes.
 
 ## STRUCTURE
 ```
@@ -14,7 +14,7 @@ data/
 | Add file format support | `pipeline.py:buselOmnivoreTextExtractor` | Branches on `.parquet` / `.jsonl` / `.txt` / `.bin` |
 | Change mixing strategy | `pipeline.py` → mixing loop | Currently round-robin random chunk from each streamer |
 | Bypass Rust (Python-only) | unset `busel_rust_io` build | `HAS_RUST_IO` falls back to `PythonByteStreamer` |
-| Image handling | `pipeline.py:Omnivore` | PIL resize to 32×32 → list[int] (token 256 marker, 3072 payload, 257) |
+| Image handling | `pipeline.py:Omnivore` | emits `[MOD_IMAGE, *3072 RGB pixels*, MEDIA_END]` — modality-prefixed |
 | PDF support | `pipeline.py` | Requires `uv add docling`; auto-detected |
 
 ## KEY CLASSES / FUNCTIONS
@@ -31,9 +31,9 @@ data/
 - **Python fallback:** `PythonByteStreamer` reads entire file into memory (only for small datasets)
 - **Chunk size:** From config (`data.chunk_size`); tokens short of chunk are zero-padded (token 0)
 - **File format detection:** Extension-based (`.parquet`, `.jsonl`, `.txt`, `.bin`)
-- **Image encoding:** `Image.open().convert("RGB").resize((32,32)).tobytes()` — 3072 payload tokens + 2 marker tokens
-- **Multimodal marker:** Token `256` (`__MEDIA_START__`) and `257` (`__MEDIA_END__`) are integer token IDs, NOT bytes. See `multimodal/AGENTS.md` for the design rationale.
-- **Stream representation:** `self.raw_bytes` is `list[int]` (not `bytearray`). Values are in `[0, 259)` — real bytes 0-255 + marker tokens 256/257/258.
+- **Image encoding (JSONL):** emits `[MOD_IMAGE, *3072 RGB pixels*, MEDIA_END]`. Backward-compat decode accepts legacy `[256, ...payload..., 257]` too.
+- **Multimodal markers:** legacy 256/257/258 (`MEDIA_START`, `MEDIA_END`, `DOC_SEP`) plus modality prefixes 263-268 (`MOD_*`). All are integer token IDs, NOT bytes. See `multimodal/AGENTS.md` for the full 70-token design.
+- **Stream representation:** `self.raw_bytes` is `list[int]` (not `bytearray`). Values are in `[0, 326)` — real bytes 0-255 + marker tokens 256-325.
 - **PDF:** Auto-converted via Docling (if installed) → text → list[int] (text bytes 0-255, no markers)
 - **Mixing:** `get_busel_dataloader` opens streamers to ALL files in `data_train/`; random chunk per step
 - **IterableDataset:** True streaming (not map-style); no random access
@@ -48,6 +48,7 @@ data/
 - **NEVER** mix `Image.open` without `.convert("RGB")` — RGBA → bytes breaks
 - **NEVER** read `.jsonl` line-by-line without `try/except` — bad lines break pipeline
 - **NEVER** use `bytearray.append(256)` — Python's `bytearray` rejects values ≥ 256. Use `list.append(256)`.
+- **NEVER** hardcode a token ID (e.g. `256` or `MOD_IMAGE.id`) — import from `multimodal.special_tokens` so disabled tokens don't leak into the stream
 - **NEVER** set `num_workers > 0` for `buselOmnivoreTextExtractor` — not picklable
 - **NEVER** cache `pd.read_parquet` results in module scope — reload on each call
 - **NEVER** use `with open(..., "rb")` for streaming — entire file loads into RAM
@@ -59,7 +60,7 @@ data/
 - **`busel` Python import:** Built from `busel_rust_io/` via `maturin develop --release`; `pyproject.toml` defines `python-source = "busel_rust_io"`
 - **Resume support:** `start_offset` parameter on `ByteStreamer` enables mid-file resume
 - **Docling optional:** `uv add docling` enables PDF→text; absence is silent (PDFs skipped, not errored)
-- **PIL bytes layout:** 32×32×3 = 3072 payload tokens; tokens 256/257 mark boundaries
+- **PIL bytes layout:** 32×32×3 = 3072 payload tokens; `MOD_IMAGE`/`MEDIA_END` mark boundaries
 - **Multimodal encoders:** See `multimodal/AGENTS.md` for the design (text/image/video/audio/PDF/docx → `list[int]`)
 - **Mixing random seed:** Currently uses `random` module (not seeded); step determinism is per-streamer
 - **Speed bottleneck:** `pd.read_parquet` for huge files is slow — consider Rust mmap for parquet too

@@ -6,6 +6,106 @@ adheres to [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [5.4.0] — 2026-06-04 — "Sovereign 70-token Vocabulary" 🛸
+
+### Added
+
+- **`multimodal/special_tokens.py`** — a plug-in `SpecialToken` registry.
+  Frozen dataclass with `name`, `id`, `layer`, `description`, `enabled`;
+  int-coercible. Auto-allocates IDs starting at 259, exposes:
+  - `vocab_size()` — currently **326** (256 bytes + 3 legacy + 67 plug-in)
+  - `enabled_ids()` — 70 ints for the inference logits mask
+  - `get_special_token(name)`, `register_special_token(name, layer, description)`
+  - `disable_special_token(name)`, `enable_special_token(name)`
+  - `list_special_tokens()`, `layer_summary()` — introspection
+  - Self-test on `python -m multimodal.special_tokens` prints the full layer
+    breakdown and validates the toggle invariant
+- **70 special tokens across 12 functional layers** — auto-defined at import:
+  1. **sequence** (4) — `BOS`, `EOS`, `PAD`, `UNK`
+  2. **modality** (6) — `MOD_IMAGE`, `MOD_VIDEO`, `MOD_AUDIO`, `MOD_PDF`, `MOD_DOCX`, `MOD_TEXT`
+  3. **mm_struct** (3) — `FRAME_SEP`, `AUDIO_CHUNK_SEP`, `CHANNEL_SEP`
+  4. **role** (4) — `ROLE_SYSTEM`, `ROLE_USER`, `ROLE_ASSISTANT`, `ROLE_TOOL`
+  5. **reasoning** (4) — `THINK_START`, `THINK_END`, `PLAN_START`, `PLAN_END`
+  6. **code** (4) — `CODE_BLOCK_START`, `CODE_BLOCK_END`, `DIFF_START`, `DIFF_END`
+  7. **tool_xml** (12) — Anthropic-style `<function_calls>` / `<invoke>` / `<parameter>` / `<result>` envelope (start/end per tag × 6)
+  8. **tool** (12) — opencode tool vocabulary: `TOOL_BASH`, `TOOL_READ`, `TOOL_WRITE`, `TOOL_EDIT`, `TOOL_GREP`, `TOOL_GLOB`, `TOOL_FETCH`, `TOOL_SEARCH`, `TOOL_TASK`, `TOOL_TODO`, `TOOL_LSP`, `TOOL_ASK`
+  9. **task** (4) — `TODO_START`, `TODO_END`, `TASK_DONE`, `TASK_PENDING`
+  10. **reference** (6) — `FILE_PATH_START`/`END`, `URL_START`/`END`, `CITE_START`/`END`
+  11. **subagent** (4) — `SUBAGENT_START`/`END`, `SUBAGENT_RESULT_START`/`END`
+  12. **status** (4) — `STATUS_SUCCESS`, `STATUS_ERROR`, `STATUS_TIMEOUT`, `STATUS_CANCELLED`
+- **`buselModel.__init__` vocab sanity check** — raises `ValueError` with
+  a helpful diagnostic if `config.vocab_size < vocab_size()`. Catches
+  stale yaml configs that forgot to bump the vocab.
+- **13 new tests** in `tests/test_suite.py` (prefix `MM-14` … `MM-26`):
+  registry correctness, layer-summary sanity, all 6 encoders emit
+  `MOD_*` prefix, disable/enable roundtrip preserves IDs, runtime token
+  registration grows vocab, legacy-collision rejection, decoder accepts
+  both `MOD_*` and legacy markers, patcher `embed_weight` shape tracks
+  registry, `buselModel` rejects undersized config.
+- **Smoke test** `smoke_test_vocab326.py` — end-to-end forward + backward
+  + optimizer loop on real GPU, verifies all 4 MTP heads are finite,
+  gradients flow, logits cover full vocab=326, special tokens reach
+  training targets.
+
+### Changed
+
+- **`configs/default.yaml`** — all 6 profiles: `vocab_size: 259` → `326`
+  (with inline comment: `# 256 raw bytes + 3 legacy + 67 plug-in specials`).
+- **`model/patching.py`** — `embed_weight` is now
+  `nn.Parameter(torch.randn(vocab_size(), d_byte))` (was `(259, d_byte)`),
+  auto-tracking the registry. Old hardcoded 259 references removed.
+- **`model/backbone.py:buselModel`** — uses dynamic `vocab_size()` when
+  `config.vocab_size` is 0, and sanity-checks against the registry.
+- **`multimodal/encoders.py`** — `_resolve_modality_marker()` returns
+  `int` (was `SpecialToken`). All 6 encoders now emit `MOD_*` prefixes
+  for modality awareness. `TextEncoder.encode_file` now emits
+  `[MOD_TEXT, *bytes, MEDIA_END]` (was bare bytes). Legacy `[256, ...,
+  257]` is still accepted by the decoder for backward compat.
+- **`tools/inference.py`** — `apply_sampling` masks
+  `logits[256:vocab_size()] = -inf` (was `logits[256:]`).
+- **`data/pipeline.py`** — JSONL image rows emit
+  `[MOD_IMAGE, *payload, MEDIA_END]` (was `[256, ..., 257]`). Has a
+  graceful fallback to legacy markers if `multimodal` is unavailable.
+- **7 existing tests fixed** to use `vocab_size()` (dynamic) and
+  modality-specific markers (`MOD_IMAGE`, `MOD_VIDEO`, etc.) instead
+  of the old `256` / `IMAGE_MARKER` constants.
+- **`multimodal/AGENTS.md`**, **`model/AGENTS.md`**, **`data/AGENTS.md`**
+  — all updated to document the new 70-token vocabulary, the
+  `MOD_*` modality markers, the dynamic vocab API, the new ANTI-PATTERNS
+  (no hardcoded token IDs, no shrinking `config.vocab_size`), and the
+  breaking checkpoint-incompatibility note.
+
+### Breaking Changes
+
+- **Old 259-vocab checkpoints are NOT loadable** in v5.4.0. The
+  `embed_weight` shape is now `(326, d_byte)`. Loading a `(259, d_byte)`
+  checkpoint will fail with strict-state-dict mismatch. **Re-train from
+  scratch** or convert via the registry's `disable_special_token` +
+  `register_special_token` API to match the old ID layout.
+
+### Anti-patterns (do not violate — new for 5.4.0)
+
+- **NEVER** hardcode token IDs (`256`, `MOD_IMAGE.id`, etc.) — always
+  import from `multimodal.special_tokens`. The IDs are auto-allocated
+  and may shift when tokens are disabled or added.
+- **NEVER** set `config.vocab_size` smaller than `vocab_size()` —
+  `buselModel.__init__` will reject it.
+- **NEVER** shrink `config.vocab_size` to "remove" disabled tokens — the
+  registry keeps the ID slot reserved; the inference mask only covers
+  enabled IDs.
+- **NEVER** use the old `256` / `IMAGE_MARKER` constants in new code —
+  use `MOD_IMAGE` / `MOD_VIDEO` / `MOD_AUDIO` / `MOD_PDF` / `MOD_DOCX` /
+  `MOD_TEXT`. Legacy 256-258 are kept for backward-compat decode only.
+
+### Performance
+
+No regression. Embedding went from `(259, 128)` to `(326, 128)` —
++67×128 = +8.5 K params for the validation profile (0.4 % of total).
+Verified on RTX 5060 Ti: 5 forward + backward + step cycles, no NaN/Inf,
+no measurable throughput change.
+
+---
+
 ## [5.3.0] — 2026-06-04 — "Multimodal Sovereign" 🛰️
 
 ### Added

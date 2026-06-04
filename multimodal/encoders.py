@@ -1,32 +1,36 @@
 """
-🛰️ busel MULTIMODAL v1.0 — Any-to-Token Encoders
+🛰️ busel MULTIMODAL v5.4 — Any-to-Token Encoders (vocab=326)
+
 Sovereign byte-level encoders for images, video, audio, PDF, and docx.
 
 Busel is byte-level: the same `BitLinear_a4_8` processes every modality.
 The encoders below turn files into a stream of integer tokens that fits
-into the existing 259-vocab (256 bytes + 3 multimodal specials). Decoders
-reverse the process for inspection.
+into the dynamically-computed vocab (see `multimodal.special_tokens`).
+Decoders reverse the process for inspection.
 
 CRITICAL — representation:
     The encoders return `list[int]` (NOT `bytes`). The values 0-255 are
-    real bytes; 256/257/258 are RESERVED TOKEN INDICES in the model's
-    vocab. Python's `bytes` type cannot represent values >= 256, so the
-    multimodal stream is an `int` stream that the data collate function
-    converts to `int32` tensors.
+    real bytes; 256+ are RESERVED TOKEN INDICES in the model's vocab
+    (256-258 legacy + 259+ plug-in specials from `special_tokens`).
+    Python's `bytes` type cannot represent values >= 256, so the multimodal
+    stream is an `int` stream that the data collate function converts to
+    `int32` tensors.
 
-Multimodal markers:
-    256  __MEDIA_START__   start of a media payload
-    257  __MEDIA_END__     end of a media payload
-    258  __DOC_SEP__       cross-document boundary (also b"\n\n")
-
-Layout for each modality:
-    IMAGE:   [256] [3072 raw RGB bytes @ 32x32] [257]
-    VIDEO:   [256] [4-byte frame_count LE] (frame_0 ... frame_N) [257]
+Multimodal layout (v5.4, plug-in token IDs from `special_tokens`):
+    IMAGE:   [MOD_IMAGE] [3072 raw RGB bytes @ 32x32] [MEDIA_END]
+    VIDEO:   [MOD_VIDEO] [4-byte frame_count LE] (frame_0 ... frame_N) [MEDIA_END]
              each frame = [3072 raw RGB bytes]
-    AUDIO:   [256] [4-byte sample_rate LE] [4-byte n_samples LE]
-             [2-byte sample_width] [little-endian int16 PCM] [257]
-    PDF:     [256] [Docling-converted UTF-8 text] [257]
-    DOCX:    [256] [python-docx plain-text UTF-8] [257]
+    AUDIO:   [MOD_AUDIO] [4-byte sample_rate LE] [4-byte n_samples LE]
+             [2-byte sample_width] [little-endian int16 PCM] [MEDIA_END]
+    PDF:     [MOD_PDF]   [Docling-converted UTF-8 text] [MEDIA_END]
+    DOCX:    [MOD_DOCX]  [python-docx plain-text UTF-8] [MEDIA_END]
+    TEXT:    [MOD_TEXT]  [UTF-8 bytes, no MEDIA_END — unbounded]
+
+Legacy layouts (v5.0-5.3, still decoded for backward compat):
+    [MEDIA_START] [payload] [MEDIA_END]  — no MOD_* prefix
+
+All `MOD_*` IDs and `MEDIA_*` IDs come from
+`multimodal.special_tokens` — no hardcoded numbers in this file.
 """
 from __future__ import annotations
 
@@ -37,10 +41,19 @@ from io import BytesIO
 from typing import Tuple
 
 from busel_registry import register
+from multimodal.special_tokens import (
+    MEDIA_START,
+    MEDIA_END,
+    DOC_SEP,
+    is_enabled,
+    get_special_token,
+)
 
-IMAGE_MARKER = 256
-MEDIA_END = 257
-DOC_SEP = 258
+# Backward-compat alias — older code (v5.0-5.3) imports `IMAGE_MARKER` to mean
+# the generic "media start" token. The plug-in split makes the modality explicit
+# (MOD_IMAGE, MOD_VIDEO, ...) but we keep the legacy name for the same value.
+IMAGE_MARKER = MEDIA_START
+
 IMAGE_W = 32
 IMAGE_H = 32
 IMAGE_BYTES = IMAGE_W * IMAGE_H * 3
@@ -83,6 +96,29 @@ except ImportError:
     HAS_DOCLING = False
 
 
+def _resolve_modality_marker(modality: str) -> int:
+    """Resolve a MOD_* token id, falling back to legacy MEDIA_START if disabled.
+
+    If the modality's special token has been disabled at runtime, we emit the
+    legacy `MEDIA_START` (256) so the stream is still valid for the model.
+    The downstream `MEDIA_END` is always emitted (legacy, never disabled).
+    """
+    name_map = {
+        "image": "mod_image",
+        "video": "mod_video",
+        "audio": "mod_audio",
+        "pdf":   "mod_pdf",
+        "docx":  "mod_docx",
+        "text":  "mod_text",
+    }
+    if modality not in name_map:
+        raise ValueError(f"unknown modality: {modality!r}")
+    name = name_map[modality]
+    if is_enabled(name):
+        return get_special_token(name).id
+    return MEDIA_START
+
+
 @register("encoder", "image")
 class ImageEncoder:
     """Encode/decode RGB images @ 32×32 = 3072 token payload.
@@ -90,6 +126,8 @@ class ImageEncoder:
     Fast path uses OpenCV (cv2.imdecode + cv2.resize INTER_AREA + cv2.cvtColor),
     ~3× faster than PIL on realistic 1024² images. PIL is a fallback when cv2
     is unavailable.
+
+    Layout (v5.4): [MOD_IMAGE] [3072 raw RGB bytes] [MEDIA_END]
     """
 
     name = "image"
@@ -115,14 +153,14 @@ class ImageEncoder:
             return self._encode_pil_path(path)
         raw = arr.tobytes()
         assert len(raw) == IMAGE_BYTES, f"image bytes {len(raw)} != {IMAGE_BYTES}"
-        return [IMAGE_MARKER] + list(raw) + [MEDIA_END]
+        return [_resolve_modality_marker("image")] + list(raw) + [MEDIA_END]
 
     def _encode_pil_path(self, path: str) -> list:
         with Image.open(path) as im:
             im = im.convert("RGB").resize(self.size)
             raw = im.tobytes()
         assert len(raw) == IMAGE_BYTES
-        return [IMAGE_MARKER] + list(raw) + [MEDIA_END]
+        return [_resolve_modality_marker("image")] + list(raw) + [MEDIA_END]
 
     def encode(self, image) -> list:
         if HAS_CV2 and not (HAS_PIL and isinstance(image, Image.Image)):
@@ -141,15 +179,17 @@ class ImageEncoder:
             arr = np.asarray(im)
         raw = arr.tobytes()
         assert len(raw) == IMAGE_BYTES, f"image bytes {len(raw)} != {IMAGE_BYTES}"
-        return [IMAGE_MARKER] + list(raw) + [MEDIA_END]
+        return [_resolve_modality_marker("image")] + list(raw) + [MEDIA_END]
 
     def decode(self, tokens: list) -> "Image.Image":
-        if not tokens or tokens[0] != IMAGE_MARKER:
-            raise ValueError("tokens missing image marker (256)")
+        if not tokens:
+            raise ValueError("empty token stream")
+        if tokens[0] not in (get_special_token("mod_image").id, MEDIA_START):
+            raise ValueError(f"tokens missing image marker (got {tokens[0]})")
         try:
             end = tokens.index(MEDIA_END, 1)
         except ValueError:
-            raise ValueError("tokens missing media-end marker (257)")
+            raise ValueError("tokens missing media-end marker")
         payload = tokens[1:end]
         if len(payload) != IMAGE_BYTES:
             raise ValueError(f"image payload {len(payload)} != {IMAGE_BYTES}")
@@ -163,6 +203,8 @@ class VideoEncoder:
     Fast path uses OpenCV VideoCapture with CAP_PROP_FRAME_COUNT (single
     metadata call) + cap.grab() for seek-skipping. imageio fallback
     iterates the video twice (frame count + frames) and is ~5-10× slower.
+
+    Layout (v5.4): [MOD_VIDEO] [4-byte frame_count LE] (frame_0 ... frame_N) [MEDIA_END]
     """
 
     name = "video"
@@ -185,19 +227,20 @@ class VideoEncoder:
         return list(arr.tobytes())
 
     def encode_file(self, path: str) -> list:
+        marker = _resolve_modality_marker("video")
         if HAS_CV2:
             cap = cv2.VideoCapture(path)
             if not cap.isOpened():
                 cap.release()
                 if HAS_IMAGEIO:
-                    return self._encode_imageio(path)
+                    return self._encode_imageio(path, marker)
                 raise ValueError(f"cv2.VideoCapture failed to open {path}")
             n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if n_total <= 0:
                 cap.release()
-                return [IMAGE_MARKER, MEDIA_END]
+                return [marker, MEDIA_END]
             step = max(1, n_total // self.max_frames)
-            out = [IMAGE_MARKER]
+            out = [marker]
             out += list(struct.pack("<I", self.max_frames))
             n_written = 0
             for idx in range(n_total):
@@ -214,16 +257,16 @@ class VideoEncoder:
             cap.release()
             out.append(MEDIA_END)
             return out
-        return self._encode_imageio(path)
+        return self._encode_imageio(path, marker)
 
-    def _encode_imageio(self, path: str) -> list:
+    def _encode_imageio(self, path: str, marker: int) -> list:
         n_total = 0
         for _ in iio.imiter(path):
             n_total += 1
         if n_total == 0:
-            return [IMAGE_MARKER, MEDIA_END]
+            return [marker, MEDIA_END]
         step = max(1, n_total // self.max_frames)
-        out = [IMAGE_MARKER]
+        out = [marker]
         out += list(struct.pack("<I", self.max_frames))
         n_written = 0
         for idx, frame in enumerate(iio.imiter(path)):
@@ -237,8 +280,10 @@ class VideoEncoder:
         return out
 
     def decode(self, tokens: list) -> list:
-        if not tokens or tokens[0] != IMAGE_MARKER:
-            raise ValueError("tokens missing image marker")
+        if not tokens:
+            raise ValueError("empty token stream")
+        if tokens[0] not in (get_special_token("mod_video").id, MEDIA_START):
+            raise ValueError(f"tokens missing video marker (got {tokens[0]})")
         n = struct.unpack("<I", bytes(tokens[1:5]))[0]
         cursor = 5
         frames = []
@@ -253,7 +298,10 @@ class VideoEncoder:
 
 @register("encoder", "audio")
 class AudioEncoder:
-    """Encode WAV / FLAC / OGG audio as 16-bit PCM token stream."""
+    """Encode WAV / FLAC / OGG audio as 16-bit PCM token stream.
+
+    Layout (v5.4): [MOD_AUDIO] [4-byte sr] [4-byte n] [2-byte sw] [int16 PCM LE] [MEDIA_END]
+    """
 
     name = "audio"
     extensions = (".wav", ".flac", ".ogg")
@@ -271,7 +319,8 @@ class AudioEncoder:
         if len(data) > int(self.max_seconds * sr):
             data = data[: int(self.max_seconds * sr)]
         pcm16 = (data * 32767.0).clip(-32768, 32767).astype("<i2").tobytes()
-        out = [IMAGE_MARKER]
+        marker = _resolve_modality_marker("audio")
+        out = [marker]
         out += list(struct.pack("<I", sr))
         out += list(struct.pack("<I", len(pcm16) // 2))
         out += list(struct.pack("<H", 2))
@@ -280,8 +329,10 @@ class AudioEncoder:
         return out
 
     def decode_to_wav(self, tokens: list) -> bytes:
-        if not tokens or tokens[0] != IMAGE_MARKER:
-            raise ValueError("tokens missing image marker")
+        if not tokens:
+            raise ValueError("empty token stream")
+        if tokens[0] not in (get_special_token("mod_audio").id, MEDIA_START):
+            raise ValueError(f"tokens missing audio marker (got {tokens[0]})")
         sr, n, sw = struct.unpack("<IIH", bytes(tokens[1:11]))
         cursor = 11
         pcm = bytes(tokens[cursor:cursor + n * sw])
@@ -296,7 +347,10 @@ class AudioEncoder:
 
 @register("encoder", "pdf")
 class PDFEncoder:
-    """Encode PDF documents as UTF-8 text via Docling."""
+    """Encode PDF documents as UTF-8 text via Docling.
+
+    Layout (v5.4): [MOD_PDF] [Docling markdown UTF-8] [MEDIA_END]
+    """
 
     name = "pdf"
     extensions = (".pdf",)
@@ -314,12 +368,16 @@ class PDFEncoder:
     def encode_file(self, path: str) -> list:
         result = self._get_converter().convert(path)
         text = result.document.export_to_markdown()
-        return [IMAGE_MARKER] + list(text.encode("utf-8", errors="replace")) + [MEDIA_END]
+        marker = _resolve_modality_marker("pdf")
+        return [marker] + list(text.encode("utf-8", errors="replace")) + [MEDIA_END]
 
 
 @register("encoder", "docx")
 class DocxEncoder:
-    """Encode .docx files as UTF-8 plain text."""
+    """Encode .docx files as UTF-8 plain text.
+
+    Layout (v5.4): [MOD_DOCX] [python-docx plain text UTF-8] [MEDIA_END]
+    """
 
     name = "docx"
     extensions = (".docx",)
@@ -337,19 +395,23 @@ class DocxEncoder:
                 if cells:
                     parts.append(" | ".join(cells))
         text = "\n".join(parts)
-        return [IMAGE_MARKER] + list(text.encode("utf-8", errors="replace")) + [MEDIA_END]
+        marker = _resolve_modality_marker("docx")
+        return [marker] + list(text.encode("utf-8", errors="replace")) + [MEDIA_END]
 
 
 @register("encoder", "text")
 class TextEncoder:
-    """Trivial text encoder (UTF-8). Used as the default for unknown formats."""
+    """Trivial text encoder (UTF-8). Used as the default for unknown formats.
+
+    Layout (v5.4): [MOD_TEXT] [raw UTF-8 bytes]   (no MEDIA_END — unbounded)
+    """
 
     name = "text"
     extensions = (".txt", ".md", ".py", ".json", ".jsonl", ".rs", ".cpp", ".h", ".go")
 
     def encode_file(self, path: str) -> list:
         with open(path, "rb") as f:
-            return list(f.read())
+            return [_resolve_modality_marker("text")] + list(f.read())
 
 
 ENCODER_REGISTRY: dict = {}

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from model.layers import RMSNorm, nvtx_range_push, nvtx_range_pop
+from multimodal.special_tokens import vocab_size as _vocab_size
 
 class StridedFastBLTPatcher(nn.Module):
     def __init__(self, d_model=768, d_byte=128, stride=4, kernel_size=5):
@@ -13,8 +14,9 @@ class StridedFastBLTPatcher(nn.Module):
         self.d_model = d_model
         self.d_byte = d_byte
         self.kernel_size = kernel_size
-        
-        self.embed_weight = nn.Parameter(torch.randn(259, d_byte) * 0.02)
+
+        self.vocab_size = _vocab_size()
+        self.embed_weight = nn.Parameter(torch.randn(self.vocab_size, d_byte) * 0.02)
         
         # 🎯 ИСПРАВЛЕНИЕ: Нелинейный гейт (Mini-SwishGLU) для фильтрации синтаксического шума
         self.gate_proj_down = nn.Linear(d_byte, max(1, d_byte // 4))

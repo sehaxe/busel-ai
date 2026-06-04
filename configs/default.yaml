@@ -13,7 +13,7 @@ profiles:
       expert_hidden: 256
       num_experts: 2
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
     data:
       data_path: "data_train"
       chunk_size: 256
@@ -36,7 +36,7 @@ profiles:
       expert_hidden: 256
       num_experts: 2         # 2 experts for speed
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
     data:
       data_path: "data_train"
       chunk_size: 256       # Small context for speed
@@ -59,7 +59,7 @@ profiles:
       expert_hidden: 256
       num_experts: 2
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
     data:
       data_path: "data_train"
       chunk_size: 256
@@ -81,7 +81,7 @@ profiles:
       expert_hidden: 384    # 2 * d_model
       num_experts: 4        # 4 эксперта MoE
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
     data:
       data_path: "data_train"
       chunk_size: 512      # Рабочий контекст 2К
@@ -97,21 +97,21 @@ profiles:
 
   shpak:
     model:
-      d_model: 384          
-      n_layers: 8           
-      n_heads: 6            
-      expert_hidden: 768    
-      num_experts: 4        
+      d_model: 384
+      n_layers: 8
+      n_heads: 6
+      expert_hidden: 768
+      num_experts: 4
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
     data:
       data_path: "data_train"
-      chunk_size: 4096      
+      chunk_size: 4096
       batch_size: 128       # Стартовый батч для Shpak (52M параметров)
     training:
-      max_steps: "auto"        
-      warmup_steps: "auto"     
-      min_lr_ratio: 0.1        
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.1
       learning_rate_muon: 0.0006
       learning_rate_adamw: 0.00006
       weight_decay: 0.1
@@ -125,16 +125,16 @@ profiles:
       expert_hidden: 1024
       num_experts: 8
       top_k: 2
-      vocab_size: 259
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
       n_hyper: 4
     data:
       data_path: "data_train"
-      chunk_size: 16384     
+      chunk_size: 16384
       batch_size: 32        # Стартовый батч для Zubr (120M параметров)
     training:
-      max_steps: "auto"        
-      warmup_steps: "auto"     
-      min_lr_ratio: 0.1        
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.1
       learning_rate_muon: 0.0006
       learning_rate_adamw: 0.00006
       weight_decay: 0.1

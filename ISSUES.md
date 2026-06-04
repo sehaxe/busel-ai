@@ -177,6 +177,14 @@ Priority legend:
   fallback.
 - **Commit:** `2352f02`
 
+### [R11] Vocab locked at 259 — no room for chat/coder/agent semantics (v5.4.0)
+
+- **File:** `multimodal/`, `model/`, `data/`, `tools/inference.py`, `configs/default.yaml`, `tests/test_suite.py`
+- **Gap:** vocab was hardcoded at 259 (256 bytes + 3 legacy `MEDIA_START`/`MEDIA_END`/`DOC_SEP`). To make busel ready as a chat bot / coder / agent, we need many more semantic tokens: `BOS`/`EOS`/`PAD`/`UNK`, modality prefixes (`MOD_IMAGE`..`MOD_TEXT`), `ROLE_SYSTEM`/`USER`/`ASSISTANT`/`TOOL`, `THINK_START`/`END`, `PLAN_START`/`END`, code/diff delimiters, Anthropic-style XML tool envelope (`<function_calls>` / `<invoke>` / `<parameter>`), 12 opencode tools (`TOOL_BASH`..`TOOL_ASK`), `TODO`/`TASK_DONE`/`TASK_PENDING`, `FILE_PATH`/`URL`/`CITE` references, `SUBAGENT` delegation, and `STATUS_SUCCESS`/`ERROR`/`TIMEOUT`/`CANCELLED`. Hardcoding 70+ new constants across 5+ files would have been a maintenance nightmare.
+- **Fix:** new `multimodal/special_tokens.py` module — a `SpecialToken` frozen dataclass + plug-in registry. Auto-allocates IDs starting at 259. Auto-defines all 70 tokens at import time across 12 functional layers. Public API: `vocab_size()`, `enabled_ids()`, `get_special_token(name)`, `register_special_token(name, layer, description)`, `disable_special_token(name)`, `enable_special_token(name)`, `list_special_tokens()`, `layer_summary()`. The patcher's `embed_weight` is now `(vocab_size(), d_byte)`, auto-tracking the registry. `buselModel.__init__` sanity-checks `config.vocab_size >= vocab_size()` and raises a helpful `ValueError` on mismatch. All hardcoded references to `259` replaced with `vocab_size()` / `enabled_ids()`. Encoders now emit `MOD_*` prefixes (modality-aware). 13 new tests (MM-14..MM-26) verify registry correctness; 7 existing tests fixed to use dynamic vocab + modality-specific markers. End-to-end smoke test verified on RTX 5060 Ti: 5 forward+backward+step cycles, all 4 MTP heads finite, gradients flow, special tokens reach training targets.
+- **Checkpoint compatibility (BREAKING):** old 259-vocab checkpoints are NOT loadable. `embed_weight` shape is now `(326, d_byte)`. Re-train from scratch.
+- **Commit:** (this session — not yet committed)
+
 ---
 
 ## 📋 Future work (not bugs)

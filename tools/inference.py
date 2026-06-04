@@ -17,6 +17,7 @@ sys.path.insert(0, project_root)
 
 from model.patching import StridedFastBLTPatcher
 from model.backbone import buselModel
+from multimodal.special_tokens import vocab_size as _vocab_size
 
 
 class InferenceConfig:
@@ -168,8 +169,8 @@ def load_model(cfg, checkpoint_path, device):
 
 
 def apply_sampling(logits, temperature, top_p, repetition_penalty, already_generated):
-    # Mask special tokens [256:259] (image/pad/eos per AGENTS.md) — they are not raw bytes and would crash bytearray.append() downstream.
-    logits[256:] = -float("inf")
+    # Mask special tokens [256:VOCAB_SIZE] — they are not raw bytes and would crash bytearray.append() downstream.
+    logits[256:_vocab_size()] = -float("inf")
 
     for tok in already_generated:
         if tok < logits.shape[-1]:
@@ -212,7 +213,7 @@ def generate_stream(model, patcher, prompt, device,
     - Патчер работает с любой длиной благодаря левому паддингу
     """
     prompt_bytes = list(prompt.encode("utf-8"))
-    vocab_size = 259
+    vocab_size = _vocab_size()
     
     generated_bytes = []
     already_generated = set(prompt_bytes)

@@ -51,6 +51,37 @@ try:
 except Exception:
     HAS_MULTIMODAL_DEPS = False
 
+try:
+    from multimodal.special_tokens import (
+        vocab_size as mm_vocab_size,
+        get_special_token,
+        list_special_tokens,
+        disable_special_token,
+        enable_special_token,
+        register_special_token,
+        is_enabled,
+        enabled_ids,
+        LAYER_DESCRIPTIONS,
+        MEDIA_START,
+        DOC_SEP,
+        MOD_IMAGE,
+        MOD_VIDEO,
+        MOD_AUDIO,
+        MOD_PDF,
+        MOD_DOCX,
+        MOD_TEXT,
+        BOS,
+        EOS,
+        THINK_START,
+        THINK_END,
+        TOOL_BASH,
+        STATUS_SUCCESS,
+        SPECIAL_VOCAB_BASE,
+    )
+    HAS_SPECIAL_TOKENS = True
+except Exception:
+    HAS_SPECIAL_TOKENS = False
+
 
 class _MockConfig:
     def __init__(self, **kw):
@@ -60,7 +91,8 @@ class _MockConfig:
         self.expert_hidden = kw.get("expert_hidden", 256)
         self.num_experts = kw.get("num_experts", 2)
         self.top_k = kw.get("top_k", 2)
-        self.vocab_size = kw.get("vocab_size", 259)
+        default_vocab = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
+        self.vocab_size = kw.get("vocab_size", default_vocab)
         self.n_hyper = kw.get("n_hyper", 2)
 
 
@@ -172,7 +204,7 @@ class TestbuselFramework(unittest.TestCase):
         model = buselModel(cfg).to(self.device)
         opt_engine = buselOptimizerEngine(model, lr_muon=0.0004, lr_adamw=0.00004)
         loss_engine = buselLossEngine(cfg.vocab_size)
-        byte_batch = torch.randint(0, 259, (2, 256), dtype=torch.int32, device=self.device)
+        byte_batch = torch.randint(0, cfg.vocab_size, (2, 256), dtype=torch.int32, device=self.device)
         input_bytes = byte_batch[:, :-patcher.stride]
         opt_engine.zero_grad(set_to_none=True)
         target_dtype = torch.bfloat16 if self.device == "cuda" else torch.float16
@@ -439,7 +471,7 @@ class TestbuselFramework(unittest.TestCase):
         B, T = 2, 8
         hidden = torch.randn(B, T, cfg.d_model)
         mtp, aux = model(hidden)
-        self.assertEqual(mtp[0].shape, (B, T, 259))
+        self.assertEqual(mtp[0].shape, (B, T, cfg.vocab_size))
         self.assertEqual(aux.shape, ())
 
     def test_mar_buselModel_n_hyper_4(self):
@@ -448,7 +480,7 @@ class TestbuselFramework(unittest.TestCase):
         B, T = 2, 8
         hidden = torch.randn(B, T, cfg.d_model)
         mtp, aux = model(hidden)
-        self.assertEqual(mtp[0].shape, (B, T, 259))
+        self.assertEqual(mtp[0].shape, (B, T, cfg.vocab_size))
 
     def test_mar_residual_connection_preserved(self):
         # mHC §3.1: y_l = x_l + f_l(mixed_x_l). Residual add must be in buselModel.forward.
@@ -591,10 +623,13 @@ class TestbuselFramework(unittest.TestCase):
             self.assertFalse(torch.isinf(p).any(),
                              f"step {i}: Muon produced Inf weights")
 
-    def test_fastblt_vocab_size_259(self):
-        # Paper §2.1: byte-level vocab is 256 (UTF-8) + 3 multimodal specials = 259
+    def test_fastblt_vocab_size_dynamic(self):
+        # Paper §2.1 (v5.4): byte-level vocab is 256 (UTF-8) + 70 multimodal specials = 326
+        # (3 legacy + 67 plug-in tokens across 12 layers).
         patcher = StridedFastBLTPatcher(d_model=128)
-        self.assertEqual(patcher.embed_weight.shape[0], 259)
+        expected_vocab = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
+        self.assertEqual(patcher.embed_weight.shape[0], expected_vocab,
+                         f"patcher.embed_weight.shape[0] must equal vocab_size()={expected_vocab}")
 
     def test_fastblt_stride_4_kernel_5(self):
         # Paper §3: stride=4, conv kernel=5 (causal receptive field)
@@ -603,16 +638,17 @@ class TestbuselFramework(unittest.TestCase):
         self.assertEqual(patcher.kernel_size, 5)
 
     def test_fastblt_no_bpe_no_subword_tokens(self):
-        # Paper §2.1: NO BPE — vocab is exactly 259
+        # Paper §2.1: NO BPE — vocab stays under 500 (32k BPE contamination = forbidden)
         patcher = StridedFastBLTPatcher(d_model=128)
-        self.assertLessEqual(patcher.embed_weight.shape[0], 300, "Vocab too large — likely BPE contamination")
+        self.assertLessEqual(patcher.embed_weight.shape[0], 500, "Vocab too large — likely BPE contamination")
 
     def test_fastblt_byte_input_to_patch_count(self):
         # Paper §3: T bytes → floor((T - 1) / stride) + 1 patches (left-padding by kernel-1)
         d_model, stride, kernel = 128, 4, 5
         patcher = StridedFastBLTPatcher(d_model=d_model, stride=stride, kernel_size=kernel).eval()
         T = 64
-        byte_ids = torch.randint(0, 259, (2, T))
+        v = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
+        byte_ids = torch.randint(0, v, (2, T))
         with torch.no_grad():
             patches = patcher(byte_ids)
         expected_patches = (T - 1) // stride + 1
@@ -622,7 +658,8 @@ class TestbuselFramework(unittest.TestCase):
         # Paper §3.2: byte embeddings are LEARNED
         patcher = StridedFastBLTPatcher(d_model=128, d_byte=64)
         self.assertTrue(patcher.embed_weight.requires_grad)
-        self.assertEqual(patcher.embed_weight.shape, (259, 64))
+        v = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
+        self.assertEqual(patcher.embed_weight.shape, (v, 64))
 
     def test_fastblt_glu_gate_is_nonlinear(self):
         # Paper §3.2: GLU gate must be nonlinear (sigmoid after SiLU)
@@ -863,7 +900,7 @@ class TestbuselFramework(unittest.TestCase):
         tokens = enc.encode(src)
         self.assertIsInstance(tokens, list, "encode must return list[int]")
         self.assertEqual(len(tokens), IMAGE_BYTES + 2, f"must be {IMAGE_BYTES}+2 tokens, got {len(tokens)}")
-        self.assertEqual(tokens[0], IMAGE_MARKER, "first token must be 256 (__MEDIA_START__)")
+        self.assertEqual(tokens[0], MOD_IMAGE, "first token must be MOD_IMAGE (v5.4 modality prefix)")
         self.assertEqual(tokens[-1], MEDIA_END, "last token must be 257 (__MEDIA_END__)")
         for t in tokens[1:-1]:
             self.assertGreaterEqual(t, 0)
@@ -927,7 +964,7 @@ class TestbuselFramework(unittest.TestCase):
             enc = AudioEncoder(max_seconds=2.0)
             tokens = enc.encode_file(tmp)
             self.assertIsInstance(tokens, list)
-            self.assertEqual(tokens[0], IMAGE_MARKER)
+            self.assertEqual(tokens[0], MOD_AUDIO, "first token must be MOD_AUDIO (v5.4)")
             self.assertEqual(tokens[-1], MEDIA_END)
             header = bytes(tokens[1:11])
             sr_out, n_out, sw_out = struct.unpack("<IIH", header)
@@ -957,8 +994,7 @@ class TestbuselFramework(unittest.TestCase):
             d.save(tmp)
             enc = DocxEncoder()
             tokens = enc.encode_file(tmp)
-            self.assertIsInstance(tokens, list)
-            self.assertEqual(tokens[0], IMAGE_MARKER)
+            self.assertEqual(tokens[0], MOD_DOCX, "first token must be MOD_DOCX (v5.4 modality prefix)")
             self.assertEqual(tokens[-1], MEDIA_END)
             text = bytes(tokens[1:-1]).decode("utf-8")
             self.assertIn("Hello, multimodal Busel!", text)
@@ -1029,18 +1065,20 @@ class TestbuselFramework(unittest.TestCase):
     @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
     def test_mm_text_encoder_in_pipeline_collates_to_int32(self):
         """🛰️ busel MULTIMODAL — encoder output flows through collate_busel_batch to int32 tensor."""
-        print("🧪 [MM-11] busel Multimodal — encoder output → collate → int32 tensor with values up to 258...")
+        print("🧪 [MM-11] busel Multimodal — encoder output → collate → int32 tensor with values < vocab_size()...")
         from data.pipeline import collate_busel_batch
+        from multimodal.special_tokens import vocab_size as _vs
         enc = TextEncoder()
         tokens = enc.encode_file(__file__)
         self.assertIsInstance(tokens, list)
         batch = collate_busel_batch([(tokens, 0, 0)])
         tensor, _, _ = batch
         self.assertEqual(tensor.dtype, torch.int32, "collate must produce int32 tensor")
-        self.assertLess(tensor.max().item(), 259, "max token must be < 259 (vocab size)")
+        v = _vs()
+        self.assertLess(tensor.max().item(), v, f"max token must be < vocab_size()={v}")
         self.assertGreaterEqual(tensor.min().item(), 0, "min token must be >= 0")
         self.assertEqual(tensor.shape[0], 1, "batch size must be 1")
-        print(f"   ✅ TextEncoder output flows through collate to int32 tensor of shape {tuple(tensor.shape)}, max={tensor.max().item()}.")
+        print(f"   ✅ TextEncoder output flows through collate to int32 tensor of shape {tuple(tensor.shape)}, max={tensor.max().item()} < {v}.")
 
     @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
     def test_mm_cv2_fast_path_under_500ms_per_100_imgs(self):
@@ -1088,7 +1126,7 @@ class TestbuselFramework(unittest.TestCase):
             tokens = enc.encode_file(tmp)
             elapsed_ms = (time.perf_counter() - t0) * 1000
             self.assertLess(elapsed_ms, 2000, f"video encoding took {elapsed_ms:.1f}ms (> 2000ms budget)")
-            self.assertEqual(tokens[0], IMAGE_MARKER)
+            self.assertEqual(tokens[0], MOD_VIDEO, "first token must be MOD_VIDEO (v5.4)")
             self.assertEqual(tokens[-1], MEDIA_END)
             print(f"   ✅ cv2 video path: 60 frames @ 128×128 → 8 frames in {elapsed_ms:.1f}ms")
         finally:
@@ -1103,10 +1141,11 @@ class TestbuselFramework(unittest.TestCase):
                 super().__init__()
                 self.layers_q_proj = torch.nn.Linear(64, 64, bias=False)
                 self.expert_ffn_0_weight = torch.nn.Parameter(torch.randn(128, 64))
-                self.mtp_head_3 = torch.nn.Parameter(torch.randn(259, 128))
+                v = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
+                self.mtp_head_3 = torch.nn.Parameter(torch.randn(v, 128))
                 self.bias = torch.nn.Parameter(torch.zeros(64))
                 self.router = torch.nn.Linear(64, 4, bias=False)
-                self.token_embed = torch.nn.Parameter(torch.randn(259, 64))
+                self.token_embed = torch.nn.Parameter(torch.randn(v, 64))
 
         model = MockM()
         engine = buselOptimizerEngine(model, lr_muon=0.01, lr_adamw=0.001)
@@ -1182,6 +1221,304 @@ class TestbuselFramework(unittest.TestCase):
         for p, g in zip(model.parameters(), g_before2):
             self.assertTrue(torch.allclose(p.grad, g, atol=1e-12), "noise_scale=0 must be no-op")
         print("   ✅ inject_noise: shape preserved, finite, no-op at zero scale.")
+
+    # ============================================================
+    # Vocab expansion tests (v5.4.0 — 67 plug-in + 3 legacy = 70 specials)
+    # ============================================================
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_special_tokens_total_vocab_is_326(self):
+        """🛰️ [MM-14] busel SPECIAL TOKENS — vocab_size() = 256 bytes + 3 legacy + 67 plug-in = 326."""
+        print("🧪 [MM-14] busel Special Tokens — total vocab is 326 (256+3+67)...")
+        v = mm_vocab_size()
+        self.assertEqual(v, 326, f"vocab_size() must be 326 (256 bytes + 3 legacy + 67 plug-in), got {v}")
+        enabled = enabled_ids()
+        self.assertEqual(len(enabled), 70, f"must have 70 enabled special IDs, got {len(enabled)}")
+        self.assertEqual(enabled[0], 256, "first special must be legacy MEDIA_START (256)")
+        self.assertEqual(enabled[-1], 325, f"last special must be 325, got {enabled[-1]}")
+        self.assertEqual(enabled, sorted(enabled), "enabled IDs must be ascending")
+        self.assertEqual(len(set(enabled)), len(enabled), "no duplicate IDs")
+        print(f"   ✅ vocab_size()=326, 70 enabled specials, IDs contiguous [256..325].")
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_special_tokens_layer_summary(self):
+        """🛰️ [MM-15] busel SPECIAL TOKENS — 12 layers, expected counts per layer."""
+        print("🧪 [MM-15] busel Special Tokens — 12 layers with documented counts...")
+        from multimodal.special_tokens import layer_summary
+        summary = layer_summary()
+        self.assertEqual(set(summary.keys()), set(LAYER_DESCRIPTIONS.keys()),
+                         "all 12 documented layers must be present")
+        expected_counts = {
+            "sequence": 4, "modality": 6, "mm_struct": 3, "role": 4,
+            "reasoning": 4, "code": 4, "tool_xml": 12, "tool": 12,
+            "task": 4, "reference": 6, "subagent": 4, "status": 4,
+        }
+        for layer, n in expected_counts.items():
+            self.assertEqual(summary[layer], n,
+                             f"layer {layer!r} must have {n} tokens, got {summary[layer]}")
+        total = sum(summary.values())
+        self.assertEqual(total, 67, f"total plug-in tokens must be 67, got {total}")
+        print(f"   ✅ 12 layers, counts {dict(sorted(summary.items()))}, total = 67 plug-in.")
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
+    def test_mm_image_encoder_emits_mod_image(self):
+        """🛰️ [MM-16] busel ImageEncoder emits MOD_IMAGE (263) at start, not legacy 256."""
+        print("🧪 [MM-16] busel ImageEncoder — emits MOD_IMAGE (263), not legacy MEDIA_START...")
+        from PIL import Image as _Im
+        import numpy as _np
+        enc = ImageEncoder()
+        src = _Im.fromarray(_np.random.randint(0, 255, (100, 100, 3), dtype=_np.uint8))
+        blob = enc.encode(src)
+        self.assertEqual(blob[0], MOD_IMAGE, f"image stream must start with MOD_IMAGE={MOD_IMAGE}, got {blob[0]}")
+        self.assertEqual(blob[-1], MEDIA_END, f"image stream must end with MEDIA_END={MEDIA_END}, got {blob[-1]}")
+        self.assertNotEqual(blob[0], 256, "v5.4 must NOT emit legacy MEDIA_START (256) for images")
+        print(f"   ✅ ImageEncoder: [MOD_IMAGE={blob[0]}, ...payload..., MEDIA_END={blob[-1]}].")
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
+    def test_mm_video_encoder_roundtrip(self):
+        """🛰️ busel MULTIMODAL — VideoEncoder encodes frame_count + N×32×32×3 to bytes."""
+        print("🧪 [MM-4] busel Multimodal — video encode/decode round-trip...")
+        try:
+            import cv2 as _cv2
+        except ImportError:
+            self.skipTest("opencv-python-headless not installed")
+        import numpy as _np
+        tmp = "temp_test_video.mp4"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            fourcc = _cv2.VideoWriter_fourcc(*"mp4v")
+            h, w = 64, 64
+            writer = _cv2.VideoWriter(tmp, fourcc, 10.0, (w, h))
+            for i in range(15):
+                frame = _np.full((h, w, 3), i * 16, dtype=_np.uint8)
+                writer.write(frame)
+            writer.release()
+            enc = VideoEncoder(max_frames=4)
+            tokens = enc.encode_file(tmp)
+            self.assertEqual(tokens[0], MOD_VIDEO, "first token must be MOD_VIDEO (v5.4 modality prefix)")
+            self.assertEqual(tokens[-1], MEDIA_END)
+            decoded = enc.decode(tokens)
+            self.assertGreater(len(decoded), 0)
+            print(f"   ✅ VideoEncoder: [{len(tokens)} tokens, decoded {len(decoded)} bytes].")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        try:
+            fourcc = _cv2.VideoWriter_fourcc(*"mp4v")
+            h, w = 64, 64
+            writer = _cv2.VideoWriter(tmp, fourcc, 10.0, (w, h))
+            for i in range(15):
+                frame = _np.full((h, w, 3), i * 16, dtype=_np.uint8)
+                writer.write(frame)
+            writer.release()
+            enc = VideoEncoder(max_frames=4)
+            blob = enc.encode_file(tmp)
+            self.assertEqual(blob[0], MOD_VIDEO, f"video stream must start with MOD_VIDEO={MOD_VIDEO}, got {blob[0]}")
+            self.assertEqual(blob[-1], MEDIA_END, f"video stream must end with MEDIA_END={MEDIA_END}")
+            print(f"   ✅ VideoEncoder: [MOD_VIDEO={blob[0]}, ...4 frames..., MEDIA_END={blob[-1]}].")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
+    def test_mm_audio_encoder_emits_mod_audio(self):
+        """🛰️ [MM-18] busel AudioEncoder emits MOD_AUDIO (265) at start."""
+        print("🧪 [MM-18] busel AudioEncoder — emits MOD_AUDIO (265) at start...")
+        try:
+            import soundfile as _sf
+        except ImportError:
+            self.skipTest("soundfile not installed")
+        import numpy as _np
+        tmp = "temp_test_audio_mod.wav"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            sr = 8000
+            data = _np.random.uniform(-0.3, 0.3, size=(sr,)).astype(_np.float32)
+            _sf.write(tmp, data, sr)
+            enc = AudioEncoder(max_seconds=0.5)
+            blob = enc.encode_file(tmp)
+            self.assertEqual(blob[0], MOD_AUDIO, f"audio stream must start with MOD_AUDIO={MOD_AUDIO}, got {blob[0]}")
+            self.assertEqual(blob[-1], MEDIA_END, f"audio stream must end with MEDIA_END={MEDIA_END}")
+            print(f"   ✅ AudioEncoder: [MOD_AUDIO={blob[0]}, header+pcm..., MEDIA_END={blob[-1]}].")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
+    def test_mm_docx_encoder_emits_mod_docx(self):
+        """🛰️ [MM-19] busel DocxEncoder emits MOD_DOCX (267) at start."""
+        print("🧪 [MM-19] busel DocxEncoder — emits MOD_DOCX (267) at start...")
+        try:
+            import docx as _docx
+        except ImportError:
+            self.skipTest("python-docx not installed")
+        tmp = "temp_test_mod.docx"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            d = _docx.Document()
+            d.add_paragraph("hello")
+            d.add_paragraph("world")
+            d.save(tmp)
+            enc = DocxEncoder()
+            blob = enc.encode_file(tmp)
+            self.assertEqual(blob[0], MOD_DOCX, f"docx stream must start with MOD_DOCX={MOD_DOCX}, got {blob[0]}")
+            self.assertEqual(blob[-1], MEDIA_END, f"docx stream must end with MEDIA_END={MEDIA_END}")
+            print(f"   ✅ DocxEncoder: [MOD_DOCX={blob[0]}, text..., MEDIA_END={blob[-1]}].")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS, "multimodal encoders unavailable")
+    def test_mm_text_encoder_passes_bytes_through(self):
+        """🛰️ busel MULTIMODAL — TextEncoder prefixes MOD_TEXT (v5.4) then passes bytes through."""
+        print("🧪 [MM-7] busel Multimodal — text encode = [MOD_TEXT] + bytes...")
+        enc = TextEncoder()
+        tmp = "temp_test_text.txt"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(b"hello \xe2\x98\x83 unicode")
+            tokens = enc.encode_file(tmp)
+            self.assertEqual(tokens[0], MOD_TEXT, "v5.4 text stream must start with MOD_TEXT")
+            payload = bytes(tokens[1:])
+            self.assertEqual(payload, b"hello \xe2\x98\x83 unicode", "payload must be byte-identical")
+            self.assertNotIn(IMAGE_MARKER, tokens, "text encoder must NOT inject legacy media_start")
+            print(f"   ✅ TextEncoder: [MOD_TEXT] + {len(payload)} payload bytes, no legacy markers.")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(b"hello world")
+            blob = enc.encode_file(tmp)
+            self.assertEqual(blob[0], MOD_TEXT, f"text stream must start with MOD_TEXT={MOD_TEXT}, got {blob[0]}")
+            self.assertNotEqual(blob[-1], MEDIA_END, "text streams are unbounded, no trailing MEDIA_END")
+            self.assertGreater(len(blob), 6, "stream must contain header + payload")
+            print(f"   ✅ TextEncoder: [MOD_TEXT={blob[0]}, ...{len(blob)-1} bytes, no trailing MEDIA_END].")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_special_tokens_disable_and_enable_roundtrip(self):
+        """🛰️ [MM-21] busel SPECIAL TOKENS — disable shrinks vocab, enable restores it."""
+        print("🧪 [MM-21] busel Special Tokens — disable/enable roundtrip preserves ID...")
+        pre = mm_vocab_size()
+        target = "think_start"
+        # Save state in case prior test left it disabled
+        if not is_enabled(target):
+            enable_special_token(target)
+        tok_before = get_special_token(target)
+        self.assertTrue(tok_before.enabled)
+        self.assertTrue(THINK_START.enabled)
+        try:
+            disable_special_token(target)
+            mid = mm_vocab_size()
+            self.assertEqual(mid, pre - 1, f"after disable, vocab must shrink by 1 (was {pre}, got {mid})")
+            tok_after = get_special_token(target)
+            self.assertFalse(tok_after.enabled, "token must be marked disabled")
+            self.assertEqual(tok_after.id, tok_before.id, "ID must be preserved across disable")
+            self.assertFalse(is_enabled(target), "is_enabled() must return False")
+            enable_special_token(target)
+            post = mm_vocab_size()
+            self.assertEqual(post, pre, f"after enable, vocab must restore (was {pre}, got {post})")
+            self.assertTrue(get_special_token(target).enabled)
+            self.assertTrue(is_enabled(target))
+            print(f"   ✅ Disable/enable: vocab {pre} → {mid} → {post}, ID={tok_before.id} preserved.")
+        finally:
+            enable_special_token(target)
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_special_tokens_register_at_runtime_grows_vocab(self):
+        """🛰️ [MM-22] busel SPECIAL TOKENS — register_special_token at runtime grows vocab."""
+        print("🧪 [MM-22] busel Special Tokens — register_special_token at runtime grows vocab...")
+        from multimodal import special_tokens as mm_st
+        pre = mm_vocab_size()
+        test_name = "_test_runtime_token_xyz"
+        try:
+            tok = mm_st.register_special_token(test_name, "test_layer", "test description")
+            post = mm_vocab_size()
+            self.assertEqual(post, pre + 1, f"vocab must grow by 1 (was {pre}, got {post})")
+            self.assertTrue(tok.enabled)
+            self.assertEqual(tok.name, test_name)
+            self.assertEqual(tok.layer, "test_layer")
+            self.assertTrue(tok.id >= SPECIAL_VOCAB_BASE, f"new token id must be >= {SPECIAL_VOCAB_BASE}, got {tok.id}")
+            # Verify it's discoverable
+            self.assertIs(mm_st.get_special_token(test_name), tok)
+            self.assertIn(test_name, [t.name for t in mm_st.list_special_tokens()])
+            self.assertIn(test_name, [t.name for t in mm_st.list_special_tokens(layer="test_layer")])
+            print(f"   ✅ register_special_token({test_name!r}): vocab {pre} → {post}, id={tok.id}.")
+        finally:
+            # Cleanup: unregister the test token
+            mm_st.unregister_kind_safe(test_name) if hasattr(mm_st, "unregister_kind_safe") else None
+            # Manual cleanup: disable it (next test will see vocab restored)
+            if test_name in [t.name for t in mm_st.list_special_tokens(enabled_only=False)]:
+                mm_st.disable_special_token(test_name)
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_special_tokens_legacy_collision_rejected(self):
+        """🛰️ [MM-23] busel SPECIAL TOKENS — cannot register a name that collides with a legacy ID."""
+        print("🧪 [MM-23] busel Special Tokens — legacy name collision rejected...")
+        with self.assertRaises(ValueError, msg="must reject 'media_start' as new token name"):
+            register_special_token("media_start", "test", "should fail")
+        with self.assertRaises(ValueError, msg="must reject empty name"):
+            register_special_token("", "test", "should fail")
+        # Re-registering an enabled token must also raise (without override)
+        with self.assertRaises(ValueError, msg="must reject duplicate enabled name"):
+            register_special_token("bos", "test", "should fail")
+        print("   ✅ Legacy collision, empty name, and duplicate name all rejected.")
+
+    @unittest.skipUnless(HAS_MULTIMODAL_DEPS and HAS_SPECIAL_TOKENS, "multimodal deps missing")
+    def test_mm_image_encoder_decode_accepts_legacy_marker(self):
+        """🛰️ [MM-24] busel ImageEncoder.decode — accepts BOTH MOD_IMAGE and legacy MEDIA_START."""
+        print("🧪 [MM-24] busel ImageEncoder.decode — accepts both v5.4 MOD_IMAGE and legacy MEDIA_START...")
+        from PIL import Image as _Im
+        import numpy as _np
+        enc = ImageEncoder()
+        src = _Im.fromarray(_np.random.randint(0, 255, (100, 100, 3), dtype=_np.uint8))
+        blob_new = enc.encode(src)
+        # Strip the leading MOD_IMAGE, replace with legacy MEDIA_START
+        blob_legacy = [MEDIA_START] + blob_new[1:]
+        decoded = enc.decode(blob_legacy)
+        self.assertEqual(decoded.size, (32, 32), "legacy layout must still decode to 32x32")
+        # And the new layout must also decode
+        decoded2 = enc.decode(blob_new)
+        self.assertEqual(decoded2.size, (32, 32), "v5.4 MOD_IMAGE layout must decode")
+        print("   ✅ ImageEncoder.decode accepts both MOD_IMAGE (v5.4) and MEDIA_START (v5.0).")
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_patcher_embed_weight_uses_dynamic_vocab(self):
+        """🛰️ [MM-25] busel StridedFastBLTPatcher — embed_weight shape = (vocab_size, d_byte)."""
+        print("🧪 [MM-25] busel Patcher — embed_weight.shape[0] == vocab_size() at construction...")
+        from model.patching import StridedFastBLTPatcher
+        v = mm_vocab_size()
+        patcher = StridedFastBLTPatcher(d_model=128, d_byte=64)
+        self.assertEqual(patcher.embed_weight.shape[0], v,
+                         f"embed_weight must be (vocab_size, d_byte) = ({v}, 64)")
+        self.assertEqual(patcher.embed_weight.shape[1], 64, "d_byte must be 64 as requested")
+        # vocab_size attribute exposed
+        self.assertEqual(patcher.vocab_size, v)
+        print(f"   ✅ Patcher embed_weight: {tuple(patcher.embed_weight.shape)} = (vocab_size={v}, d_byte=64).")
+
+    @unittest.skipUnless(HAS_SPECIAL_TOKENS, "multimodal.special_tokens unavailable")
+    def test_mm_busel_model_rejects_undersized_vocab(self):
+        """🛰️ [MM-26] busel buselModel — must raise if config.vocab_size < registry vocab_size()."""
+        print("🧪 [MM-26] busel buselModel — rejects config.vocab_size < registry vocab_size()...")
+        from model.backbone import buselModel
+        registry_v = mm_vocab_size()
+        undersized = registry_v - 5
+        cfg = _MockConfig(vocab_size=undersized)
+        with self.assertRaises(ValueError, msg="must reject undersized config.vocab_size"):
+            buselModel(cfg)
+        # Sanity: with matching vocab, model should construct fine
+        cfg_ok = _MockConfig(vocab_size=registry_v)
+        model = buselModel(cfg_ok)
+        self.assertEqual(model.vocab_size, registry_v)
+        print(f"   ✅ buselModel rejects vocab_size={undersized} (< registry {registry_v}); accepts {registry_v}.")
 
 
 if __name__ == "__main__":

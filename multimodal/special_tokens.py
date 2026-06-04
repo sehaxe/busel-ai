@@ -1,0 +1,488 @@
+"""
+🛰️ busel SPECIAL TOKENS v5.4 — Plug-in Vocabulary Expansion (67 tokens, 12 layers)
+
+Sovereign byte-level vocabulary with 67 plug-in special tokens organised into
+12 functional layers, plus 3 legacy reserved tokens (256-258).
+
+**Design philosophy: no hardcode.** The vocabulary is computed dynamically
+from the registry at runtime. Adding a new token = one decorator call.
+Disabling a token = one function call. Removing it = one line edit. No
+constants are scattered across the model, the encoders, or the inference
+mask — everything reads from this module.
+
+Token ID layout (computed at import time):
+    0      - 255  : 256 raw UTF-8 bytes (BYTE_COUNT)
+    256    - 258  : Legacy reserved (media_start, media_end, doc_sep) — immutable
+    259+          : Plug-in special tokens (67 across 12 layers, see below)
+
+Layer inventory (v5.4.0, full variant — 67 tokens):
+    Layer  | # | Description
+    -------|----+---------------------------------------------------
+    1 seq  |  4 | BOS / EOS / PAD / UNK
+    2 mod  |  6 | MOD_{IMAGE, VIDEO, AUDIO, PDF, DOCX, TEXT}
+    3 mms  |  3 | FRAME_SEP, AUDIO_CHUNK_SEP, CHANNEL_SEP
+    4 role |  4 | ROLE_{SYSTEM, USER, ASSISTANT, TOOL}
+    5 reas |  4 | THINK_{START, END}, PLAN_{START, END}
+    6 code |  4 | CODE_BLOCK_{START, END}, DIFF_{START, END}
+    7 xml  | 12 | TOOL_CALLS_*, TOOL_INVOKE_*, TOOL_PARAM_*,
+              |    TOOL_RESULTS_*, TOOL_RESULT_*, TOOL_ERROR_* (Anthropic XML)
+    8 tool | 12 | TOOL_{BASH, READ, WRITE, EDIT, GREP, GLOB, FETCH,
+              |    SEARCH, TASK, TODO, LSP, ASK}  (opencode 17-tool set)
+    9 task |  4 | TODO_{START, END}, TASK_{DONE, PENDING}
+   10 ref  |  6 | FILE_PATH_*, URL_*, CITE_*  (open/close)
+   11 sub  |  4 | SUBAGENT_*, SUBAGENT_RESULT_*  (opencode delegate_task)
+   12 stt  |  4 | STATUS_{SUCCESS, ERROR, TIMEOUT, CANCELLED}
+    -------+----+---------------------------------------------------
+    TOTAL  | 67 | (256 raw bytes + 67 specials = vocab_size() = 326)
+
+Usage:
+    from multimodal.special_tokens import (
+        vocab_size, get_special_token, list_special_tokens,
+        disable_special_token, enable_special_token,
+        register_special_token,  # for adding new tokens
+    )
+
+    # Add a new token at runtime:
+    MY_TOKEN = register_special_token("my_marker", "custom", "my description")
+    assert vocab_size() == 327  # vocab grew by 1
+
+    # Disable a token (vocab shrinks, ID preserved):
+    disable_special_token("think_start")
+    assert vocab_size() == 325
+
+    # Re-enable:
+    enable_special_token("think_start")
+    assert vocab_size() == 326
+"""
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from typing import Iterator, Optional
+
+
+# === Foundation: byte range + 3 legacy reserved specials ===
+BYTE_COUNT: int = 256
+"""Number of raw UTF-8 byte values [0, 256)."""
+
+# Legacy reserved tokens — IMMUTABLE, present from v5.0.
+# These were hardcoded across the multimodal pipeline; removing them would
+# break existing checkpoints. The plug-in tokens start at SPECIAL_VOCAB_BASE.
+LEGACY_TOKENS: dict[str, int] = {
+    "media_start": 256,
+    "media_end":   257,
+    "doc_sep":     258,
+}
+"""Legacy reserved token IDs (v5.0-5.3). Kept for backward compat."""
+
+SPECIAL_VOCAB_BASE: int = BYTE_COUNT + len(LEGACY_TOKENS)
+"""First plug-in special token ID. All new tokens start here."""
+
+
+# === Token dataclass ===
+@dataclass(frozen=True, slots=True)
+class SpecialToken:
+    """An immutable special-token descriptor.
+
+    `id` is allocated once at registration time and never changes. Disabling
+    a token sets `enabled=False` (so the encoder won't emit it and the model
+    won't be trained to produce it) but preserves `id` (so a future re-enable
+    keeps the same row in the embedding table — no checkpoint re-mapping).
+
+    Int-coercible: `int(TOK_BASH) == 296`, `TOK_BASH == 296` → True.
+    """
+    name:        str
+    id:          int
+    layer:       str
+    description: str
+    enabled:     bool = True
+
+    def __int__(self) -> int:
+        return self.id
+
+    def __index__(self) -> int:
+        return self.id
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, SpecialToken):
+            return (
+                self.id == other.id
+                and self.name == other.name
+                and self.layer == other.layer
+                and self.description == other.description
+                and self.enabled == other.enabled
+            )
+        if isinstance(other, int):
+            return self.id == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.id, self.name, self.enabled))
+
+
+# === Internal registry state ===
+_SPECIAL_TOKENS:    dict[str, SpecialToken]      = {}
+_LAYER_TOKENS:      dict[str, list[str]]         = {}
+_ID_LOCK            = threading.Lock()
+_NEXT_ID:           int                          = SPECIAL_VOCAB_BASE
+
+
+def _alloc_id() -> int:
+    """Atomically allocate the next available ID. Thread-safe."""
+    global _NEXT_ID
+    with _ID_LOCK:
+        cur = _NEXT_ID
+        _NEXT_ID += 1
+        return cur
+
+
+# === Public API ===
+
+def register_special_token(
+    name:        str,
+    layer:       str,
+    description: str = "",
+    *,
+    override:    bool = False,
+) -> SpecialToken:
+    """Register a new plug-in special token. ID is auto-allocated.
+
+    The token is enabled by default. To disable at runtime (without removing
+    the registration), use `disable_special_token(name)`.
+
+    Args:
+        name: Unique identifier within the special-token registry. Lowercase
+            snake_case recommended. Must not collide with legacy reserved
+            tokens ("media_start", "media_end", "doc_sep").
+        layer: Functional layer ("sequence", "modality", "tool", ...). Used
+            for grouping in `list_special_tokens(layer=...)` and for docs.
+        description: One-line human description (used in `print(tok)` and
+            the auto-generated AGENTS.md token table).
+        override: If True, allow replacing a previously-disabled token (re-enable
+            with new metadata). Default False: raise on collision with an
+            already-enabled token.
+
+    Returns:
+        The new `SpecialToken` instance.
+
+    Raises:
+        ValueError: If `name` is empty, collides with a legacy token, or
+            collides with an already-enabled plug-in token (and override=False).
+    """
+    global _NEXT_ID
+    if not name or not isinstance(name, str):
+        raise ValueError(f"name must be a non-empty string, got {name!r}")
+    if name in LEGACY_TOKENS:
+        raise ValueError(
+            f"{name!r} is a legacy reserved token (ids 256-258); these are "
+            f"immutable. Pick a different name."
+        )
+    if not layer or not isinstance(layer, str):
+        raise ValueError(f"layer must be a non-empty string, got {layer!r}")
+    with _ID_LOCK:
+        existing = _SPECIAL_TOKENS.get(name)
+        if existing is not None:
+            if existing.enabled and not override:
+                raise ValueError(
+                    f"special_token {name!r} already registered at id={existing.id} "
+                    f"(enabled). Use override=True to replace it, or call "
+                    f"disable_special_token({name!r}) first."
+                )
+            if not existing.enabled:
+                # Re-enable disabled token, keeping its original ID
+                tok = SpecialToken(name, existing.id, layer, description, enabled=True)
+                _SPECIAL_TOKENS[name] = tok
+                return tok
+            # override=True on enabled token: allocate a new ID at the END
+            tok_id = _NEXT_ID
+            _NEXT_ID += 1
+            tok = SpecialToken(name, tok_id, layer, description, enabled=True)
+            _SPECIAL_TOKENS[name] = tok
+            _LAYER_TOKENS.setdefault(layer, [])
+            if name not in _LAYER_TOKENS[layer]:
+                _LAYER_TOKENS[layer].append(name)
+            return tok
+        # Fresh registration
+        tok_id = _NEXT_ID
+        _NEXT_ID += 1
+        tok = SpecialToken(name, tok_id, layer, description, enabled=True)
+        _SPECIAL_TOKENS[name] = tok
+        _LAYER_TOKENS.setdefault(layer, []).append(name)
+        return tok
+
+
+def disable_special_token(name: str) -> SpecialToken:
+    """Mark a token as disabled. Encoder won't emit it; model won't generate it.
+
+    The token's ID is preserved (its row in the embedding table is not
+    removed), so disabling+re-enabling is a no-op for checkpoint shape.
+
+    Raises:
+        KeyError: If `name` is unknown.
+    """
+    with _ID_LOCK:
+        if name not in _SPECIAL_TOKENS:
+            raise KeyError(f"unknown special token: {name!r}")
+        tok = _SPECIAL_TOKENS[name]
+        if not tok.enabled:
+            return tok  # already disabled, no-op
+        new_tok = SpecialToken(
+            name=tok.name, id=tok.id, layer=tok.layer,
+            description=tok.description, enabled=False,
+        )
+        _SPECIAL_TOKENS[name] = new_tok
+        return new_tok
+
+
+def enable_special_token(name: str) -> SpecialToken:
+    """Re-enable a previously disabled special token.
+
+    Raises:
+        KeyError: If `name` is unknown.
+    """
+    with _ID_LOCK:
+        if name not in _SPECIAL_TOKENS:
+            raise KeyError(f"unknown special token: {name!r}")
+        tok = _SPECIAL_TOKENS[name]
+        if tok.enabled:
+            return tok  # already enabled, no-op
+        new_tok = SpecialToken(
+            name=tok.name, id=tok.id, layer=tok.layer,
+            description=tok.description, enabled=True,
+        )
+        _SPECIAL_TOKENS[name] = new_tok
+        return new_tok
+
+
+def get_special_token(name: str) -> SpecialToken:
+    """Look up a token by name. Raises KeyError if unknown."""
+    with _ID_LOCK:
+        if name not in _SPECIAL_TOKENS:
+            raise KeyError(f"unknown special token: {name!r}")
+        return _SPECIAL_TOKENS[name]
+
+
+def is_enabled(name: str) -> bool:
+    """True if the token is registered AND enabled. False otherwise."""
+    with _ID_LOCK:
+        tok = _SPECIAL_TOKENS.get(name)
+        return tok is not None and tok.enabled
+
+
+def list_special_tokens(
+    layer:        Optional[str]    = None,
+    *,
+    enabled_only: bool            = True,
+) -> list[SpecialToken]:
+    """List all special tokens, optionally filtered by layer.
+
+    Args:
+        layer: If given, return only tokens in this layer. If None, return
+            all tokens in registration order.
+        enabled_only: If True (default), skip disabled tokens. Set False to
+            include disabled tokens (useful for diagnostics).
+
+    Returns:
+        Sorted list (by ID, ascending).
+    """
+    with _ID_LOCK:
+        if layer is None:
+            tokens = list(_SPECIAL_TOKENS.values())
+        else:
+            names = _LAYER_TOKENS.get(layer, [])
+            tokens = [_SPECIAL_TOKENS[n] for n in names if n in _SPECIAL_TOKENS]
+        if enabled_only:
+            tokens = [t for t in tokens if t.enabled]
+        return sorted(tokens, key=lambda t: t.id)
+
+
+def enabled_ids() -> list[int]:
+    """Return all enabled special-token IDs in ascending order.
+
+    Includes the 3 legacy reserved tokens (256-258) plus all enabled
+    plug-in tokens. Total = 3 + N_enabled_plug_ins = 70 by default.
+    """
+    with _ID_LOCK:
+        plug_in = sorted(t.id for t in _SPECIAL_TOKENS.values() if t.enabled)
+        return sorted(list(LEGACY_TOKENS.values()) + plug_in)
+
+
+def all_ids() -> list[int]:
+    """Return ALL special-token IDs (enabled + disabled, plug-in + legacy) ascending."""
+    with _ID_LOCK:
+        plug_in = sorted(t.id for t in _SPECIAL_TOKENS.values())
+        return sorted(list(LEGACY_TOKENS.values()) + plug_in)
+
+
+def vocab_size() -> int:
+    """Total vocabulary size: BYTE_COUNT (256) + enabled plug-ins.
+
+    Includes the 3 legacy tokens unconditionally (they are always enabled).
+    Re-computed on every call (no caching — token disable/enable is dynamic).
+    Cheap: O(N) where N <= 70.
+    """
+    with _ID_LOCK:
+        n = sum(1 for t in _SPECIAL_TOKENS.values() if t.enabled)
+        return BYTE_COUNT + len(LEGACY_TOKENS) + n
+
+
+def layer_summary() -> dict[str, int]:
+    """Return {layer_name: enabled_token_count} for all layers."""
+    with _ID_LOCK:
+        out: dict[str, int] = {}
+        for layer, names in _LAYER_TOKENS.items():
+            out[layer] = sum(
+                1 for n in names
+                if n in _SPECIAL_TOKENS and _SPECIAL_TOKENS[n].enabled
+            )
+        return out
+
+
+# === Auto-define the 70 plug-in tokens (v5.4.0) ===
+# To ADD a new token: append one line below. Vocab grows by 1.
+# To REMOVE a token: delete the line. Vocab shrinks by 1.
+# To DISABLE temporarily: call disable_special_token("name") at runtime.
+
+# Layer 1: Sequence control (4)
+BOS = register_special_token("bos", "sequence", "Beginning of sequence")
+EOS = register_special_token("eos", "sequence", "End of sequence / generation stop")
+PAD = register_special_token("pad", "sequence", "Padding (no-op attention)")
+UNK = register_special_token("unk", "sequence", "Unknown / out-of-vocab")
+
+# Layer 2: Modality (6)
+MOD_IMAGE = register_special_token("mod_image", "modality", "Image payload header")
+MOD_VIDEO = register_special_token("mod_video", "modality", "Video payload header")
+MOD_AUDIO = register_special_token("mod_audio", "modality", "Audio payload header")
+MOD_PDF   = register_special_token("mod_pdf",   "modality", "PDF payload header (Docling)")
+MOD_DOCX  = register_special_token("mod_docx",  "modality", "DOCX payload header (python-docx)")
+MOD_TEXT  = register_special_token("mod_text",  "modality", "Text payload header (UTF-8 bytes)")
+
+# Layer 3: Multimodal structure (3)
+FRAME_SEP       = register_special_token("frame_sep",       "mm_struct", "End of video frame")
+AUDIO_CHUNK_SEP = register_special_token("audio_chunk_sep", "mm_struct", "End of audio chunk (16-bit PCM segment)")
+CHANNEL_SEP     = register_special_token("channel_sep",     "mm_struct", "RGB / stereo channel separator")
+
+# Layer 4: Chat roles (4) — Anthropic API style
+ROLE_SYSTEM    = register_special_token("role_system",    "role", "<system> turn")
+ROLE_USER      = register_special_token("role_user",      "role", "<user> turn")
+ROLE_ASSISTANT = register_special_token("role_assistant", "role", "<assistant> turn")
+ROLE_TOOL      = register_special_token("role_tool",      "role", "<tool> result turn")
+
+# Layer 5: Reasoning / CoT (4) — o1/o3 + Claude extended thinking
+THINK_START = register_special_token("think_start", "reasoning", "Open extended-thinking block")
+THINK_END   = register_special_token("think_end",   "reasoning", "Close extended-thinking block")
+PLAN_START  = register_special_token("plan_start",  "reasoning", "Open planning block")
+PLAN_END    = register_special_token("plan_end",    "reasoning", "Close planning block")
+
+# Layer 6: Code (4) — Markdown spec
+CODE_BLOCK_START = register_special_token("code_block_start", "code", "Open ```code block")
+CODE_BLOCK_END   = register_special_token("code_block_end",   "code", "Close ```code block")
+DIFF_START       = register_special_token("diff_start",       "code", "Open unified diff block (```diff)")
+DIFF_END         = register_special_token("diff_end",         "code", "Close unified diff block")
+
+# Layer 7: Tool XML (12) — Anthropic-style (opencode / claude / code-execution)
+TOOL_CALLS_START   = register_special_token("tool_calls_start",   "tool_xml", "<function_calls>")
+TOOL_CALLS_END     = register_special_token("tool_calls_end",     "tool_xml", "</function_calls>")
+TOOL_INVOKE_START  = register_special_token("tool_invoke_start",  "tool_xml", "<invoke name=\"...\">")
+TOOL_INVOKE_END    = register_special_token("tool_invoke_end",    "tool_xml", "</invoke>")
+TOOL_PARAM_START   = register_special_token("tool_param_start",   "tool_xml", "<parameter name=\"...\">")
+TOOL_PARAM_END     = register_special_token("tool_param_end",     "tool_xml", "</parameter>")
+TOOL_RESULTS_START = register_special_token("tool_results_start", "tool_xml", "<function_results>")
+TOOL_RESULTS_END   = register_special_token("tool_results_end",   "tool_xml", "</function_results>")
+TOOL_RESULT_START  = register_special_token("tool_result_start",  "tool_xml", "<result>")
+TOOL_RESULT_END    = register_special_token("tool_result_end",    "tool_xml", "</result>")
+TOOL_ERROR_START   = register_special_token("tool_error_start",   "tool_xml", "<error>")
+TOOL_ERROR_END     = register_special_token("tool_error_end",     "tool_xml", "</error>")
+
+# Layer 8: Common tools (12) — opencode 17-tool subset (most common)
+TOOL_BASH   = register_special_token("tool_bash",   "tool", "Bash / shell command")
+TOOL_READ   = register_special_token("tool_read",   "tool", "Read file")
+TOOL_WRITE  = register_special_token("tool_write",  "tool", "Write file (new)")
+TOOL_EDIT   = register_special_token("tool_edit",   "tool", "Edit file (find/replace)")
+TOOL_GREP   = register_special_token("tool_grep",   "tool", "Grep for pattern")
+TOOL_GLOB   = register_special_token("tool_glob",   "tool", "Glob path pattern")
+TOOL_FETCH  = register_special_token("tool_fetch",  "tool", "Fetch URL (HTTP)")
+TOOL_SEARCH = register_special_token("tool_search", "tool", "Web search")
+TOOL_TASK   = register_special_token("tool_task",   "tool", "Delegate sub-task to subagent")
+TOOL_TODO   = register_special_token("tool_todo",   "tool", "Update todo list")
+TOOL_LSP    = register_special_token("tool_lsp",    "tool", "LSP query (go-to-def, refs, hover)")
+TOOL_ASK    = register_special_token("tool_ask",    "tool", "Ask user clarifying question")
+
+# Layer 9: Task management (4)
+TODO_START   = register_special_token("todo_start",   "task", "<todo>")
+TODO_END     = register_special_token("todo_end",     "task", "</todo>")
+TASK_DONE    = register_special_token("task_done",    "task", "[x] task done")
+TASK_PENDING = register_special_token("task_pending", "task", "[ ] task pending")
+
+# Layer 10: References (6) — Cline / Cursor style
+FILE_PATH_START = register_special_token("file_path_start", "reference", "<file_path>")
+FILE_PATH_END   = register_special_token("file_path_end",   "reference", "</file_path>")
+URL_START       = register_special_token("url_start",       "reference", "<url>")
+URL_END         = register_special_token("url_end",         "reference", "</url>")
+CITE_START      = register_special_token("cite_start",      "reference", "<cite>")
+CITE_END        = register_special_token("cite_end",        "reference", "</cite>")
+
+# Layer 11: Subagent (4) — opencode delegate_task
+SUBAGENT_START        = register_special_token("subagent_start",        "subagent", "<subagent>")
+SUBAGENT_END          = register_special_token("subagent_end",          "subagent", "</subagent>")
+SUBAGENT_RESULT_START = register_special_token("subagent_result_start", "subagent", "<subagent_result>")
+SUBAGENT_RESULT_END   = register_special_token("subagent_result_end",   "subagent", "</subagent_result>")
+
+# Layer 12: Status (4) — Cline / Claude API
+STATUS_SUCCESS   = register_special_token("status_success",   "status", "OK / success")
+STATUS_ERROR     = register_special_token("status_error",     "status", "error / failed")
+STATUS_TIMEOUT   = register_special_token("status_timeout",   "status", "timed out")
+STATUS_CANCELLED = register_special_token("status_cancelled", "status", "cancelled by user")
+
+
+# === Layer descriptions (for AGENTS.md / __str__ / docs) ===
+LAYER_DESCRIPTIONS: dict[str, str] = {
+    "sequence":  "BOS / EOS / PAD / UNK",
+    "modality":  "Image / Video / Audio / PDF / DOCX / Text payload headers",
+    "mm_struct": "Frame / chunk / channel separators",
+    "role":      "System / User / Assistant / Tool",
+    "reasoning": "Think / Plan open/close (o1, Claude extended thinking)",
+    "code":      "Code-block / Diff open/close (```)",
+    "tool_xml":  "Anthropic XML: <function_calls>…</function_calls>",
+    "tool":      "Bash / Read / Write / Edit / Grep / Glob / Fetch / Search / Task / Todo / LSP / Ask",
+    "task":      "Todo / Task state markers",
+    "reference": "File path / URL / Citation open/close (Cline style)",
+    "subagent":  "Subagent delegation open/close (opencode)",
+    "status":    "Success / Error / Timeout / Cancelled",
+}
+
+
+# === Backward-compat aliases (for code that imports the old constant names) ===
+MEDIA_START = LEGACY_TOKENS["media_start"]
+MEDIA_END   = LEGACY_TOKENS["media_end"]
+DOC_SEP     = LEGACY_TOKENS["doc_sep"]
+
+
+# === Self-test (only when run directly) ===
+if __name__ == "__main__":
+    print(f"🛰️  busel SPECIAL TOKENS v5.4 — vocabulary expansion report")
+    print(f"   Byte range         : [0, {BYTE_COUNT})")
+    print(f"   Legacy reserved    : {sorted(LEGACY_TOKENS.values())} ({len(LEGACY_TOKENS)} tokens)")
+    print(f"   Plug-in registered : {len(_SPECIAL_TOKENS)} (across {len(_LAYER_TOKENS)} layers)")
+    print(f"   Vocab size         : {vocab_size()}")
+    print()
+    print(f"   Per-layer summary:")
+    for layer, desc in LAYER_DESCRIPTIONS.items():
+        toks = list_special_tokens(layer)
+        n = len(toks)
+        print(f"     [{layer:>9}] ×{n:>2}: {desc}")
+        for t in toks:
+            mark = "✓" if t.enabled else "✗"
+            print(f"         {mark} {t.id:>3} = {t.name:<24} ({t.description})")
+    print()
+    print(f"   Quick toggle test:")
+    pre = vocab_size()
+    disable_special_token("think_start")
+    mid = vocab_size()
+    enable_special_token("think_start")
+    post = vocab_size()
+    print(f"     vocab before disable = {pre}")
+    print(f"     vocab after  disable = {mid}  (Δ = {mid - pre})")
+    print(f"     vocab after  enable  = {post} (Δ = {post - mid})")
+    assert pre == mid + 1 == post, "vocab toggle invariant violated"
+    print(f"     ✓ Toggle invariant holds.")

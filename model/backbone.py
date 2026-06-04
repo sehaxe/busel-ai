@@ -15,6 +15,7 @@ import torch.nn as nn
 from model.layers import BitLinear_a4_8, RMSNorm, nvtx_range_push, nvtx_range_pop
 from model.attention import BulbaGDN2SeRoPEBlock, MultiHeadLatentAttention
 from model.routing import MoDSequenceRouter, BulbaTernaryTitanMoE
+from multimodal.special_tokens import vocab_size as _vocab_size, enabled_ids as _enabled_ids
 
 
 class ManifoldConstrainedAttnRes(nn.Module):
@@ -166,6 +167,17 @@ class buselModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_hyper = int(getattr(config, "n_hyper", 2))
+        self.vocab_size = int(getattr(config, "vocab_size", 0))
+        if self.vocab_size == 0:
+            self.vocab_size = _vocab_size()
+        registry_vocab = _vocab_size()
+        if self.vocab_size < registry_vocab:
+            raise ValueError(
+                f"config.vocab_size={self.vocab_size} is smaller than the "
+                f"current special-token registry vocab={registry_vocab}. "
+                f"Update configs/default.yaml or disable tokens to match. "
+                f"Enabled token IDs: {_enabled_ids()[:10]}{'…' if len(_enabled_ids()) > 10 else ''}"
+            )
 
         capacity = 1.0
         self.layers = nn.ModuleList()

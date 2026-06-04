@@ -34,6 +34,15 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from multimodal.special_tokens import MOD_IMAGE as _MM_MOD_IMAGE, MEDIA_END
+    MOD_IMAGE = _MM_MOD_IMAGE.id if hasattr(_MM_MOD_IMAGE, "id") else int(_MM_MOD_IMAGE)
+    HAS_SPECIAL_TOKENS = True
+except ImportError:
+    HAS_SPECIAL_TOKENS = False
+    MOD_IMAGE = 256
+    MEDIA_END = 257
+
 class PythonByteStreamer:
     def __init__(self, file_path, chunk_size, start_offset=0):
         with open(file_path, "rb") as f:
@@ -116,9 +125,9 @@ class buselOmnivoreTextExtractor:
                                 else:
                                     img = Image.open(img_path).convert("RGB").resize(self.img_size)
                                     img_bytes = img.tobytes()
-                                self.raw_bytes.append(256)
+                                self.raw_bytes.append(MOD_IMAGE)
                                 self.raw_bytes.extend(img_bytes)
-                                self.raw_bytes.append(257)
+                                self.raw_bytes.append(MEDIA_END)
                                 text_val = self._recursive_extract_excluding_image(data)
                                 if text_val.strip():
                                     self.raw_bytes.extend(text_val.strip().encode('utf-8'))
