@@ -216,3 +216,21 @@ def load_pipeline_yaml(path: str | os.PathLike) -> PipelineConfig:
         stages=stages,
         global_params=dict(raw.get("global_params", {})),
     )
+
+
+def _apply_model_profile(cfg, m: dict) -> None:
+    """Copy model-shape fields from the YAML profile dict onto a stage config in-place.
+
+    Shared by buselPretrainConfig, buselSFTConfig, buselDPOConfig. Validation
+    rules differ per stage (pretrain checks d_model % n_hyper AND n_heads;
+    DPO checks only n_heads; SFT checks both), so callers do the validation
+    AFTER calling this helper.
+    """
+    cfg.d_model = int(m.get("d_model", cfg.d_model))
+    cfg.n_layers = int(m.get("n_layers", cfg.n_layers))
+    cfg.n_heads = int(m.get("n_heads", cfg.n_heads))
+    cfg.expert_hidden = int(m.get("expert_hidden", cfg.expert_hidden))
+    cfg.num_experts = int(m.get("num_experts", cfg.num_experts))
+    cfg.top_k = int(m.get("top_k", cfg.top_k))
+    cfg.vocab_size = int(m.get("vocab_size", cfg.vocab_size))
+    cfg.n_hyper = int(m.get("n_hyper", cfg.n_hyper))

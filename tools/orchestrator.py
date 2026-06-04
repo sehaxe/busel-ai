@@ -28,6 +28,56 @@ def print_tui_header():
     typer.echo(typer.style("╚═══════════════════════════════════════════════════════════════════════════╝", fg=typer.colors.MAGENTA, bold=True))
 
 
+def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps) -> str:
+    """Build a temp pipeline YAML (pretrain-only + overrides); return the temp dir path."""
+    import tempfile
+    import yaml as _yaml
+    src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "pipelines", "pretrain-only.yaml")
+    with open(src) as f:
+        cfg = _yaml.safe_load(f)
+    stage = cfg["stages"][0]
+    stage.setdefault("params", {})
+    if profile:
+        stage["params"]["profile_name"] = profile
+    if max_steps is not None:
+        stage["params"]["max_steps"] = max_steps
+    if warmup_steps is not None:
+        stage["params"]["warmup_steps"] = warmup_steps
+    if resume:
+        stage["resume"] = resume
+    tmpdir = tempfile.mkdtemp(prefix="busel_shim_")
+    tmp_yaml = os.path.join(tmpdir, "shim.yaml")
+    with open(tmp_yaml, "w") as f:
+        _yaml.dump(cfg, f)
+    return tmpdir
+
+
+def train_single_profile(args_list):
+    """Translate legacy train.py CLI args into a pipeline run.
+
+    Supported: --profile, --resume, --max-steps, --warmup-steps.
+    Other flags (--no-compile, --compile-mode, --no-checkpointing, --seed) are dropped
+    because the pipeline runner owns those knobs (see configs/pipelines/*.yaml).
+    """
+    import argparse
+    import shutil
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--profile", "-p", default="shpak")
+    p.add_argument("--resume", "-r", default=None)
+    p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--warmup-steps", type=int, default=None)
+    args, _unknown = p.parse_known_args(args_list)
+
+    tmpdir = _build_shim_yaml(args.profile, args.resume, args.max_steps, args.warmup_steps)
+    try:
+        pipeline(name="shim", start_stage=None, config_dir=tmpdir)
+        return 0
+    except SystemExit as e:
+        return e.code or 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def autopilot(
     profile_name: str = typer.Option("shpak", "--profile", "-p", help="Profile name: shpak or zubr")
 ):
@@ -56,17 +106,17 @@ def autopilot(
     typer.echo("=" * 80)
 
     typer.echo(typer.style(f"🔥 AUTOPILOT: Launching main training loop [{profile_name.upper()}]...", fg=typer.colors.GREEN, bold=True))
-    subprocess.run([sys.executable, "train.py", "--profile", profile_name])
+    train_single_profile(["--profile", profile_name])
 
 
 def train(
     profile_name: str = typer.Option("shpak", "--profile", "-p", help="Profile: shpak or zubr"),
     resume: str = typer.Option(None, "--resume", "-r", help="Path to checkpoint for resuming")
 ):
-    args = [sys.executable, "train.py", "--profile", profile_name]
+    args = ["--profile", profile_name]
     if resume:
         args.extend(["--resume", resume])
-    subprocess.run(args)
+    train_single_profile(args)
 
 
 def train_all(

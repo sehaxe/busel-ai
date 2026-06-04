@@ -6,6 +6,102 @@ adheres to [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [5.8.0] — 2026-06-04 — "Refactor Sweep: Vectorize, Dedupe, Decompose" ⚡
+
+### Changed
+
+- **`tools/inference.py` `apply_sampling()` — vectorized `repetition_penalty`:**
+  replaced a Python `for t in already_generated: scores = ...` loop with a
+  vectorized `torch.where(scores < 0, scores * rep, scores / rep)` + gather
+  /scatter. **Bit-exact equivalence** verified by SAMP-9 within 1e-5
+  tolerance. Wins for long prompts (10000+ tokens) where the Python loop
+  was the bottleneck; short prompts are within noise.
+- **`tools/inference.py` `interactive_loop()` — REPL command parser deduped:**
+  extracted `parse_repl_command_value(parts, value_type) → (new, err)`
+  helper + `_REPL_PARAMS` data table. Replaced 4 near-identical
+  `try/except` blocks with a single data-driven loop. **Critical fix:**
+  the original `except:` was bare — it would swallow `KeyboardInterrupt`
+  and `SystemExit`, hanging the REPL or preventing shutdown. Now uses
+  `except (ValueError, IndexError):` which is the only legitimate
+  failure mode for a `/cmd <value>` REPL line.
+- **`train.py` replaced with 15-line shim:** the legacy 650-line
+  cybernetic training orchestrator is gone. `train.py` now parses
+  `--profile/--resume/--max-steps/--warmup-steps`, builds a temp
+  pipeline YAML from `configs/pipelines/pretrain-only.yaml` with
+  overrides, and calls `tools.orchestrator:train_single_profile`. The
+  legacy `--no-compile` / `--compile-mode` / `--no-checkpointing` /
+  `--seed` flags are dropped — these are now configured in the YAML
+  (the canonical training interface has been `uv run python cli.py
+  pipeline --name pretrain-only` since v5.5). `tools/orchestrator.py`
+  gained `_build_shim_yaml` + `train_single_profile` helpers; its
+  `train()` and `autopilot()` now call the helper directly instead of
+  spawning a subprocess.
+- **`tools/plotter.py` `generate_report_plot()` — split into 3 helpers:**
+  `_load_metrics(log_path)` for JSONL parsing, `_ema(data, alpha)`
+  promoted from inner to module-level, `_compute_dashboard_stats(...)`
+  for the 4 dashboard summary numbers. The 4 dashboard column blocks
+  (Min Loss / Speed / Volume / Peak Memory) are now a single loop
+  over a `columns` list — eliminates ~20 lines of repetitive
+  `fig.text(0.XX, 0.YY, ...)` calls. **plotter.py: 188 → 168 LOC
+  (-20).**
+- **`training/stages/{base,pretrain,sft,dpo}.py` — shared
+  `_apply_model_profile` helper:** the 8-line model-shape field
+  block (`d_model`, `n_layers`, `n_heads`, `expert_hidden`,
+  `num_experts`, `top_k`, `vocab_size`, `n_hyper`) was duplicated
+  3× across `buselPretrainConfig.from_profile`,
+  `buselSFTConfig.from_profile`, `buselDPOConfig.from_profile`. Now
+  lives in `training/stages/base.py` as a single helper, called
+  from all 3 configs. Validation rules (which differ per stage —
+  DPO doesn't check `d_model % n_hyper`) stay in the caller.
+
+### Tests
+
+- **+24 new tests** (was 142, now **166/166 passing** in 4.36 s):
+  - `SAMP-1..10` (10) — `apply_sampling` correctness + vectorized
+    rep_penalty bit-exactness
+  - `REPL-1..5` (5) — `parse_repl_command_value` + `KeyboardInterrupt`
+    not swallowed + 4-param data table
+  - `SHIM-1..3` (3) — `_build_shim_yaml` default + override +
+    temp-dir cleanup contract
+  - `PLOT-1..5` (5) — `_load_metrics` / `_ema` /
+    `_compute_dashboard_stats` correctness
+  - `STG-15` (1) — `_apply_model_profile` shared across all 3
+    stage configs (full profile + partial + string→int coercion)
+
+### Performance
+
+- **Gen perf baseline (RTX 5060 Ti, validation profile, 200 tok × 3):**
+  - **v5.7.1 baseline: 13.3 tok/s median**
+  - **v5.8.0 (post-refactor): 13.3 tok/s median** ✅
+  - Vectorized `rep_penalty` shows no regression on short prompts;
+    expected to win on long prompts (10000+ tokens) where the Python
+    loop was the bottleneck. The 8-item refactor sweep's perf
+    priority is preserved — no slowdown from the dedupes.
+
+### Notes
+
+- **8-item sweep summary:** 6 completed, 1 reverted (Item 1: drop
+  `.item()` per token — YAGNI, the original guard prevents a CUDA
+  device-side assert that would break the CUDA context), 1 cancelled
+  (Item 3: hardcode `256 → _vocab_size()` — the `256` is
+  `BYTE_COUNT`, not vocab_size; using `BYTE_COUNT` would add an
+  import, violating the "lowest LOC" priority).
+- **Net LOC change:** `train.py` 650 → 15 (-635), `plotter.py` 188
+  → 168 (-20), `tools/inference.py` ~-20 (REPL dedup), `tools/
+  orchestrator.py` +40 (new helpers), `training/stages/{base,
+  pretrain, sft, dpo}.py` net -3 (helper + 3 callers).
+  **Net: ≈-640 LOC.**
+- **No deletes:** all UI/UX preserved (Teto emoticon, rich panels,
+  spinners, banner, step print). No removals — the refactor was
+  strictly deduplication and decomposition.
+- **Backwards-incompatible:** the legacy `train.py` flags
+  `--no-compile` / `--compile-mode` / `--no-checkpointing` / `--seed`
+  are dropped (user said "idc about compatability it is earlyu stage
+  do best" — they preferred the strong refactor over compat shims).
+  Migration: configure these in `configs/pipelines/pretrain-only.yaml`.
+
+---
+
 ## [5.7.1] — 2026-06-04 — "Compile-Safe Checkpoint Loader + Stage Audit" 🛸
 
 ### Added

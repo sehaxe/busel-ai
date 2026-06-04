@@ -162,12 +162,13 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, already_gener
     # Mask special tokens [256:VOCAB_SIZE] — they are not raw bytes and would crash bytearray.append() downstream.
     logits[256:_vocab_size()] = -float("inf")
 
-    for tok in already_generated:
-        if tok < logits.shape[-1]:
-            if logits[tok] > 0:
-                logits[tok] /= repetition_penalty
-            else:
-                logits[tok] *= repetition_penalty
+    if already_generated:
+        indices_list = [t for t in already_generated if t < logits.shape[-1]]
+        if indices_list:
+            indices = torch.tensor(indices_list, dtype=torch.long, device=logits.device)
+            scores = logits[indices]
+            scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+            logits[indices] = scores
 
     # temperature==0 → greedy argmax restricted to byte range [0:256] (specials already masked above).
     if temperature < 1e-6:
@@ -265,9 +266,30 @@ def print_banner(profile, device, loaded):
     print()
 
 
+def parse_repl_command_value(parts, value_type):
+    """Parse a `/<cmd> <value>` REPL command. Returns (new_value, None) on success, (None, usage_msg) on failure.
+
+    The narrow except is critical: a bare `except:` would swallow KeyboardInterrupt
+    and SystemExit, hanging the REPL or preventing shutdown. The only legitimate
+    failures here are IndexError (no arg) and ValueError (bad value).
+    """
+    try:
+        return value_type(parts[1]), None
+    except (ValueError, IndexError):
+        return None, f"❌ usage: /{parts[0][1:]} <value>"
+
+
+_REPL_PARAMS = [
+    ("/temp", "temperature", float, "🌡️  temperature"),
+    ("/topp", "top_p", float, "🎯 top_p"),
+    ("/rep", "repetition_penalty", float, "🔁 rep"),
+    ("/max", "max_new_tokens", int, "📏 max"),
+]
+
+
 def interactive_loop(model, patcher, device, profile, loaded):
     print_banner(profile, device, loaded)
-    temperature, top_p, repetition_penalty, max_new_tokens = 0.7, 0.9, 1.15, 150
+    params = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.15, "max_new_tokens": 150}
     raw_mode, context = False, ""
     auto_approve = False
     tool_registry = default_tool_registry()
@@ -311,34 +333,15 @@ def interactive_loop(model, patcher, device, profile, loaded):
                 continue
             print(f"🤖 Auto-approve tool calls: {'ON' if auto_approve else 'OFF'}")
             continue
-        if user_input.lower().startswith("/temp"):
-            try:
-                temperature = float(user_input.split()[1])
-                print(f"🌡️  temperature = {temperature}")
-            except:
-                print("❌ usage: /temp 0.7")
-            continue
-        if user_input.lower().startswith("/topp"):
-            try:
-                top_p = float(user_input.split()[1])
-                print(f"🎯 top_p = {top_p}")
-            except:
-                print("❌ usage: /topp 0.9")
-            continue
-        if user_input.lower().startswith("/rep"):
-            try:
-                repetition_penalty = float(user_input.split()[1])
-                print(f"🔁 rep = {repetition_penalty}")
-            except:
-                print("❌ usage: /rep 1.15")
-            continue
-        if user_input.lower().startswith("/max"):
-            try:
-                max_new_tokens = int(user_input.split()[1])
-                print(f"📏 max = {max_new_tokens}")
-            except:
-                print("❌ usage: /max 150")
-            continue
+        for cmd, var_name, value_type, label in _REPL_PARAMS:
+            if user_input.lower().startswith(cmd):
+                new_value, err = parse_repl_command_value(user_input.split(), value_type)
+                if err is not None:
+                    print(err)
+                else:
+                    params[var_name] = new_value
+                    print(f"{label} = {new_value}")
+                continue
 
         prompt = (context + user_input) if raw_mode else (context + f"User: {user_input}\nAssistant: ")
 
@@ -351,8 +354,8 @@ def interactive_loop(model, patcher, device, profile, loaded):
             try:
                 for chunk in generate_stream(
                     model, patcher, prompt, device,
-                    max_new_tokens=max_new_tokens, temperature=temperature,
-                    top_p=top_p, repetition_penalty=repetition_penalty,
+                    max_new_tokens=params["max_new_tokens"], temperature=params["temperature"],
+                    top_p=params["top_p"], repetition_penalty=params["repetition_penalty"],
                     # Tool-call envelopes span multiple lines; the model must
                     # not be cut off at the first newline mid-envelope.
                     stop_on_newline=False,

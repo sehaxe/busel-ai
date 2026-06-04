@@ -1957,6 +1957,54 @@ class TestbuselFramework(unittest.TestCase):
         self.assertAlmostEqual(cfg.learning_rate_muon, 0.00005, places=7)
         print(f"   ✅ DPOConfig: β={cfg.dpo_beta}, lr_muon={cfg.learning_rate_muon:.6f}")
 
+    @unittest.skipUnless(HAS_TRAINING_STAGES, "stages required")
+    def test_stage_model_profile_helper_shared(self):
+        """🛸 [STG-15] _apply_model_profile is shared by pretrain/SFT/DPO configs.
+        Verifies the v5.8.0 Item 8 DRY refactor: all 3 stage configs route
+        their 8 model-shape fields through the same helper in base.py.
+        """
+        print("🧪 [STG-15] _apply_model_profile shared by all 3 stage configs...")
+        from training.stages.base import _apply_model_profile
+        from training.stages.pretrain import buselPretrainConfig
+        from training.stages.sft import buselSFTConfig
+        from training.stages.dpo import buselDPOConfig
+
+        profile_model = {
+            "d_model": 192, "n_layers": 6, "n_heads": 6,
+            "expert_hidden": 384, "num_experts": 4, "top_k": 2,
+            "vocab_size": 326, "n_hyper": 4,
+        }
+        fields = ("d_model", "n_layers", "n_heads", "expert_hidden",
+                  "num_experts", "top_k", "vocab_size", "n_hyper")
+        for cfg_class, label in (
+            (buselPretrainConfig, "pretrain"),
+            (buselSFTConfig, "sft"),
+            (buselDPOConfig, "dpo"),
+        ):
+            cfg = cfg_class()
+            _apply_model_profile(cfg, profile_model)
+            for f in fields:
+                self.assertEqual(
+                    getattr(cfg, f), profile_model[f],
+                    f"{label}.{f} should equal {profile_model[f]}, got {getattr(cfg, f)}",
+                )
+            print(f"   ✅ {label}: all 8 model fields set from profile via helper")
+
+        cfg = buselPretrainConfig()
+        default_n_layers = buselPretrainConfig().n_layers
+        _apply_model_profile(cfg, {"d_model": 256})
+        self.assertEqual(cfg.d_model, 256)
+        self.assertEqual(cfg.n_layers, default_n_layers)
+        print("   ✅ partial profile: explicit field set, missing keeps default")
+
+        cfg = buselPretrainConfig()
+        _apply_model_profile(cfg, {"d_model": "256", "n_layers": "5"})
+        self.assertEqual(cfg.d_model, 256)
+        self.assertEqual(cfg.n_layers, 5)
+        self.assertIsInstance(cfg.d_model, int)
+        self.assertIsInstance(cfg.n_layers, int)
+        print("   ✅ string values are coerced to int")
+
     # ════════════════════════════════════════════════════════════════════
     #  PHASE 6 — EVAL (tools/eval.py + training/stages/eval.py)
     # ════════════════════════════════════════════════════════════════════
@@ -2368,6 +2416,403 @@ class TestbuselCheckpoint(unittest.TestCase):
         self.assertIn("phantom_key", result.unexpected_keys)
         self.assertEqual(len(result.missing_keys), 0)
         print(f"   ✅ strict=False → _IncompatibleKeys(unexpected={result.unexpected_keys})")
+
+
+class TestbuselApplySampling(unittest.TestCase):
+    """🎯 v5.8.0 — Per-token sampling correctness for `tools.inference.apply_sampling`.
+
+    Behavior-capture tests run on the CURRENT implementation, then act as
+    regression guards during the perf refactor (drop 1 .item()/token,
+    vectorize repetition_penalty). All edge cases that the hot path must
+    handle WITHOUT crashing the REPL.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+        cls.vocab = mm_vocab_size() if HAS_SPECIAL_TOKENS else 326
+
+    def _logits(self, dtype=torch.float32):
+        return torch.zeros(self.vocab, dtype=dtype, device=self.device)
+
+    def test_normal_sampling_returns_valid_byte(self):
+        """🎯 [SAMP-1] Normal logits + temperature=0.7 → returns a valid byte [0, 256)."""
+        print("🧪 [SAMP-1] apply_sampling: normal sampling returns valid byte...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(0)
+        logits = self._logits()
+        for i in range(256):
+            logits[i] = torch.randn(1).item()
+        tok = apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+        self.assertIsInstance(tok, int)
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        print(f"   ✅ normal sampling → tok={tok} (valid byte)")
+
+    def test_greedy_returns_argmax(self):
+        """🎯 [SAMP-2] temperature < 1e-6 → returns argmax of logits[:256] (deterministic)."""
+        print("🧪 [SAMP-2] apply_sampling: greedy mode returns argmax...")
+        from tools.inference import apply_sampling
+        logits = self._logits()
+        logits[42] = 10.0
+        for _ in range(5):
+            tok = apply_sampling(logits.clone(), temperature=0.0, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+            self.assertEqual(tok, 42)
+        logits[300] = 100.0
+        tok = apply_sampling(logits.clone(), temperature=0.0, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+        self.assertEqual(tok, 42)
+        print("   ✅ greedy returns argmax of [0:256] regardless of special-token logits")
+
+    def test_special_tokens_masked_even_with_high_logits(self):
+        """🎯 [SAMP-3] logits[256:vocab] = -inf even if originally very large — must never emit a special token."""
+        print("🧪 [SAMP-3] apply_sampling: special tokens masked...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(1)
+        for _ in range(50):
+            logits = self._logits()
+            for i in range(256, self.vocab):
+                logits[i] = 100.0
+            for i in range(256):
+                logits[i] = torch.randn(1).item() - 5.0
+            tok = apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+            self.assertGreaterEqual(tok, 0)
+            self.assertLess(tok, 256)
+        print("   ✅ 50/50 trials returned a valid byte despite special-token domination")
+
+    def test_all_logits_neginf_falls_back_safely(self):
+        """🎯 [SAMP-4] All logits -inf (pathological) → still returns a valid byte (no crash, no NaN)."""
+        print("🧪 [SAMP-4] apply_sampling: all -inf logits → safe fallback...")
+        from tools.inference import apply_sampling
+        logits = torch.full((self.vocab,), -float("inf"), device=self.device)
+        tok = apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+        self.assertIsInstance(tok, int)
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        print(f"   ✅ all -inf → tok={tok} (safe argmax fallback)")
+
+    def test_nan_logits_falls_back_safely(self):
+        """🎯 [SAMP-5] NaN/inf in logits → still returns a valid byte (no crash, no NaN)."""
+        print("🧪 [SAMP-5] apply_sampling: NaN/inf logits → safe fallback...")
+        from tools.inference import apply_sampling
+        logits = self._logits()
+        logits[10] = float("nan")
+        logits[20] = float("inf")
+        logits[30] = -float("inf")
+        for i in range(256):
+            if i not in (10, 20, 30):
+                logits[i] = 1.0
+        tok = apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=1.0, already_generated=set())
+        self.assertIsInstance(tok, int)
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        print(f"   ✅ NaN/inf present → tok={tok} (safe fallback)")
+
+    def test_repetition_penalty_unity_is_noop(self):
+        """🎯 [SAMP-6] repetition_penalty=1.0 → logits for already_generated are unchanged."""
+        print("🧪 [SAMP-6] apply_sampling: rep_penalty=1.0 is a noop...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(2)
+        already = set(range(10))
+        logits_before = self._logits()
+        for i in range(10, 100):
+            logits_before[i] = torch.randn(1).item() * 2.0
+        for i in already:
+            logits_before[i] = 5.0
+        logits_after = logits_before.clone()
+        apply_sampling(logits_after, temperature=0.7, top_p=0.9, repetition_penalty=1.0, already_generated=already)
+        for i in already:
+            self.assertAlmostEqual(float(logits_after[i]), 5.0, places=5)
+        print("   ✅ rep_penalty=1.0 leaves already_generated logits untouched")
+
+    def test_repetition_penalty_penalizes_generated_tokens(self):
+        """🎯 [SAMP-7] repetition_penalty>1 → already_generated tokens' logits are divided (or negative multiplied)."""
+        print("🧪 [SAMP-7] apply_sampling: rep_penalty>1 penalizes...")
+        from tools.inference import apply_sampling
+        already = {42}
+        logits = self._logits()
+        logits[42] = 4.0
+        apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=2.0, already_generated=already)
+        self.assertAlmostEqual(float(logits[42]), 2.0, places=5)
+        logits = self._logits()
+        logits[42] = -4.0
+        apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=2.0, already_generated=already)
+        self.assertAlmostEqual(float(logits[42]), -8.0, places=5)
+        print("   ✅ positive logits divided, negative logits multiplied (toward 0 reduction)")
+
+    def test_top_p_nucleus_filter_does_not_crash(self):
+        """🎯 [SAMP-8] Extreme top_p (0.0, 1.0) do not crash — both return a valid byte."""
+        print("🧪 [SAMP-8] apply_sampling: top_p edge cases (0.0, 1.0)...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(3)
+        logits = self._logits()
+        for i in range(256):
+            logits[i] = torch.randn(1).item()
+        tok = apply_sampling(logits.clone(), temperature=0.7, top_p=1.0, repetition_penalty=1.0, already_generated=set())
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        tok = apply_sampling(logits.clone(), temperature=0.7, top_p=0.0, repetition_penalty=1.0, already_generated=set())
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        print("   ✅ top_p ∈ {0.0, 1.0} → valid byte, no crash")
+
+    def test_repetition_penalty_matches_explicit_loop(self):
+        """🎯 [SAMP-9] Vectorized rep_penalty produces the same logits as the explicit Python loop (numerical equivalence).
+
+        The vectorized form must match the per-element reference for any
+        already_generated set (small or large). Tolerance 1e-5 absorbs
+        float32 reduction-order differences.
+        """
+        print("🧪 [SAMP-9] apply_sampling: vectorized rep_penalty matches explicit loop...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(4)
+        for trial in range(5):
+            already = set(int(x) % 256 for x in torch.randint(0, 256, (200,)).tolist())
+            logits_ref = self._logits()
+            logits_vec = self._logits()
+            for i in range(self.vocab):
+                v = torch.randn(1).item()
+                logits_ref[i] = v
+                logits_vec[i] = v
+            penalty = 1.5
+            for tok in already:
+                if logits_ref[tok] > 0:
+                    logits_ref[tok] /= penalty
+                else:
+                    logits_ref[tok] *= penalty
+            logits_ref[256:self.vocab] = -float("inf")
+            apply_sampling(logits_vec, temperature=0.0, top_p=0.9, repetition_penalty=penalty, already_generated=already)
+            diff = (logits_ref[:256] - logits_vec[:256]).abs().max().item()
+            self.assertLess(diff, 1e-5, f"trial {trial}: max logit diff {diff} > 1e-5")
+        print("   ✅ 5/5 trials: vectorized matches explicit loop within 1e-5")
+
+    def test_repetition_penalty_handles_full_prompt(self):
+        """🎯 [SAMP-10] Large already_generated (simulating a 200-token prompt) does not crash and returns a valid byte."""
+        print("🧪 [SAMP-10] apply_sampling: large already_generated (200 tokens)...")
+        from tools.inference import apply_sampling
+        torch.manual_seed(5)
+        already = set(int(x) for x in torch.randint(0, self.vocab, (200,)).tolist())
+        logits = self._logits()
+        for i in range(256):
+            logits[i] = torch.randn(1).item()
+        tok = apply_sampling(logits, temperature=0.7, top_p=0.9, repetition_penalty=1.15, already_generated=already)
+        self.assertIsInstance(tok, int)
+        self.assertGreaterEqual(tok, 0)
+        self.assertLess(tok, 256)
+        print(f"   ✅ 200-token prompt → tok={tok} (valid byte, no crash)")
+
+
+class TestbuselReplCommands(unittest.TestCase):
+    """🎯 v5.8.0 — REPL `/temp /topp /rep /max` command parsing.
+
+    Regression guard: the 4 command blocks used bare `except:` (caught
+    KeyboardInterrupt, SystemExit, etc.). Fixed to `except (ValueError, IndexError):`
+    and deduped into a single helper. Each test exercises the helper.
+    """
+
+    def test_parse_command_value_accepts_valid_float(self):
+        """🎯 [REPL-1] Helper returns (parsed_value, None) for a valid float input."""
+        print("🧪 [REPL-1] parse_repl_command_value: valid float...")
+        from tools.inference import parse_repl_command_value
+        new_value, err = parse_repl_command_value("/temp 0.5".split(), float)
+        self.assertEqual(new_value, 0.5)
+        self.assertIsNone(err)
+        print(f"   ✅ /temp 0.5 → {new_value} (no error)")
+
+    def test_parse_command_value_accepts_valid_int(self):
+        """🎯 [REPL-2] Helper returns (parsed_value, None) for a valid int input."""
+        print("🧪 [REPL-2] parse_repl_command_value: valid int...")
+        from tools.inference import parse_repl_command_value
+        new_value, err = parse_repl_command_value("/max 100".split(), int)
+        self.assertEqual(new_value, 100)
+        self.assertIsNone(err)
+        print(f"   ✅ /max 100 → {new_value} (no error)")
+
+    def test_parse_command_value_missing_arg_returns_index_error(self):
+        """🎯 [REPL-3] Helper returns (None, usage_msg) when no argument provided (IndexError)."""
+        print("🧪 [REPL-3] parse_repl_command_value: missing arg...")
+        from tools.inference import parse_repl_command_value
+        new_value, err = parse_repl_command_value("/temp".split(), float)
+        self.assertIsNone(new_value)
+        self.assertIsNotNone(err)
+        self.assertIn("/temp", err)
+        print(f"   ✅ /temp → usage: {err}")
+
+    def test_parse_command_value_bad_value_returns_value_error(self):
+        """🎯 [REPL-4] Helper returns (None, usage_msg) for unparseable value (ValueError)."""
+        print("🧪 [REPL-4] parse_repl_command_value: bad value...")
+        from tools.inference import parse_repl_command_value
+        new_value, err = parse_repl_command_value("/topp abc".split(), float)
+        self.assertIsNone(new_value)
+        self.assertIsNotNone(err)
+        self.assertIn("/topp", err)
+        print(f"   ✅ /topp abc → usage: {err}")
+
+    def test_parse_command_value_narrow_except_does_not_swallow_keyboard_interrupt(self):
+        """🎯 [REPL-5] Helper does NOT catch KeyboardInterrupt (the bare-except bug)."""
+        print("🧪 [REPL-5] parse_repl_command_value: KeyboardInterrupt propagates...")
+        from tools.inference import parse_repl_command_value
+        def explode(*a, **kw):
+            raise KeyboardInterrupt()
+        float_orig = float
+        try:
+            import builtins
+            builtins.float = explode
+            with self.assertRaises(KeyboardInterrupt):
+                parse_repl_command_value("/temp 0.5".split(), float)
+        finally:
+            import builtins
+            builtins.float = float_orig
+        print("   ✅ KeyboardInterrupt NOT swallowed (bare-except fix verified)")
+
+
+class TestbuselTrainShim(unittest.TestCase):
+    """🛸 v5.8.0 — `train.py` is now a 15-line shim around the pipeline.
+
+    Verifies that the shim correctly:
+    (1) builds a temp YAML from pretrain-only.yaml + CLI overrides,
+    (2) injects profile_name, resume, max_steps, warmup_steps into the right places,
+    (3) cleans up the temp dir after the run.
+    """
+
+    def test_build_shim_yaml_default_profile(self):
+        """🛸 [SHIM-1] _build_shim_yaml: default profile (no overrides) keeps pretrain-only.yaml values."""
+        print("🧪 [SHIM-1] _build_shim_yaml: default profile...")
+        import yaml
+        from tools.orchestrator import _build_shim_yaml
+        import shutil, os
+        tmpdir = _build_shim_yaml("shpak", None, None, None)
+        try:
+            with open(os.path.join(tmpdir, "shim.yaml")) as f:
+                cfg = yaml.safe_load(f)
+            self.assertEqual(cfg["stages"][0]["params"]["profile_name"], "shpak")
+            self.assertEqual(cfg["stages"][0]["params"]["max_steps"], 200)
+            self.assertEqual(cfg["stages"][0]["params"]["warmup_steps"], 10)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        print("   ✅ default profile: pretrain-only.yaml values preserved")
+
+    def test_build_shim_yaml_overrides(self):
+        """🛸 [SHIM-2] _build_shim_yaml: --profile X, --max-steps N, --warmup-steps N, --resume Y all propagate."""
+        print("🧪 [SHIM-2] _build_shim_yaml: overrides propagate...")
+        import yaml
+        from tools.orchestrator import _build_shim_yaml
+        import shutil, os
+        tmpdir = _build_shim_yaml("chyzh", "checkpoints/x.pt", 50, 5)
+        try:
+            with open(os.path.join(tmpdir, "shim.yaml")) as f:
+                cfg = yaml.safe_load(f)
+            stage = cfg["stages"][0]
+            self.assertEqual(stage["params"]["profile_name"], "chyzh")
+            self.assertEqual(stage["params"]["max_steps"], 50)
+            self.assertEqual(stage["params"]["warmup_steps"], 5)
+            self.assertEqual(stage["resume"], "checkpoints/x.pt")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        print("   ✅ all 4 overrides propagate to stage params + resume")
+
+    def test_build_shim_yaml_cleans_up(self):
+        """🛸 [SHIM-3] _build_shim_yaml: returns a real temp dir (caller is responsible for cleanup)."""
+        print("🧪 [SHIM-3] _build_shim_yaml: returns a real temp dir...")
+        import os
+        from tools.orchestrator import _build_shim_yaml
+        import shutil
+        tmpdir = _build_shim_yaml("shpak", None, None, None)
+        self.assertTrue(os.path.isdir(tmpdir))
+        self.assertTrue(os.path.isfile(os.path.join(tmpdir, "shim.yaml")))
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        print("   ✅ temp dir + shim.yaml exist; caller responsible for cleanup")
+
+
+class TestbuselPlotter(unittest.TestCase):
+    """📈 v5.8.0 — Plotter helpers (`_load_metrics`, `_compute_dashboard_stats`).
+
+    The matplotlib rendering is not tested (matplotlib is not a project dep).
+    Only the data-loading + stats helpers, which are testable in isolation.
+    """
+
+    def test_load_metrics_returns_none_for_missing_file(self):
+        """📈 [PLOT-1] _load_metrics: returns None if the log file does not exist."""
+        print("🧪 [PLOT-1] _load_metrics: missing file → None...")
+        from tools.plotter import _load_metrics
+        result = _load_metrics("/tmp/nonexistent_metrics_xyz.jsonl")
+        self.assertIsNone(result)
+        print("   ✅ missing file → None (caller bails out cleanly)")
+
+    def test_load_metrics_returns_none_for_empty_file(self):
+        """📈 [PLOT-2] _load_metrics: returns None if the log file is empty (only whitespace)."""
+        print("🧪 [PLOT-2] _load_metrics: empty file → None...")
+        import tempfile, os
+        from tools.plotter import _load_metrics
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write("\n\n   \n")
+            tmp = f.name
+        try:
+            self.assertIsNone(_load_metrics(tmp))
+        finally:
+            os.unlink(tmp)
+        print("   ✅ empty file → None (caller bails out cleanly)")
+
+    def test_load_metrics_parses_valid_jsonl(self):
+        """📈 [PLOT-3] _load_metrics: returns 6 parallel numpy arrays from a valid JSONL log."""
+        print("🧪 [PLOT-3] _load_metrics: valid JSONL → 6 arrays...")
+        import tempfile, os, json
+        from tools.plotter import _load_metrics
+        rows = [
+            {"step": 1, "loss": 10.0, "aux_loss": 0.1, "speed": 100.0, "lr": 0.001, "vram": 500.0},
+            {"step": 2, "loss": 9.5, "aux_loss": 0.2, "speed": 200.0, "lr": 0.002, "vram": 510.0},
+            {"step": 3, "loss": 9.0, "aux_loss": 0.15, "speed": 300.0, "lr": 0.003, "vram": 520.0},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+            tmp = f.name
+        try:
+            result = _load_metrics(tmp)
+            self.assertIsNotNone(result)
+            steps, losses, aux_losses, speeds, lrs, vrams = result
+            self.assertEqual(len(steps), 3)
+            self.assertEqual(list(losses), [10.0, 9.5, 9.0])
+            self.assertEqual(list(speeds), [100.0, 200.0, 300.0])
+            self.assertEqual(list(vrams), [500.0, 510.0, 520.0])
+        finally:
+            os.unlink(tmp)
+        print("   ✅ 3 rows parsed into 6 correct numpy arrays")
+
+    def test_load_metrics_skips_malformed_lines(self):
+        """📈 [PLOT-4] _load_metrics: malformed JSONL lines are skipped (not crashed)."""
+        print("🧪 [PLOT-4] _load_metrics: malformed lines skipped...")
+        import tempfile, os, json
+        from tools.plotter import _load_metrics
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write('{"step": 1, "loss": 5.0, "aux_loss": 0.0, "speed": 1.0, "lr": 0.001, "vram": 1.0}\n')
+            f.write('this is not json\n')
+            f.write('{"step": 2, "loss": 4.0, "aux_loss": 0.0, "speed": 1.0, "lr": 0.001, "vram": 1.0}\n')
+            tmp = f.name
+        try:
+            result = _load_metrics(tmp)
+            self.assertIsNotNone(result)
+            steps = result[0]
+            self.assertEqual(len(steps), 2)
+        finally:
+            os.unlink(tmp)
+        print("   ✅ 1 malformed line skipped, 2 valid lines returned")
+
+    def test_compute_dashboard_stats_basic(self):
+        """📈 [PLOT-5] _compute_dashboard_stats: returns 5 stat fields (min_loss, avg_speed, etc.)."""
+        print("🧪 [PLOT-5] _compute_dashboard_stats: 5 stat fields...")
+        import numpy as np
+        from tools.plotter import _compute_dashboard_stats
+        steps = np.array([1, 2, 3, 4, 5])
+        losses = np.array([10.0, 8.0, 6.0, 5.0, 7.0])
+        speeds = np.array([100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1000.0, 1100.0, 1200.0])
+        vrams = np.array([500.0, 600.0, 700.0, 800.0, 900.0])
+        cumulative = steps * 2048
+        stats = _compute_dashboard_stats(steps, losses, speeds, vrams, cumulative)
+        self.assertEqual(stats["min_loss_val"], 5.0)
+        self.assertEqual(stats["min_loss_step"], 4)
+        self.assertEqual(stats["max_vram_val"], 900.0)
+        self.assertEqual(stats["total_tokens_val"], 5 * 2048)
+        print(f"   ✅ min_loss=5.0@step4, peak_vram=900.0, total={stats['total_tokens_val']}")
 
 
 if __name__ == "__main__":
