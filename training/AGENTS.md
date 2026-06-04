@@ -25,16 +25,21 @@ training/
 |---|---|---|---|
 | `_newton_schulz_core` | function | optimizer.py | Quintic NS iteration, 5 steps, transposed for tall matrices |
 | `_compiled_newton_schulz` | function | optimizer.py | `@torch.compile(reduce-overhead)` on Linux+CUDA; eager fallback |
-| `Muon` | Optimizer | optimizer.py | Manual momentum + NS orthogonalize, scale=`0.2*sqrt(max(A,B))` |
-| `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+`proj`+!`router`→Muon; rest→AdamW |
+| `Muon` | Optimizer | optimizer.py | Manual momentum + NS orthogonalize, scale=`0.2*sqrt(max(A,B))`. NS initial normalisation uses 1-step power iteration (spectral norm) rather than Frobenius. |
+| `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+!`router`+!`embed`→Muon; rest→AdamW. Prints routing summary. |
 | `buselAutoPilot` | class | autopilot.py | Wraps engine; tracks loss/grad history; recovery countdown |
 | `buselLossEngine` | class | recipe.py | Liger-CE on CUDA; vanilla F.cross_entropy elsewhere; MTP weights [0.5, 0.25, 0.125] |
 
 ## CONVENTIONS
-- **Param routing rule:** `param.ndim == 2 and "router" not in name and "proj" in name` → Muon
+- **Param routing rule:** `param.ndim == 2 and "router" not in name and "embed" not in name` → Muon
+  (fixes ISSUES.md #1; the old rule was `"proj" in name` which missed MoE expert
+  FFN weights, MLA compress/decompress, Blackboard memory, mtp_projections,
+  mtp_heads — i.e. ~83% of trainable parameters were silently falling through
+  to AdamW)
 - **Muon momentum:** 0.95; NS steps: 5; weight_decay: dynamic (set by AutoPilot)
-- **AdamW weight_decay:** 0.01 (fixed); lr_adamw is 10× smaller than lr_muon
-- **Dampening threshold:** `mean(history[:-1]) + 3σ` over last 15 grad norms
+- **AdamW weight_decay:** dynamic (set by AutoPilot on every step from
+  `target_wd × wd_factor` curve). lr_adamw is 10× smaller than lr_muon.
+- **Dampening threshold:** `mean(history[:-1]) + 3σ` over last 15 grad norms (predictive)
 - **Spike detection:** `current_loss > 1.35 × rolling_avg(loss[:-1])` over 15 steps
 - **Recovery:** LR scaled to 35% for 15 steps after spike; noise scale ×1.5
 - **LR cosine:** `min_lr_ratio + (1-min_lr_ratio) × 0.5 × (1+cos(π·progress))` after warmup
@@ -61,5 +66,8 @@ training/
 - **`inject_noise`:** Gaussian `noise_scale × grad_norm` per param (only if `grad_norm > 1e-5`)
 - **Loss API contract:** `compute_pretrain_loss(logits_t1, targets, [logits_t2,t3,t4], [t2,t3,t4])` — MTP logits are Optional, weight is index-based
 - **MTP target alignment:** Defined in `train.py:build_targets` — T1=stride-shifted byte, T2/T3/T4 at offsets [2,3,4] in byte space
+- **MTP-4 loss weights:** T1 has implicit weight 1.0; the 3 explicit weights in
+  `recipe.py:compute_pretrain_loss` are `[0.5, 0.25, 0.125]` for T2/T3/T4
+  respectively (decaying by 2× per step into the future).
 - **`progress` propagation:** `train.py` passes `step/max_steps` to layer.forward → MoE.forward
 - **Liger fallback:** `importlib.util.find_spec("liger_kernel")` or just try-except — auto-fallback to vanilla

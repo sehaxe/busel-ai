@@ -535,6 +535,41 @@ class TestbuselFramework(unittest.TestCase):
         self.assertEqual(len(muon_ids & adamw_ids), 0, "no param in both")
         self.assertEqual(len(muon_ids | adamw_ids), sum(1 for p in model.parameters() if p.requires_grad))
 
+    def test_muon_routing_covers_moe_and_mla(self):
+        # ISSUES.md #1: 2D BitLinear weights (MoE, MLA, Blackboard, mtp) must route to Muon.
+        cfg = _MockConfig(d_model=384, n_layers=4, n_heads=6, expert_hidden=768, num_experts=4)
+        model = buselModel(cfg)
+        engine = buselOptimizerEngine(model, lr_muon=0.001, lr_adamw=0.0001)
+        n_muon = sum(p.numel() for g in engine.opt_muon.param_groups for p in g["params"])
+        n_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        ratio = n_muon / n_total
+        self.assertGreater(ratio, 0.85,
+                           f"Expected ≥85% of params to Muon after ISSUES.md #1 fix; got {ratio*100:.1f}%")
+
+    def test_muon_routing_excludes_router_and_embed(self):
+        # Routers + embed tables stay on AdamW (noise-sensitive / structured).
+        cfg = _MockConfig(d_model=128, n_layers=2, n_heads=4, num_experts=4)
+        model = buselModel(cfg)
+        engine = buselOptimizerEngine(model, lr_muon=0.001, lr_adamw=0.0001)
+        muon_ids = {id(p) for g in engine.opt_muon.param_groups for p in g["params"]}
+        for name, p in model.named_parameters():
+            if "router" in name or "embed" in name:
+                self.assertNotIn(id(p), muon_ids,
+                                 f"{name} must NOT be on Muon (router/embed exclusion rule)")
+
+    def test_muon_step_does_not_produce_nan(self):
+        # ISSUES.md #3 + #4 regression: momentum update + NS core must not NaN.
+        torch.manual_seed(42)
+        p = torch.randn(64, 64, device=self.device, dtype=torch.float32) * 0.02
+        opt = Muon([p], lr=0.001, momentum=0.95, weight_decay=0.1)
+        for i in range(5):
+            p.grad = torch.randn_like(p) * 0.01
+            opt.step()
+            self.assertFalse(torch.isnan(p).any(),
+                             f"step {i}: Muon produced NaN weights")
+            self.assertFalse(torch.isinf(p).any(),
+                             f"step {i}: Muon produced Inf weights")
+
     def test_fastblt_vocab_size_259(self):
         # Paper §2.1: byte-level vocab is 256 (UTF-8) + 3 multimodal specials = 259
         patcher = StridedFastBLTPatcher(d_model=128)

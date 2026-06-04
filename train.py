@@ -233,6 +233,24 @@ def main():
     else:
         cfg.max_steps = int(cfg.max_steps)
 
+    if cfg.warmup_steps == "auto" or cfg.warmup_steps is None:
+        cfg.warmup_steps = max(50, int(0.05 * cfg.max_steps))
+    else:
+        cfg.warmup_steps = int(cfg.warmup_steps)
+
+    # Runtime guard (ISSUES.md #7): max_steps must exceed warmup_steps.
+    if cfg.max_steps <= cfg.warmup_steps:
+        raise ValueError(
+            f"max_steps ({cfg.max_steps}) must be strictly greater than "
+            f"warmup_steps ({cfg.warmup_steps}). Either raise max_steps or "
+            f"lower warmup_steps in configs/default.yaml."
+        )
+    if cfg.warmup_steps < 1:
+        raise ValueError(
+            f"warmup_steps ({cfg.warmup_steps}) must be >= 1. The first 50 "
+            f"steps also need to be free of predictive dampening (autopilot.py)."
+        )
+
     # Gradient Checkpointing (CUDA only)
     if device == "cuda" and not args.no_checkpointing:
         model.enable_gradient_checkpointing()
