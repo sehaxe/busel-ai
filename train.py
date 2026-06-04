@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║ busel TRAINING ENGINE v5.2 - Cybernetic Curriculum                         ║
+║ busel TRAINING ENGINE v5.7.1 - Cybernetic Curriculum                       ║
 ║                                                                           ║
 ║ 🎯 KEY OPTIMIZATIONS:                                                     ║
 ║   • Sequence Length Warmup (Curriculum: 1024 -> 2048 -> 4096)             ║
@@ -9,6 +9,7 @@
 ║   • buselAutoPilot v6.0 (Predictive Gradient Dampening & Adaptive AGC)    ║
 ║   • CUDA-only Gradient Checkpointing (safeguards MPS RNG state bug)       ║
 ║   • Dynamic Auto-Batcher & Gradient Accumulation Integration              ║
+║   • v5.7.1 — compile-safe checkpoint resume via model.checkpoint helper   ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -95,25 +96,13 @@ def detect_device():
 
 
 def _strip_compile_prefix(sd):
-    """Strip torch.compile state_dict prefixes so checkpoints remain portable.
+    """Deprecated: use `model.checkpoint.strip_compile_prefix` instead.
 
-    `torch.compile(model, fullgraph=False)` wraps the model so that
-    `model.state_dict()` returns keys prefixed with `_orig_mod.`. We strip this on
-    resume so checkpoints saved by a compiled run can be loaded by an un-compiled
-    resume (or vice-versa). Also handles `compiled_model.` and `_dynamo.`
-    variants from older `torch._dynamo` versions.
+    Kept as a thin shim for the `torch.save(... _strip_compile_prefix(model.state_dict()) ...)`
+    call sites in this file. New code should import from `model.checkpoint`.
     """
-    if not sd:
-        return sd
-    out = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
+    from model.checkpoint import strip_compile_prefix as _impl
+    return _impl(sd)
 
 
 def build_targets(byte_batch, input_length, stride=4):
@@ -288,8 +277,9 @@ def main():
     if args.resume and os.path.exists(args.resume):
         print(f"\n💾 Resuming checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(_strip_compile_prefix(checkpoint['model_state_dict']))
-        patcher.load_state_dict(_strip_compile_prefix(checkpoint['patcher_state_dict']))
+        from model.checkpoint import load_state_dict_safely
+        for obj, key in [(model, 'model_state_dict'), (patcher, 'patcher_state_dict')]:
+            load_state_dict_safely(obj, checkpoint[key])
 
         if checkpoint.get('step') != 'emergency_backup':
             start_step = checkpoint['step']

@@ -1,6 +1,6 @@
 # training/ — Optimizer, AutoPilot, Loss, **Stage Framework**
 
-**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**.
+**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**, **v5.7.1 compile-safe checkpoint loader**.
 
 ## STRUCTURE
 ```
@@ -99,4 +99,5 @@ training/
 - **Stage module naming:** `stages/<name>.py` corresponds to `@register_stage("<name>")`. File names are snake_case, registry names are also snake_case to match.
 - **Backward compat:** `train.py` is unchanged in v5.5. Users can run `uv run train.py --profile shpak` (legacy) OR `uv run cli.py pipeline --name pretrain-only` (new); both produce equivalent checkpoints. The `train.py` migration will be a separate PR.
 - **Stage framework phases:** Phase 0+1 (this release) = pretrain stage only. Phase 2-8 will add SFT, DPO, eval, REPL stages.
+- **v5.7.1 checkpoint loading:** All 4 stages (`pretrain`, `sft`, `dpo`, `eval`) load checkpoints via `model.checkpoint.load_state_dict_safely(model, ckpt["model_state_dict"])` instead of `model.load_state_dict(...)`. This is **required** — `train.py` runs with `--compile` by default, so saved checkpoints have `_orig_mod.` prefixes and reach the stages wrapped in `OptimizedModule`. See `model/AGENTS.md` for the full helper API and the 4 cross-config cases.
 - **Registry kind `stage`:** The stages use `busel_registry.register("stage", name)` (a new registry kind). `get_stage("pretrain")` returns the class. The existing `attention`/`optimizer`/`encoder` kinds are untouched.

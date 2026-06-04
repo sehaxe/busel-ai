@@ -38,20 +38,6 @@ def _detect_device() -> str:
     return "cpu"
 
 
-def _strip_compile_prefix(sd: dict) -> dict:
-    if not sd:
-        return sd
-    out: dict = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
-
-
 @torch.no_grad()
 def perplexity(
     model: Any,

@@ -24,9 +24,9 @@ in whether the *scaling-laws ceiling* can be pushed down by:
    in the forward pass (real weights are kept in a master copy with STE updates).
    At inference the math becomes pure additions on CPU, the model shrinks to
    ~11 MB for a 50 M-param profile, and FP16 multiplications disappear.
-2. **Byte-level tokens (vocab=259)** — no BPE. No 40 % of the model wasted on
+2. **Byte-level tokens (vocab=326)** — no BPE. No 40 % of the model wasted on
    an embedding matrix. The same token stream carries text, code, JSON,
-   images (32×32×3 = 3072 tokens, token `256` marker), video, audio, PDF
+   images (32×32×3 = 3072 tokens, `MOD_IMAGE` marker), video, audio, PDF
    (via Docling), and docx. See [Multimodal data](https://sehaxe.github.io/busel-ai/data/multimodal/).
 3. **mAR (Manifold Constrained Attention Residuals)** — replaces the
    classical `y = x + f(x)` residual with an input-dependent, doubly-stochastic
@@ -101,15 +101,15 @@ data loader auto-dispatches by extension.
             ┌─────────────────────────────────────┐
             │ multimodal/encoders                │  OpenCV fast path
             │   text  → list[int]  (UTF-8 bytes)  │  PIL/imageio fallback
-            │   image → [256] [3072 RGB] [257]   │  docling for PDF
-            │   video → [256] [N×3072 frames]    │  python-docx for docx
-            │   audio → [256] [sr][n][sw][PCM]   │  soundfile for audio
+            │   image → [MOD_IMAGE] [3072 RGB] [MEDIA_END] │  docling for PDF
+            │   video → [MOD_VIDEO] [N×3072 frames]    │  python-docx for docx
+            │   audio → [MOD_AUDIO] [sr][n][sw][PCM]   │  soundfile for audio
             └─────────────────────────────────────┘
-                              │  tokens (B × T, values 0-258)
+                              │  tokens (B × T, values 0-325)
                               ▼
             ┌─────────────────────────────────────┐
             │ StridedFastBLTPatcher              │  stride=4 conv
-            │   vocab=259 → d_byte=128 → d_model │  + sigmoid gate
+            │   vocab=326 → d_byte=128 → d_model │  + sigmoid gate
             └─────────────────────────────────────┘
                               │  patches (B × T/4 × d_model)
                               ▼
@@ -131,7 +131,7 @@ data loader auto-dispatches by extension.
             └─────────────────────────────────────┘
                               │
                               ▼
-                       logits (B × T/4 × 259)
+                       logits (B × T/4 × 326)
 ```
 
 Read the deep dive in the docs:
@@ -144,13 +144,13 @@ Read the deep dive in the docs:
 
 ```
 busel-ai/
-├── model/              # BitNet v2 architecture (BitLinear, mAR, attention mix)
+├── model/              # BitNet v2 architecture (BitLinear, mAR, attention mix) + checkpoint I/O
 ├── training/           # Muon+AdamW hybrid optimizer, AutoPilot v6.0, MTP-4 loss
 ├── data/               # Stream-interleaving token loader (list[int], Rust mmap or Python)
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (77 tests) + ultra-stable profiler v2.0
+├── tests/              # unittest suite (137 tests) + ultra-stable profiler v2.0
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
 ├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
 ├── site/               # Astro+Starlight docs site (this wiki)
@@ -324,7 +324,7 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (77 tests,
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (137 tests,
 verbose mode by default, no pytest, no torch.profiler on MPS). Add new
 tests there — never spawn a second test file.
 
@@ -333,6 +333,12 @@ via `@register("encoder", name)`. To add a new modality, write a class that
 returns `list[int]` (NOT `bytes`) and add it to `multimodal/encoders.py`.
 See [`multimodal/AGENTS.md`](./multimodal/AGENTS.md) for the full design
 rationale, anti-patterns, and performance characteristics.
+
+**Checkpoint loading** lives in [`model/checkpoint.py`](./model/checkpoint.py) —
+the single source of truth for `_orig_mod.` prefix handling. Use
+`load_state_dict_safely(model, sd)` instead of `model.load_state_dict(sd)`
+anywhere the model might be wrapped by `torch.compile` (it always is, by
+default in `train.py`).
 
 ---
 

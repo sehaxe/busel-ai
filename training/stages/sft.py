@@ -94,21 +94,6 @@ class buselSFTConfig:
         return cfg
 
 
-def _strip_compile_prefix(sd: dict) -> dict:
-    """Strip torch.compile prefixes for portable checkpoint loading."""
-    if not sd:
-        return sd
-    out: dict = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
-
-
 def _enforce_stability(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -246,8 +231,9 @@ class buselSFTStage:
 
         if resume and os.path.exists(resume):
             checkpoint = torch.load(resume, map_location=self.device)
-            self.model.load_state_dict(_strip_compile_prefix(checkpoint["model_state_dict"]))
-            self.patcher.load_state_dict(_strip_compile_prefix(checkpoint["patcher_state_dict"]))
+            from model.checkpoint import load_state_dict_safely
+            load_state_dict_safely(self.model, checkpoint["model_state_dict"])
+            load_state_dict_safely(self.patcher, checkpoint["patcher_state_dict"])
             self.start_step = checkpoint.get("step", 0) if checkpoint.get("step") != "emergency_backup" else 0
             print(f"📥 Resumed SFT from {resume} at step {self.start_step}")
             log_event("sft_resumed", resume=resume, start_step=self.start_step)

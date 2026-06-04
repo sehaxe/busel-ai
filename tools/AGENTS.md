@@ -1,6 +1,6 @@
 # tools/ — CLI, Data Manager, Orchestrator
 
-**Scope:** User-facing entrypoints (Typer CLI), dataset management, training orchestration, plotting, standalone inference, **v5.5 multi-stage pipeline runner**.
+**Scope:** User-facing entrypoints (Typer CLI), dataset management, training orchestration, plotting, standalone inference, **v5.5 multi-stage pipeline runner**, **v5.7.1 compile-safe checkpoint loader**.
 
 ## STRUCTURE
 ```
@@ -65,6 +65,7 @@ tools/
 - **NEVER** set `max_steps` < `warmup_steps` in any preset — produces NaN spikes
 - **NEVER** modify `data_train/` directly without gitignoring first — dirs are already in .gitignore
 - **NEVER** execute a model-emitted tool call without user confirmation — the REPL's `interactive_confirm` is the gate. The only escape hatch is the per-session `/auto on` toggle, which the user must opt into.
+- **NEVER** call `model.load_state_dict(sd)` directly in `tools/inference.py` or `tools/eval.py` — always use `model.checkpoint.load_state_dict_safely`. `inference.py` uses `strict=False` to print a diagnostic of any missing/unexpected keys (most common: vocab-size mismatch when a pre-v5.4 checkpoint is loaded). **🆕 v5.7.1**
 - **NEVER** set `stop_on_newline=True` inside the multi-pass tool loop in `interactive_loop` — tool-call envelopes span multiple lines, and the model would be cut off mid-`</function_calls>`.
 
 ## NOTES
@@ -75,3 +76,4 @@ tools/
 - **Plotter file:** See `tools/plotter.py` for exact metrics.jsonl schema (loss, lr, step, grad_norm, moe_aux)
 - **Typer `help`:** All commands have emoji-prefixed `help="..."` for rich output
 - **v5.7 REPL tool flow:** The `interactive_loop` is multi-pass — when the model emits `<function_calls>...</function_calls>`, the REPL asks the user, executes or denies, injects `<function_results>...</function_results>`, and re-prompts. Up to 5 tool-call rounds per user turn. The user can `/auto on` to skip the prompt (not recommended). Special tokens (TOOL_CALLS_START etc.) are MASKED in the sampling logits (see `apply_sampling` in `inference.py`), so the model emits the LITERAL byte sequence for the envelope.
+- **v5.7.1 inference checkpoint load:** `tools/inference.py` calls `load_state_dict_safely(model, ckpt["model_state_dict"], strict=False)` and prints a 2-line banner reporting `keys_loaded=N, missing=K, unexpected=U`. If `K > 0` or `U > 0`, the user sees a warning — common case is loading a pre-v5.4 259-vocab checkpoint into a 326-vocab model (the patcher `embed_weight` shape is `(326, d_byte)` vs `(259, d_byte)`). **🆕 v5.7.1**

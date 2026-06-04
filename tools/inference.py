@@ -82,28 +82,6 @@ def resolve_config(checkpoint_path: str, profile_override: str = None):
     return cfg, effective_profile
 
 
-def _strip_compile_prefix(sd):
-    """Strip torch.compile state_dict prefixes (_orig_mod., compiled_model., _dynamo.).
-
-    Training wraps the model via `torch.compile(model, fullgraph=False)` which causes
-    `model.state_dict()` to return keys prefixed with `_orig_mod.`. Inference builds a
-    fresh un-compiled model, so without this strip the keys never match and
-    `load_state_dict(strict=False)` silently ignores ALL weights — the model runs with
-    random init and produces garbage output.
-    """
-    if not sd:
-        return sd
-    out = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
-
-
 def find_latest_checkpoint():
     ckpt_dir = os.path.join(project_root, "checkpoints")
     if not os.path.exists(ckpt_dir):
@@ -150,11 +128,11 @@ def load_model(cfg, checkpoint_path, device):
         print(f"💾 Loading weights from: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         try:
-            model_sd = _strip_compile_prefix(ckpt["model_state_dict"])
-            patcher_sd = _strip_compile_prefix(ckpt["patcher_state_dict"])
-
-            m_missing, m_unexpected = model.load_state_dict(model_sd, strict=False)
-            p_missing, p_unexpected = patcher.load_state_dict(patcher_sd, strict=False)
+            from model.checkpoint import load_state_dict_safely
+            model_sd = ckpt["model_state_dict"]
+            patcher_sd = ckpt["patcher_state_dict"]
+            m_missing, m_unexpected = load_state_dict_safely(model, model_sd, strict=False)
+            p_missing, p_unexpected = load_state_dict_safely(patcher, patcher_sd, strict=False)
 
             total_ckpt_keys = len(model_sd) + len(patcher_sd)
             total_loaded = (len(model_sd) - len(m_unexpected)) + (len(patcher_sd) - len(p_unexpected))

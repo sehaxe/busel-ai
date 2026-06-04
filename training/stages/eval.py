@@ -57,20 +57,6 @@ class buselEvalConfig:
         return cfg
 
 
-def _strip_compile_prefix(sd: dict) -> dict:
-    if not sd:
-        return sd
-    out: dict = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
-
-
 def _detect_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -126,8 +112,9 @@ class buselEvalStage:
 
         if resume and os.path.exists(resume):
             ckpt = torch.load(resume, map_location=self.device)
-            self.model.load_state_dict(_strip_compile_prefix(ckpt["model_state_dict"]))
-            self.patcher.load_state_dict(_strip_compile_prefix(ckpt["patcher_state_dict"]))
+            from model.checkpoint import load_state_dict_safely
+            load_state_dict_safely(self.model, ckpt["model_state_dict"])
+            load_state_dict_safely(self.patcher, ckpt["patcher_state_dict"])
             print(f"📥 Loaded checkpoint for eval: {resume}")
         else:
             raise FileNotFoundError(

@@ -2290,5 +2290,85 @@ class TestbuselToolExecutor(unittest.TestCase):
         print(f"   ✅ MAX_TOOL_CALLS_PER_TURN={MAX_TOOL_CALLS_PER_TURN}, MAX_TOOL_OUTPUT_BYTES={MAX_TOOL_OUTPUT_BYTES}")
 
 
+class TestbuselCheckpoint(unittest.TestCase):
+    """🛸 v5.7.1 — Compile-safe state_dict loader.
+
+    Covers `model.checkpoint.strip_compile_prefix` and
+    `load_state_dict_safely`. All 4 cross-config cases for the latter:
+    (saved × loaded) ∈ {uncompiled, compiled}².
+    """
+
+    def test_strip_compile_prefix_identity(self):
+        """🔧 [CKPT-1] strip_compile_prefix: empty dict + non-prefixed keys pass through unchanged."""
+        print("🧪 [CKPT-1] strip_compile_prefix: identity on empty + non-prefixed...")
+        from model.checkpoint import strip_compile_prefix
+        self.assertEqual(strip_compile_prefix({}), {})
+        sd = {"encoder.weight": "a", "decoder.bias": "b"}
+        out = strip_compile_prefix(sd)
+        self.assertEqual(out, sd)
+        self.assertIn("encoder.weight", sd)
+        print("   ✅ identity + non-mutation invariants hold")
+
+    def test_strip_compile_prefix_strips_orig_mod(self):
+        """🔧 [CKPT-2] strip_compile_prefix: removes the `_orig_mod.` prefix from every key."""
+        print("🧪 [CKPT-2] strip_compile_prefix: strips `_orig_mod.` prefix...")
+        from model.checkpoint import strip_compile_prefix
+        sd = {"_orig_mod.encoder.weight": "a", "_orig_mod.decoder.bias": "b"}
+        out = strip_compile_prefix(sd)
+        self.assertEqual(set(out.keys()), {"encoder.weight", "decoder.bias"})
+        self.assertEqual(out["encoder.weight"], "a")
+        self.assertEqual(out["decoder.bias"], "b")
+        print("   ✅ `_orig_mod.` prefix removed from all keys")
+
+    def test_strip_compile_prefix_strips_legacy_prefixes(self):
+        """🔧 [CKPT-3] strip_compile_prefix: handles all 3 legacy prefixes (`_orig_mod.`, `compiled_model.`, `_dynamo.`)."""
+        print("🧪 [CKPT-3] strip_compile_prefix: strips all 3 legacy prefixes...")
+        from model.checkpoint import strip_compile_prefix
+        sd = {
+            "_orig_mod.foo": 1,
+            "compiled_model.bar": 2,
+            "_dynamo.baz": 3,
+            "qux": 4,
+        }
+        out = strip_compile_prefix(sd)
+        self.assertEqual(set(out.keys()), {"foo", "bar", "baz", "qux"})
+        self.assertEqual(out["foo"], 1)
+        self.assertEqual(out["bar"], 2)
+        self.assertEqual(out["baz"], 3)
+        self.assertEqual(out["qux"], 4)
+        print("   ✅ all 3 legacy prefixes stripped, non-prefixed keys untouched")
+
+    def test_load_state_dict_safely_fresh_model(self):
+        """🔧 [CKPT-4] load_state_dict_safely: round-trip on a fresh model (no torch.compile)."""
+        print("🧪 [CKPT-4] load_state_dict_safely: round-trip on fresh model...")
+        from model.checkpoint import load_state_dict_safely
+        import torch
+        import torch.nn as nn
+        m1 = nn.Linear(4, 4)
+        sd = m1.state_dict()
+        m2 = nn.Linear(4, 4)
+        self.assertFalse(torch.equal(m1.weight, m2.weight))
+        load_state_dict_safely(m2, sd, strict=True)
+        self.assertTrue(torch.equal(m1.weight, m2.weight))
+        self.assertTrue(torch.equal(m1.bias, m2.bias))
+        print("   ✅ fresh-model round-trip: weights copied, biases copied, no warnings")
+
+    def test_load_state_dict_safely_strict_false_returns_incompatible_keys(self):
+        """🔧 [CKPT-5] load_state_dict_safely(strict=False) returns the _IncompatibleKeys namedtuple for diagnostics."""
+        print("🧪 [CKPT-5] load_state_dict_safely: strict=False returns _IncompatibleKeys...")
+        from model.checkpoint import load_state_dict_safely
+        import torch
+        import torch.nn as nn
+        m1 = nn.Linear(4, 4)
+        m2 = nn.Linear(4, 4)
+        sd = dict(m1.state_dict())
+        sd["phantom_key"] = torch.zeros(1)
+        result = load_state_dict_safely(m2, sd, strict=False)
+        self.assertIsNotNone(result)
+        self.assertIn("phantom_key", result.unexpected_keys)
+        self.assertEqual(len(result.missing_keys), 0)
+        print(f"   ✅ strict=False → _IncompatibleKeys(unexpected={result.unexpected_keys})")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 [project]
 name = "busel"
-version = "4.0.0"
+version = "5.7.1"
 description = "busel - Sovereign 1-bit Omni-LLM"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -12,6 +12,9 @@ temp_test_*
 checkpoints/*.png
 checkpoints/*.jsonl
 
+# --- Ralph-Loop / Sisyphus session metadata ---
+.sisyphus/
+
 # --- Python ---
 .venv/
 __pycache__/

@@ -90,25 +90,6 @@ class buselPretrainConfig:
         return cfg
 
 
-def _strip_compile_prefix(sd: dict) -> dict:
-    """Strip torch.compile state_dict prefixes for portable checkpoints.
-
-    Mirrors train.py:_strip_compile_prefix. Handles `_orig_mod.`,
-    `compiled_model.`, `_dynamo.` prefixes.
-    """
-    if not sd:
-        return sd
-    out: dict = {}
-    for k, v in sd.items():
-        new_k = k
-        for prefix in ("_orig_mod.", "compiled_model.", "_dynamo."):
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        out[new_k] = v
-    return out
-
-
 def _enforce_stability(seed: int = 42) -> None:
     """Set TF32, cuDNN benchmark, seed (mirrors train.py:enforce_stability)."""
     torch.manual_seed(seed)
@@ -307,8 +288,9 @@ class buselPretrainStage:
 
         if resume and os.path.exists(resume):
             checkpoint = torch.load(resume, map_location=self.device)
-            self.model.load_state_dict(_strip_compile_prefix(checkpoint["model_state_dict"]))
-            self.patcher.load_state_dict(_strip_compile_prefix(checkpoint["patcher_state_dict"]))
+            from model.checkpoint import load_state_dict_safely
+            load_state_dict_safely(self.model, checkpoint["model_state_dict"])
+            load_state_dict_safely(self.patcher, checkpoint["patcher_state_dict"])
             if checkpoint.get("step") != "emergency_backup":
                 self.start_step = checkpoint["step"]
                 self.start_file_idx = checkpoint.get("file_idx", 0)
@@ -473,10 +455,11 @@ class buselPretrainStage:
             if self._emergency_save_requested["value"]:
                 os.makedirs("checkpoints", exist_ok=True)
                 try:
+                    from model.checkpoint import strip_compile_prefix
                     torch.save(
                         {
-                            "model_state_dict": _strip_compile_prefix(self.model.state_dict()),
-                            "patcher_state_dict": _strip_compile_prefix(self.patcher.state_dict()),
+                            "model_state_dict": strip_compile_prefix(self.model.state_dict()),
+                            "patcher_state_dict": strip_compile_prefix(self.patcher.state_dict()),
                             "step": step,
                             "file_idx": self.global_current_file_idx,
                             "byte_offset": self.global_current_byte_offset,

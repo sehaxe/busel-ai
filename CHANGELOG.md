@@ -6,6 +6,155 @@ adheres to [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [5.7.1] — 2026-06-04 — "Compile-Safe Checkpoint Loader + Stage Audit" 🛸
+
+### Added
+
+- **`model/checkpoint.py`** — single source of truth for `torch.compile`
+  state-dict handling. Two public functions:
+  - `strip_compile_prefix(sd) → dict` — removes `_orig_mod.` /
+    `compiled_model.` / `_dynamo.` prefixes from a state_dict. Returns
+    a new dict; input is not mutated. Idempotent: if no prefix is
+    present, returns a shallow copy.
+  - `load_state_dict_safely(obj, sd, *, strict=True)` — loads `sd` into
+    `obj` (an `nn.Module` or `OptimizedModule` wrapper) handling **all 4
+    cross-config cases** transparently:
+
+    | saved ↓     | loaded →   | action                                        |
+    | ----------- | ---------- | --------------------------------------------- |
+    | uncompiled  | uncompiled | strip (no-op) + direct `load_state_dict`      |
+    | uncompiled  | compiled   | load into `obj._orig_mod` (raw keys)          |
+    | compiled    | uncompiled | strip prefix + direct `load_state_dict`       |
+    | compiled    | compiled   | strip prefix + load into `obj._orig_mod`      |
+
+  When `strict=False`, returns the `_IncompatibleKeys` namedtuple for
+  partial-load diagnostics (used by `tools/inference.py` to verify
+  that the checkpoint's `model_state_dict` and `patcher_state_dict`
+  keys match the freshly-constructed model).
+- **`configs/pipelines/sft-only.yaml`** — minimal 1-stage SFT smoke-test
+  pipeline. Resumes from the most recent pretrain checkpoint, runs SFT
+  for `--max-steps 10` (configurable in `params`), exits. Used to
+  verify the v5.6 stage framework end-to-end without the time cost of
+  the full pretrain → SFT → DPO → eval pipeline.
+- **5 new tests** in `tests/test_suite.py` (prefix `CKPT-1` … `CKPT-5`):
+  `strip_compile_prefix` identity, `strip_compile_prefix` strips
+  `_orig_mod.`, `strip_compile_prefix` strips all 3 legacy prefixes,
+  `load_state_dict_safely` round-trip on a fresh model, and the
+  `strict=False` path that surfaces the `_IncompatibleKeys` namedtuple
+  for partial-load diagnostics. **Total: 142/142 passing** (was 137,
+  +5 net).
+
+### Changed
+
+- **7 files consolidated** to use `model.checkpoint` instead of inline
+  `_strip_compile_prefix` definitions. Net: **+74 lines, −132 lines**
+  across 8 files. The 7 sites:
+  - `train.py` (legacy training orchestrator)
+  - `training/stages/pretrain.py` (load + save)
+  - `training/stages/sft.py` (load)
+  - `training/stages/dpo.py` (load)
+  - `training/stages/eval.py` (load)
+  - `tools/eval.py` (load)
+  - `tools/inference.py` (load, with `strict=False` for diagnostics)
+- **`model/AGENTS.md`** — added `checkpoint.py` to the STRUCTURE
+  listing, the WHERE TO LOOK table, the KEY CLASSES table
+  (`strip_compile_prefix` + `load_state_dict_safely`), and a new
+  CONVENTIONS note: "ALWAYS use `load_state_dict_safely` when loading
+  a state_dict into a model that may be wrapped by `torch.compile`.
+  Direct `model.load_state_dict(sd)` will fail with key-mismatch
+  errors when the checkpoint was saved with `--compile` (default)."
+- **`README.md`** — stale-info sweep:
+  - 3× `vocab=259` → `vocab=326` (project pitch, architecture diagram,
+    logits dim)
+  - 2× `77 tests` → `137 tests` (project layout, contributing section)
+  - 2× `[256] [3072 RGB] [257]` → `[MOD_IMAGE] [3072 RGB] [MEDIA_END]`
+    in the architecture diagram (legacy markers kept for backward
+    compat decode; new code uses `MOD_*` per v5.4.0)
+  - `values 0-258` → `values 0-325` (architecture token-stream arrow)
+  - Added project-layout entry for `model/checkpoint.py` and a new
+    contributing-section paragraph linking to it.
+- **`pyproject.toml`** — version `4.0.0` → `5.7.1` (was stale; project
+  has been on v5.x since 5.2.0; v5.7.0 was the last unreleased commit
+  bump).
+- **`train.py` docstring** — `v5.2` → `v5.7.1` (the training engine
+  header was the only remaining reference to the old 5.2 line).
+
+### Fixed
+
+- **Critical resume bug (latent since v5.2):** When `train.py` was run
+  with `--compile` (the default), the saved checkpoint had `_orig_mod.`
+  prefix on every state-dict key. The resume code in 7 places called
+  `_strip_compile_prefix` which would strip the prefix and load into
+  the `OptimizedModule` wrapper directly — but the wrapper expected
+  the prefixed keys, so the load either silently corrupted the
+  weights (matched subset, `strict=False` path) or raised
+  `RuntimeError: Error(s) in loading state_dict for ...` (strict path,
+  the SFT/DPO stages). The fix is `load_state_dict_safely`, which
+  inspects the actual saved keys and conditionally strips + loads
+  into the underlying `obj._orig_mod` if the target is compiled.
+  **Verified end-to-end:** `--resume` of a 100-step compile-saved
+  checkpoint now resumes cleanly to step 200 with loss continuing
+  the expected trend (6.80 → 6.58, no NaN, no key-mismatch warning).
+- **`tools/inference.py` `NameError: name 'model_sd' is not defined`:**
+  In v5.7.0, a refactor removed the local `_strip_compile_prefix`
+  helper but left two diagnostic `print` lines referencing the
+  intermediate `model_sd` / `patcher_sd` variables. Effect: the REPL
+  loaded the checkpoint with the wrong key format and silently fell
+  back to **random initial weights** (since the load raised an
+  unhandled exception mid-load). The user-visible symptom: the model
+  generated fluent but meaningless text, and the banner said
+  "💾 trained weights" when in fact no weights had been loaded. The
+  fix restores the `model_sd = ckpt["model_state_dict"]` and
+  `patcher_sd = ckpt["patcher_state_dict"]` assignments and routes
+  them through `load_state_dict_safely(... strict=False)` for
+  diagnostic reporting.
+- **`uv.lock` regenerated by `uv run`:** Side-effect of running
+  tests under `uv run python …` — `uv` rewrites the lockfile to
+  reflect resolved extras. **NOT COMMITTED** (root AGENTS.md
+  anti-pattern: "NEVER commit `uv.lock`"). Reverted before
+  the v5.7.1 commit.
+
+### Anti-patterns (do not violate — new for 5.7.1)
+
+- **NEVER** call `model.load_state_dict(sd)` directly — always go
+  through `model.checkpoint.load_state_dict_safely(model, sd)`. Direct
+  loads will break the day someone runs the model uncompiled
+  (CPU inference, or `--no-compile`).
+- **NEVER** duplicate the `_strip_compile_prefix` logic in a new
+  file — `model.checkpoint.strip_compile_prefix` is the only
+  implementation. (Adds compile-prefix variants? Add a new
+  prefix to `_COMPILE_PREFIXES` in `model/checkpoint.py`.)
+- **NEVER** reach into `model._orig_mod` manually — let
+  `load_state_dict_safely` do the unwrapping. It's the single place
+  that knows the wrapper API.
+
+### Performance
+
+No regression. `load_state_dict_safely` adds 1 dict-iteration +
+1 `hasattr` per load (only at checkpoint load, not per step). The
+resume benchmark on RTX 5060 Ti (validation profile, 200 steps
++ 100 resumed): same `~50 k tok/s` steady-state as the fresh
+training run, identical loss curve.
+
+### Verified
+
+- `uv run python -m unittest tests.test_suite -v` → **142/142 PASS** in 4.8 s
+- `uv run train.py --profile validation` (compile default) → 200 steps, loss 10.89 → 6.92, 50 k tok/s, 535 MB VRAM peak
+- `uv run train.py --profile validation --resume checkpoints/busel_validation_step_100.pt` → resumes at step 100, continues to step 200, loss 6.80 → 6.58, no key-mismatch errors
+- `uv run python cli.py pipeline --name sft-only` → SFT setup() succeeds, SFT run() blocked by pre-existing data format mismatch (`sft_smoltalk.jsonl` is `{"text": ...}` not `[{"role": ..., "content": ...}]` — documented, not a code bug)
+- `printf '/tools\n/max 30\nHello\n/quit\n' | uv run python tools/inference.py --checkpoint …` → 164 keys loaded, banner shows "💾 trained weights", /tools lists 2 tools, /max 30 works, model generation works
+
+### Compatibility
+
+- **Checkpoint format unchanged** — v5.7.1 checkpoints load cleanly in
+  v5.7.0 (the format spec is identical; only the load code is fixed).
+- **No model architecture changes** — all weight shapes, all init
+  schemes, all layer configs are unchanged.
+- **No new dependencies** — `model/checkpoint.py` uses only stdlib
+  + `torch` (already in `pyproject.toml`).
+
+---
+
 ## [5.7.0] — 2026-06-04 — "Tool Executor in REPL with Per-Call Confirmation" 🔧
 
 ### Added
