@@ -481,6 +481,32 @@ def list_presets_cmd(
         typer.echo(f"  - {n}")
 
 
+@app.command(name="download-data")
+def download_data(
+    stage: str = typer.Option(None, "--stage", "-s", help="Filter by stage: 'sft' or 'dpo' (default: both)"),
+):
+    """📥 Download EVERY data preset in one shot (3 SFT + 1 DPO HF datasets).
+
+    Equivalent to running `download-preset --name <n>` for every entry in
+    `data/presets.py`. Skips any preset whose output JSONL already exists.
+    """
+    from data.presets import list_presets
+    names = list_presets(stage=stage)
+    if not names:
+        typer.echo(typer.style("⚠️  No presets matched.", fg=typer.colors.YELLOW))
+        return
+    typer.echo(typer.style(
+        f"📥 Bulk-downloading {len(names)} data preset(s)...",
+        fg=typer.colors.CYAN, bold=True,
+    ))
+    for n in names:
+        _download_preset(n, limit=None, output_override=None)
+    typer.echo(typer.style(
+        f"✅ Done. {len(names)} preset(s) processed. Run `uv run cli.py train-all` to start training.",
+        fg=typer.colors.GREEN, bold=True,
+    ))
+
+
 @app.command()
 def label_vision(
     source_dir: str = typer.Option("my_photos", "--dir", "-s", help="Directory with raw images"),

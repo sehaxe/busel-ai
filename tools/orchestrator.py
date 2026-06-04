@@ -69,6 +69,18 @@ def train(
     subprocess.run(args)
 
 
+def train_all(
+    start_stage: str = typer.Option(None, "--start-stage", help="Resume from this stage name (e.g. 'sft', 'dpo')"),
+):
+    """🚀 ONE-CLICK FULL TRAINING: pretrain → SFT → DPO → eval.
+
+    Runs the `full` pipeline (configs/pipelines/full.yaml). Requires that
+    the 4 HF data presets are already downloaded — run
+    `uv run cli.py download-data` first.
+    """
+    pipeline(name="full", start_stage=start_stage, config_dir="configs/pipelines")
+
+
 def profile():
     subprocess.run([sys.executable, "tests/profiler_run.py"])
 

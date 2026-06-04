@@ -2040,6 +2040,30 @@ class TestbuselFramework(unittest.TestCase):
         self.assertEqual([s.name for s in cfg.stages], ["pretrain", "eval"])
         print(f"   ✅ pipeline={cfg.name!r}, stages={[s.name for s in cfg.stages]}")
 
+    def test_cli_simpler_commands_registered(self):
+        """🚀 [CLI-1] `download-data` and `train-all` are registered on cli.py."""
+        print("🧪 [CLI-1] download-data + train-all commands exist in cli.py...")
+        from cli import app
+        names = [cmd.name for cmd in app.registered_commands]
+        self.assertIn("download-data", names, f"missing 'download-data' in {names}")
+        self.assertIn("train-all", names, f"missing 'train-all' in {names}")
+        print(f"   ✅ both `download-data` and `train-all` registered ({len(names)} total commands)")
+
+    def test_data_presets_enumerate_all(self):
+        """📚 [CLI-2] data/presets.py exposes 4 HF-backed presets (3 SFT + 1 DPO)."""
+        print("🧪 [CLI-2] data/presets.py exposes 4 HF-backed presets...")
+        from data.presets import list_presets, get_preset
+        all_names = list_presets()
+        sft_names = list_presets(stage="sft")
+        dpo_names = list_presets(stage="dpo")
+        self.assertEqual(len(all_names), 4, f"expected 4 presets, got {len(all_names)}")
+        self.assertEqual(len(sft_names), 3, f"expected 3 SFT presets, got {len(sft_names)}")
+        self.assertEqual(len(dpo_names), 1, f"expected 1 DPO preset, got {len(dpo_names)}")
+        for n in all_names:
+            meta = get_preset(n)
+            self.assertIsNotNone(meta.get("hf_dataset"), f"{n} missing hf_dataset")
+        print(f"   ✅ {len(all_names)} presets: {all_names}")
+
 
 if __name__ == "__main__":
     unittest.main()
