@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-06-05
 **Branch:** main
-**Test count:** 168 (unittest, no pytest)
+**Test count:** 171 (unittest, no pytest)
 
 ## [PRIORITY] — read first
 1. **Performance + LOC** — when in doubt, the faster + shorter option wins.
@@ -160,9 +160,9 @@ uv run python cli.py profile                      # hardware profiler only
 # Docs
 cd site && bun install && bun run build           # GitHub Pages deploy
 
-# Profile v5.8 research features (3 modes on shpak 52.8M + 3-size scaling)
-uv run python tests/v58_profile.py --mode shpak-5run   # 4 configs on shpak (baseline / +Sparse / +LCSB / +Sparse+LCSB)
-uv run python tests/v58_profile.py --mode shpak-pairs  # pair interactions (baseline / +LCSB / +Sparse+LCSB)
+# Profile research features (3 modes: v5.8 ablations + v6.0 cumulative + scaling)
+uv run python tests/v58_profile.py --mode shpak-5run   # v5.8 ablation on shpak 52.8M (baseline / +Sparse / +LCSB / +Sparse+LCSB)
+uv run python tests/v58_profile.py --mode shpak-v60    # v6.0 cumulative on shpak 52.8M (5 runs adding DA, Cautious, SF, LCSB)
 uv run python tests/v58_profile.py --mode scale-3sizes # 4 configs × 3 sizes (micro_test / shpak / zubr)
 ```
 
