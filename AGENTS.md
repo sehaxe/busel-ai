@@ -57,6 +57,9 @@ All flipped on by default. No opt-out. The whole arch is better for it.
 | Field | Default | Why OFF by default | Measured on shpak 52.8M |
 |---|---|---|---|
 | `sparse_6_8` (model) | `False` | Sparse-BitNet 6:8 (Dual STE, paper §3.3 quant-then-mask order, fixed in v6.0) — 2/8 weight sparsity. No N:M-aware CUDA kernels, so no speedup on training. CPU/inference wins. | +1% step, +2% mem (no win on CUDA) |
+| `use_schedule_free` (training) | `False` | **🆕 v6.0** — Schedule-Free averaging (Defazio et al. 2024, arXiv:2405.15682, MLCommons 2024 AlgoPerf winner). Polyak-averages z→x, swaps p.data between y (forward) and z (grad). Composes with Muon, LotusMuon, AdamW. ⚠️ **For best results set `min_lr_ratio: 1.0`** — SF is incompatible with cosine LR decay (cosine interferes with the implicit schedule). Step-time cost: +1.2% (extra clone ops). Convergence benefit (paper: 2-3× fewer steps to same loss) measured at 50+ steps, not visible in 10-step profile. Safe to enable with `min_lr_ratio=1.0` — no correctness regressions, only convergence speedup. | +1.2% step, +7% mem at 10 steps (no benefit yet — needs 50+ steps) |
+| `sf_beta` (training) | `0.9` | y = (1-β)·x + β·z interpolation coefficient. Paper default. | — |
+| `sf_gamma_factor` (training) | `2.0` | Multiplicative LR scale during the inner base.step() — SF allows 2-3× larger LRs than cosine-scheduled methods. | — |
 
 **Removed in v6.0:**
 - **GradLite error feedback** (`use_error_feedback`) — LOTUS+bf16 round-trip is numerically exact → no error to feedback → framework is a no-op. **+1 GB VRAM overhead for 0% benefit.** All code, tests, and config lines deleted.

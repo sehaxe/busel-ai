@@ -63,6 +63,9 @@ class buselPretrainConfig:
     selective_backward: bool = False
     backward_ratio: float = 1.0
     sparse_6_8: bool = False
+    use_schedule_free: bool = False
+    sf_beta: float = 0.9
+    sf_gamma_factor: float = 2.0
 
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
@@ -90,6 +93,9 @@ class buselPretrainConfig:
         cfg.sparse_6_8 = bool(m.get("sparse_6_8", cfg.sparse_6_8))
         cfg.selective_backward = bool(m.get("selective_backward", cfg.selective_backward))
         cfg.backward_ratio = float(m.get("backward_ratio", cfg.backward_ratio))
+        cfg.use_schedule_free = bool(t.get("use_schedule_free", cfg.use_schedule_free))
+        cfg.sf_beta = float(t.get("sf_beta", cfg.sf_beta))
+        cfg.sf_gamma_factor = float(t.get("sf_gamma_factor", cfg.sf_gamma_factor))
         if cfg.d_model % cfg.n_hyper != 0:
             raise ValueError(
                 f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
@@ -323,6 +329,9 @@ class buselPretrainStage:
             lotus_rank=self.cfg.lotus_rank,
             lotus_lr_scale=self.cfg.lotus_lr_scale,
             lr_multipliers=self.cfg.lr_multipliers,
+            use_schedule_free=self.cfg.use_schedule_free,
+            sf_beta=self.cfg.sf_beta,
+            sf_gamma_factor=self.cfg.sf_gamma_factor,
         )
         self.autopilot = buselAutoPilot(
             self.opt_engine,

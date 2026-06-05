@@ -39,7 +39,8 @@ def _load_profile(name: str) -> dict:
     return full["profiles"][name]
 
 
-def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, device):
+def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio,
+            use_schedule_free, device):
     cfg_profile = _load_profile(profile_name)
     profile = dict(cfg_profile)
     profile["model"] = dict(profile["model"])
@@ -50,6 +51,7 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
     profile["data"]["batch_size"] = batch_size
     profile["data"]["chunk_size"] = CHUNK_SIZE_FORCED
     profile["training"] = dict(profile["training"])
+    profile["training"]["use_schedule_free"] = use_schedule_free
 
     class Cfg:
         pass
@@ -78,6 +80,7 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
         optimizer_type=cfg.optimizer_type,
         lotus_rank=cfg.lotus_rank,
         lotus_lr_scale=cfg.lotus_lr_scale,
+        use_schedule_free=cfg.use_schedule_free,
     )
     autopilot = buselAutoPilot(opt, max_lr_muon=cfg.learning_rate_muon,
                                  max_lr_adamw=cfg.learning_rate_adamw, target_wd=cfg.weight_decay)
@@ -85,11 +88,12 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
     return model, patcher, opt, autopilot, loss_engine, cfg
 
 
-def _run_one(name, profile_name, batch_size, sparse_6_8, selective_backward,
-             backward_ratio, device, n_warmup, n_measure, scale_stats=False):
-    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio})\n{'=' * 80}")
+def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
+             sparse_6_8=False, selective_backward=False, backward_ratio=1.0,
+             scale_stats=False, use_schedule_free=False):
+    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free}\n{'=' * 80}")
     model, patcher, opt, ap, loss_engine, cfg = _build(
-        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, device,
+        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, use_schedule_free, device,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"   params: {n_params:,} ({n_params * 2 / 1024**2:.2f} MB FP16)")
@@ -160,8 +164,10 @@ def _run_one(name, profile_name, batch_size, sparse_6_8, selective_backward,
             print(f"   ⚠️  OOM at batch={batch_size}; falling back to batch={BATCH_FALLBACK_FOR_ZUBR}")
             del model, patcher, opt, ap, loss_engine
             torch.cuda.empty_cache()
-            return _run_one(name, profile_name, BATCH_FALLBACK_FOR_ZUBR, sparse_6_8,
-                            selective_backward, backward_ratio, device, n_warmup, n_measure, scale_stats)
+            return _run_one(name, profile_name, BATCH_FALLBACK_FOR_ZUBR, device, n_warmup, n_measure,
+                            sparse_6_8=sparse_6_8, selective_backward=selective_backward,
+                            backward_ratio=backward_ratio, scale_stats=scale_stats,
+                            use_schedule_free=use_schedule_free)
         raise
     finally:
         if created_dir:
@@ -216,6 +222,28 @@ def mode_shpak_5run(device):
     return results
 
 
+def mode_shpak_sf(device):
+    print("🌀 busel SHPAK SCHEDULE-FREE PROFILER (v6.0 research validation)")
+    print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
+    print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
+    print("   ⚠️  SF uses γ_factor=2.0 (default). For best results set min_lr_ratio=1.0")
+    print("      in the profile to disable cosine — see AGENTS.md v6.0 SF section.\n")
+    runs = [
+        ("1. baseline (cosine)",                     {}),
+        ("2. + Schedule-Free (cosine)",              {"use_schedule_free": True}),
+        ("3. + SF + LCSB (cosine)",                  {"use_schedule_free": True, "selective_backward": True, "backward_ratio": 0.5}),
+    ]
+    results = []
+    for name, flags in runs:
+        try:
+            results.append(_run_one(name, "shpak", BATCH, n_warmup=N_WARMUP_5RUN, n_measure=N_MEASURE_5RUN, **flags, device=device))
+        except Exception as e:
+            print(f"   ❌ FAILED: {type(e).__name__}: {e}")
+            results.append({"name": name, "error": str(e)})
+    _print_table("SHPAK SCHEDULE-FREE COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
+    return results
+
+
 def mode_shpak_pairs(device):
     print("🧪 busel SHPAK PAIR-INTERACTION PROFILER (v5.8)")
     print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
@@ -262,7 +290,7 @@ def mode_scale_3sizes(device):
 
 def main():
     parser = argparse.ArgumentParser(description="busel v5.8 profile suite")
-    parser.add_argument("--mode", choices=["shpak-5run", "shpak-pairs", "scale-3sizes"],
+    parser.add_argument("--mode", choices=["shpak-5run", "shpak-pairs", "shpak-sf", "scale-3sizes"],
                         default="shpak-5run", help="Which comparison to run (default: shpak-5run)")
     parser.add_argument("--out", default="checkpoints/v58_profile.json",
                         help="Output JSON path (default: checkpoints/v58_profile.json)")
@@ -273,6 +301,8 @@ def main():
         results = mode_shpak_5run(device)
     elif args.mode == "shpak-pairs":
         results = mode_shpak_pairs(device)
+    elif args.mode == "shpak-sf":
+        results = mode_shpak_sf(device)
     else:
         results = mode_scale_3sizes(device)
 
