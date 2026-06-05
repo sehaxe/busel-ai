@@ -65,14 +65,13 @@ in whether the *scaling-laws ceiling* can be pushed down by:
       convergence regression. The clear v5.8 winner, flipped to default in
       v6.0. Off in test/calibration profiles (validation, micro_test,
       quick_test) for deterministic forward.
-    - **Sparse-BitNet 6:8** (Dual STE) — 2/8 weight sparsity mask via
-      quant-then-mask order (paper §3.3 baseline, fixed in v6.0). Quality
-      benefit on 1.58-bit (paper: BF16 +1.20 PPL vs Sparse-BitNet +0.32 PPL
-      on 0.5B) — busel validation in progress. Off by default; flip
-      `sparse_6_8: true` to test.
     - **GradLite error feedback** — **REMOVED in v6.0.** LOTUS+bf16 round-trip
       is numerically exact → no error to feedback → +1 GB VRAM for 0% benefit.
-    - See `tests/v58_profile.py` for the 4-mode profile comparison (v5.8 ablations + v6.0 cumulative + v6.1 dispersion + scaling).
+    - **Sparse-BitNet 6:8** (Dual STE) — **REMOVED in v6.2 cleanup.** +1% step
+      time, +2% peak VRAM (mask overhead), no CUDA speedup (no N:M-aware GEMM
+      kernels). Quality benefit (paper: +0.32 PPL on 0.5B) unproven at busel
+      scale. Code, tests, and config lines deleted.
+    - See `tests/v58_profile.py` for the 2-mode profile comparison (v6.0 cumulative + v6.1 dispersion).
 
 The codebase is intentionally small — the entire model + training + data
 pipeline is ~3,000 lines of Python and ~140 lines of Rust, so you can read
@@ -146,7 +145,7 @@ data loader auto-dispatches by extension.
             ║     h = buselDecoderLayer(h)        ║  ← attn (GDN-2 or MLA)
             ║     [opt-in: LCSB skips 50% of     ║     + MoE (2 shared +
             ║      layer forwards via no_grad]   ║       N routed, Top-1)
-            ║     [opt-in: 6:8 weight mask]       ║  ← −44% step, +80% tps
+            ║                                    ║  ← −44% step, +80% tps
             ╚═════════════════════════════════════╝
                               │  hidden (B × T/4 × d_model)
                               ▼
@@ -175,7 +174,7 @@ busel-ai/
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (172 tests) + ultra-stable profiler v2.1 + consolidated 4-mode v58_profile.py (v5.8 + v6.0 + v6.1)
+├── tests/              # unittest suite (171 tests) + ultra-stable profiler v2.1 + 2-mode v58_profile.py (v6.0 + v6.1)
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
 ├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
 ├── site/               # Astro+Starlight docs site (this wiki)
@@ -368,17 +367,16 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (172 tests,
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (171 tests,
 verbose mode by default, no pytest, no torch.profiler on MPS).
 Add new tests there — never spawn a second test file.
 
-For v5.8/v6.0 research validation, run
-`uv run python tests/v58_profile.py --mode shpak-5run` to compare baseline vs
-Sparse-BitNet 6:8 and LCSB on shpak 52.8M,
-`uv run python tests/v58_profile.py --mode shpak-pairs` to measure
-pair-interaction overhead on top of LCSB alone, and
-`uv run python tests/v58_profile.py --mode scale-3sizes` to scale the comparison
-across micro_test / shpak / zubr.
+For v6.0/v6.1 research validation, run
+`uv run python tests/v58_profile.py --mode shpak-v60` to sweep the cumulative
+v6.0 stack on shpak 52.8M (baseline → +DA → +DA+Cautious → +DA+Cautious+LCSB
+→ +DA+Cautious+SF+LCSB), and
+`uv run python tests/v58_profile.py --mode shpak-disp` to validate the v6.1
+Dispersion Loss on the v6.0 winner.
 
 The **multimodal** module follows the same pattern: encoders are registered
 via `@register("encoder", name)`. To add a new modality, write a class that
