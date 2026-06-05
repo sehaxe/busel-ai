@@ -280,7 +280,7 @@ class buselPretrainStage:
         )
 
         if self.device == "cuda" and not self.no_checkpointing:
-            self.model.enable_gradient_checkpointing()
+            self.model.enable_gradient_checkpointing(every=2)
 
         if self.device == "cuda" and not self.no_compile:
             self._compile_in_progress["value"] = True

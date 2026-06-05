@@ -196,19 +196,22 @@ class buselModel(nn.Module):
         self.final_norm = RMSNorm(config.d_model)
         self.mtp_pipeline = buselMTP4Pipeline(config)
         self.use_gradient_checkpointing = False
+        self.checkpoint_every = 1
 
-    def enable_gradient_checkpointing(self): self.use_gradient_checkpointing = True
+    def enable_gradient_checkpointing(self, every: int = 1): self.use_gradient_checkpointing = True; self.checkpoint_every = max(1, int(every))
     def disable_gradient_checkpointing(self): self.use_gradient_checkpointing = False
 
     def forward(self, x, next_token_ids=None, progress=0.0):
         nvtx_range_push("buselModel_Forward")
         streams = [x] * self.n_hyper
         total_aux_loss = 0.0
+        ckpt_every = self.checkpoint_every if self.use_gradient_checkpointing else 1
+        ckpt_eligible = self.training and self.use_gradient_checkpointing and x.device.type in ["cuda", "mps"]
 
         for i, layer in enumerate(self.layers):
             mixed = self.m_residuals[i](x, streams)
 
-            if self.training and self.use_gradient_checkpointing and mixed.device.type in ["cuda", "mps"]:
+            if ckpt_eligible and (i % ckpt_every == 0):
                 layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
                     layer, mixed, progress, use_reentrant=False, determinism_check="none"
                 )
