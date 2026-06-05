@@ -119,6 +119,7 @@ class buselPretrainConfig:
     inductor_cache_dir: str = "~/.cache/busel/inductor"
     inductor_cache_clean: bool = False
     inductor_cache_max_gb: float = 0.0
+    dynamic_compile: bool = True
 
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
@@ -157,6 +158,7 @@ class buselPretrainConfig:
         cfg.inductor_cache_dir = str(p.get("inductor_cache_dir", cfg.inductor_cache_dir))
         cfg.inductor_cache_clean = bool(p.get("inductor_cache_clean", cfg.inductor_cache_clean))
         cfg.inductor_cache_max_gb = float(p.get("inductor_cache_max_gb", cfg.inductor_cache_max_gb))
+        cfg.dynamic_compile = bool(p.get("dynamic_compile", cfg.dynamic_compile))
         if cfg.d_model % cfg.n_hyper != 0:
             raise ValueError(
                 f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
@@ -393,17 +395,17 @@ class buselPretrainStage:
             self._compile_in_progress["value"] = True
             try:
                 self.model = torch.compile(
-                    self.model, fullgraph=False, dynamic=None, mode=self.compile_mode
+                    self.model, fullgraph=False, dynamic=self.cfg.dynamic_compile, mode=self.compile_mode
                 )
                 self.patcher = torch.compile(
-                    self.patcher, fullgraph=False, dynamic=None, mode=self.compile_mode
+                    self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile, mode=self.compile_mode
                 )
             except Exception as e:
                 err_str = str(e)
                 if "CUDAGraphs" in err_str or "FakeTensor" in err_str or "overwritten" in err_str:
                     try:
-                        self.model = torch.compile(self.model, fullgraph=False, dynamic=None)
-                        self.patcher = torch.compile(self.patcher, fullgraph=False, dynamic=None)
+                        self.model = torch.compile(self.model, fullgraph=False, dynamic=self.cfg.dynamic_compile)
+                        self.patcher = torch.compile(self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile)
                     except Exception:
                         pass
             finally:

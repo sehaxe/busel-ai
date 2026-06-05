@@ -119,6 +119,7 @@ profiles:
       inductor_cache_dir: "~/.cache/busel/inductor"
       inductor_cache_clean: false
       inductor_cache_max_gb: 0.0
+      dynamic_compile: true
 
   shpak:
     model:
@@ -134,7 +135,74 @@ profiles:
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 64
+      batch_size: 128
+    training:
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.1
+      learning_rate_muon: 0.0006
+      learning_rate_adamw: 0.00006
+      weight_decay: 0.1
+      grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
+    perf:
+      step_ms_est: 380
+      inductor_cache_dir: "~/.cache/busel/inductor"
+      inductor_cache_clean: false
+      inductor_cache_max_gb: 0.0
+      dynamic_compile: true
+
+  zubr:
+    model:
+      d_model: 384
+      n_layers: 12
+      n_heads: 6
+      expert_hidden: 1024
+      num_experts: 8
+      top_k: 1
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
+      n_hyper: 4
+      selective_backward: true
+      backward_ratio: 0.5
+    data:
+      data_path: "data_train"
+      chunk_size: 16384
+      batch_size: 32
+    training:
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.1
+      learning_rate_muon: 0.0006
+      learning_rate_adamw: 0.00006
+      weight_decay: 0.1
+      grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
+    perf:
+      step_ms_est: 800
+      inductor_cache_dir: "~/.cache/busel/inductor"
+      inductor_cache_clean: false
+      inductor_cache_max_gb: 0.0
+      dynamic_compile: true
+
+  shpak:
+    model:
+      d_model: 384
+      n_layers: 8
+      n_heads: 6
+      expert_hidden: 768
+      num_experts: 4
+      top_k: 1
+      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
+      selective_backward: true
+      backward_ratio: 0.5
+    data:
+      data_path: "data_train"
+      chunk_size: 4096
+      batch_size: 48
     training:
       max_steps: "auto"
       warmup_steps: "auto"
