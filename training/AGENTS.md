@@ -1,6 +1,6 @@
 # training/ — Optimizer, AutoPilot, Loss, **Stage Framework**
 
-**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**, **v5.7.1 compile-safe checkpoint loader**, **v5.7.1 LOTUS+Muon (rank-8) + EMA + decoupled per-layer LR + selective activation checkpointing (all on by default)**, **v5.8 LCSB selective per-layer backward (opt-in, OFF by default)**.
+**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**, **v5.7.1 compile-safe checkpoint loader**, **v5.7.1 LOTUS+Muon (rank-8) + EMA + decoupled per-layer LR + selective activation checkpointing (all on by default)**, **v5.8 LCSB selective per-layer backward (opt-in, OFF by default)**, **v6.1 Dispersion Loss on token embeddings (opt-in, OFF by default)**.
 
 ## STRUCTURE
 ```
@@ -25,6 +25,7 @@ training/
 | Change grad clipping | `autopilot.py` → `before_step` | First 50 steps: max_norm=2.0 free; later: rolling_avg × 1.5 |
 | Add loss term | `recipe.py` | `compute_pretrain_loss` already handles MTP-4 weighted sum |
 | Change dampening | `autopilot.py` line ~50 | 3σ rule on last 15 grad norms (predictive) |
+| Add dispersion loss | `recipe.py` → `compute_dispersion_loss` | **🆕 v6.1** — Wang 2026 uniformity loss on L2-normalised token embeddings; counters condensation in small LMs. |
 | Switch to FlashMuon | `optimizer.py` line ~9 | Auto-uses `flash_muon.Muon` if `torch.cuda.is_available()` |
 | **Add a new stage** | `stages/<name>.py` → `@register_stage("<name>")` class | Auto-discovered; `__init__.py` eager-imports for registration |
 | **Define a pipeline** | `configs/pipelines/<name>.yaml` | Read by `tools/orchestrator.py:pipeline()` |
@@ -40,7 +41,8 @@ training/
 | `EMAState` | class | optimizer.py | **v5.7.1+ default (`use_ema=True`, `ema_decay=0.999`).** EMA shadow of weights, updated every step. Saved alongside model state in checkpoints. Smooths loss + gives 10-15 % fewer steps to same loss. |
 | `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+!`router`+!`embed`→Muon; rest→AdamW. **6 sub-groups** (`attn`, `ffn`, `mtp`, `norm`, `embed`, `router`) for **decoupled per-layer LR multipliers**. Prints routing summary. |
 | `buselAutoPilot` | class | autopilot.py | Wraps engine; tracks loss/grad history; recovery countdown; **re-pushes per-subgroup LR multipliers every step** |
-| `buselLossEngine` | class | recipe.py | Liger-CE on CUDA; vanilla `F.cross_entropy` elsewhere. MTP weights `[0.5, 0.25, 0.125]` (T1 has implicit 1.0). `__init__(vocab_size=259)` is the dataclass default — the config overrides to 326. |
+| `buselLossEngine` | class | recipe.py | Liger-CE on CUDA; vanilla `F.cross_entropy` elsewhere. MTP weights `[0.5, 0.25, 0.125]` (T1 has implicit 1.0). `__init__(vocab_size=259)` is the dataclass default — the config overrides to 326. **🆕 v6.1** — also exposes `compute_dispersion_loss` static method. |
+| `compute_dispersion_loss` | staticmethod | recipe.py | **🆕 v6.1** — Uniformity loss (Wang & Isola 2020 / Wang et al. 2026, arXiv:2602.00217) on L2-normalised byte embeddings. L = weight · log E[exp(−t·‖z_i−z_j‖²)] over a `sample_size` random subset. Backprop drives token embeddings apart on the unit hypersphere — counters embedding condensation that hurts small LMs (+1.17 % avg on 10 benchmarks, +3.3 % over baseline per paper). |
 | `validate_training_schedule` | function | recipe.py | Runtime guard for `max_steps > warmup_steps` and `warmup >= 1`; called from `train.py` after auto-planning |
 | `BaseStage` | Protocol | stages/base.py | Stage lifecycle contract: `setup(cfg)` → `run(state)` → `finalize(state)` |
 | `StageState` | dataclass | stages/base.py | Shared mutable state between stages: `step`, `epoch`, `best_loss`, `metrics`, `last_checkpoint_path`, `artifact` |
@@ -119,3 +121,4 @@ training/
 - **v5.7.1 checkpoint loading:** All 4 stages (`pretrain`, `sft`, `dpo`, `eval`) load checkpoints via `model.checkpoint.load_state_dict_safely(model, ckpt["model_state_dict"])` instead of `model.load_state_dict(...)`. This is **required** — `train.py` runs with `--compile` by default, so saved checkpoints have `_orig_mod.` prefixes and reach the stages wrapped in `OptimizedModule`. See `model/AGENTS.md` for the full helper API and the 4 cross-config cases.
 - **Registry kind `stage`:** The stages use `busel_registry.register("stage", name)` (a new registry kind). `get_stage("pretrain")` returns the class. The existing `attention`/`optimizer`/`encoder` kinds are untouched.
 - **v5.8 wiring to `buselPretrainConfig`:** Three new fields — `sparse_6_8`, `selective_backward`, `backward_ratio`. All default OFF. The `from_profile` reader maps them to the right places: `sparse_6_8` walks all `BitLinear_a4_8` submodules in `buselModel.__init__`; `selective_backward` + `backward_ratio` enable LCSB. **🆕 v5.8**
+- **🆕 v6.1 Dispersion Loss wiring:** Three new `buselPretrainConfig` fields — `use_dispersion_loss`, `dispersion_weight`, `dispersion_temperature`. All default OFF. The `from_profile` reader maps them to the YAML `training:` section. When enabled, the patcher's `return_embedding=True` is invoked, and the pretrain loop adds `compute_dispersion_loss(embed_for_dispersion, weight, temperature)` to the total loss. **Validation on shpak 52.8 M (10 steps, batch=16 ctx=4096):** Dispersion alone vs baseline → −6.3 % loss at +2.5 % step. v6.1 winner (DA+Cautious+LCSB+Dispersion) vs v6.0 winner → −4.8 % loss at +1.8 % step. **Cost:** +519 MB VRAM (offsets LCSB's gain because the dispersion path must keep embeddings alive for backward). Best combined with the v6.0 stack. **🆕 v6.1**

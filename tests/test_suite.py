@@ -333,6 +333,26 @@ class TestbuselFramework(unittest.TestCase):
         self.assertTrue(has_grad, "DA has no flowing gradients")
         print(f"   ✅ DA-MLA: +{n_diff:,} params, forward+backward OK, out.shape={tuple(out_da.shape)}")
 
+    def test_dispersion_loss(self):
+        """🔵 [DISP] Dispersion loss (Wang 2026) — counters embedding condensation in small LMs."""
+        print("🔵 [DISP] Dispersion loss (Wang 2026) — spread < collapsed; gradient flows...")
+        torch.manual_seed(0)
+        e_collapsed = torch.ones(2, 64, 32, device=self.device) * 0.1
+        e_spread = torch.randn(2, 64, 32, device=self.device)
+        loss_collapsed = buselLossEngine.compute_dispersion_loss(e_collapsed, weight=1.0, temperature=2.0)
+        loss_spread = buselLossEngine.compute_dispersion_loss(e_spread, weight=1.0, temperature=2.0)
+        self.assertFalse(torch.isnan(loss_collapsed))
+        self.assertFalse(torch.isnan(loss_spread))
+        self.assertLess(loss_spread.item(), loss_collapsed.item(),
+                        "Spread embeddings must give lower uniformity loss (better)")
+        e_grad = torch.randn(2, 64, 32, device=self.device, requires_grad=True)
+        loss_g = buselLossEngine.compute_dispersion_loss(e_grad, weight=0.1, temperature=2.0)
+        loss_g.backward()
+        self.assertIsNotNone(e_grad.grad)
+        self.assertFalse(torch.isnan(e_grad.grad).any())
+        self.assertTrue((e_grad.grad != 0).any(), "Gradient should be non-zero somewhere")
+        print(f"   ✅ Dispersion loss: spread={loss_spread.item():.3f} < collapsed={loss_collapsed.item():.3f}; grad flows")
+
 
     def test_complete_backbone_and_gradients(self):
         print("🧪 [8] Complete Backbone & Backpropagation...")

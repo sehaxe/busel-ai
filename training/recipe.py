@@ -169,3 +169,25 @@ class buselLossEngine:
         log_probs = F.log_softmax(logits, dim=-1)
         target_log_probs = log_probs.gather(-1, targets.unsqueeze(-1).long()).squeeze(-1)
         return (target_log_probs * mask.float()).sum(dim=-1)
+
+    @staticmethod
+    def compute_dispersion_loss(
+        embedding: torch.Tensor,
+        weight: float = 0.1,
+        temperature: float = 2.0,
+        sample_size: int = 4096,
+    ) -> torch.Tensor:
+        """Uniformity loss (Wang & Isola 2020) on L2-normalised embeddings.
+
+        Counter the token-embedding condensation that hurts small LMs
+        (Wang et al. 2026, arXiv:2602.00217 — +1.17 % avg on 10 benchmarks,
+        +3.3 % over baseline).  L = weight · log E[exp(-t·‖z_i−z_j‖²)] over
+        a `sample_size` random subset of embeddings.  Backprop drives the
+        bytes apart on the unit hypersphere.
+        """
+        e = embedding.reshape(-1, embedding.size(-1))
+        n = min(sample_size, e.size(0))
+        idx = torch.randperm(e.size(0), device=e.device)[:n]
+        z = F.normalize(e[idx], dim=-1)
+        sq_dists = torch.cdist(z, z, p=2).pow(2)
+        return weight * torch.log(torch.exp(-temperature * sq_dists).mean() + 1e-8)

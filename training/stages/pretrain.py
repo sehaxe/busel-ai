@@ -68,6 +68,9 @@ class buselPretrainConfig:
     sf_gamma_factor: float = 2.0
     use_cautious: bool = False
     use_differential_attention: bool = False
+    use_dispersion_loss: bool = False
+    dispersion_weight: float = 0.1
+    dispersion_temperature: float = 2.0
 
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
@@ -100,6 +103,9 @@ class buselPretrainConfig:
         cfg.sf_beta = float(t.get("sf_beta", cfg.sf_beta))
         cfg.sf_gamma_factor = float(t.get("sf_gamma_factor", cfg.sf_gamma_factor))
         cfg.use_cautious = bool(t.get("use_cautious", cfg.use_cautious))
+        cfg.use_dispersion_loss = bool(t.get("use_dispersion_loss", cfg.use_dispersion_loss))
+        cfg.dispersion_weight = float(t.get("dispersion_weight", cfg.dispersion_weight))
+        cfg.dispersion_temperature = float(t.get("dispersion_temperature", cfg.dispersion_temperature))
         if cfg.d_model % cfg.n_hyper != 0:
             raise ValueError(
                 f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
@@ -475,7 +481,10 @@ class buselPretrainStage:
                 with torch.autocast(
                     device_type=self.device, dtype=autocast_dtype, enabled=autocast_enabled
                 ):
-                    patches = self.patcher(input_bytes)
+                    if self.cfg.use_dispersion_loss:
+                        patches, embed_for_dispersion = self.patcher(input_bytes, return_embedding=True)
+                    else:
+                        patches = self.patcher(input_bytes)
                     T_patches = patches.shape[1]
                     targets, mtp_targets = _build_targets(
                         byte_batch, T_patches, stride=self.patcher.stride
@@ -488,6 +497,12 @@ class buselPretrainStage:
                         [logits_t2, logits_t3, logits_t4],
                         mtp_targets,
                     ) + aux_loss.float()
+                    if self.cfg.use_dispersion_loss:
+                        loss = loss + self.loss_engine.compute_dispersion_loss(
+                            embed_for_dispersion,
+                            weight=self.cfg.dispersion_weight,
+                            temperature=self.cfg.dispersion_temperature,
+                        )
 
                 loss = loss / self.cfg.grad_accum_steps
                 loss.backward()

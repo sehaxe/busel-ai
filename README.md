@@ -72,7 +72,7 @@ in whether the *scaling-laws ceiling* can be pushed down by:
       `sparse_6_8: true` to test.
     - **GradLite error feedback** — **REMOVED in v6.0.** LOTUS+bf16 round-trip
       is numerically exact → no error to feedback → +1 GB VRAM for 0% benefit.
-    - See `tests/v58_profile.py` for the 3-mode profile comparison.
+    - See `tests/v58_profile.py` for the 4-mode profile comparison (v5.8 ablations + v6.0 cumulative + v6.1 dispersion + scaling).
 
 The codebase is intentionally small — the entire model + training + data
 pipeline is ~3,000 lines of Python and ~140 lines of Rust, so you can read
@@ -175,7 +175,7 @@ busel-ai/
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (168 tests) + ultra-stable profiler v2.1 + consolidated 3-mode v58_profile.py (v5.8)
+├── tests/              # unittest suite (172 tests) + ultra-stable profiler v2.1 + consolidated 4-mode v58_profile.py (v5.8 + v6.0 + v6.1)
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
 ├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
 ├── site/               # Astro+Starlight docs site (this wiki)
@@ -368,7 +368,7 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (168 tests,
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (172 tests,
 verbose mode by default, no pytest, no torch.profiler on MPS).
 Add new tests there — never spawn a second test file.
 

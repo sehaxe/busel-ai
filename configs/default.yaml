@@ -30,6 +30,9 @@ profiles:
       weight_decay: 0.1
       grad_accum_steps: 1
       checkpoint_interval: 200
+      use_dispersion_loss: false  # 🆕 Dispersion Loss (Wang 2026) on token embeddings
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
 
   micro_test:
     model:
@@ -56,6 +59,9 @@ profiles:
       weight_decay: 0.1
       grad_accum_steps: 1
       checkpoint_interval: 500  # Save every 500 steps
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
 
   quick_test:
     model:
@@ -81,6 +87,9 @@ profiles:
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
       grad_accum_steps: 1
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
 
   chyzh:
     model:
@@ -106,6 +115,9 @@ profiles:
       learning_rate_adamw: 0.00008
       weight_decay: 0.1
       grad_accum_steps: 1   # Накопление не требуется, батч 512 пройдет легко
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
 
   shpak:
     model:
@@ -131,6 +143,9 @@ profiles:
       learning_rate_adamw: 0.00006
       weight_decay: 0.1
       grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0
 
   zubr:
     model:
@@ -157,3 +172,6 @@ profiles:
       learning_rate_adamw: 0.00006
       weight_decay: 0.1
       grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
+      use_dispersion_loss: false
+      dispersion_weight: 0.1
+      dispersion_temperature: 2.0

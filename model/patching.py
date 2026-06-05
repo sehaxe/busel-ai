@@ -25,19 +25,24 @@ class StridedFastBLTPatcher(nn.Module):
         self.conv = nn.Conv1d(d_byte, d_model, kernel_size=kernel_size, stride=stride, padding=0)
         self.norm = RMSNorm(d_model)
 
-    def forward(self, byte_ids):
+    def forward(self, byte_ids, return_embedding=False):
         nvtx_range_push("busel_Byte_Patching_Forward")
         byte_ids_device = byte_ids.to(self.embed_weight.device)
         x = F.embedding(byte_ids_device, self.embed_weight)
-        
+
+        # pre-GLU byte-embedding — captured when return_embedding=True for dispersion loss (Wang 2026)
+        embed_for_dispersion = x if return_embedding else None
+
         # 🎯 ИСПРАВЛЕНИЕ: Применяем нелинейный Swish-гейт
         gate = torch.sigmoid(self.gate_proj_up(F.silu(self.gate_proj_down(x))))
         x = x * gate
-        
+
         x = x.transpose(1, 2)
         x_padded = F.pad(x, (self.kernel_size - 1, 0))
         patches = self.conv(x_padded)
         patches = patches.transpose(1, 2)
         out = self.norm(patches)
         nvtx_range_pop()
+        if return_embedding:
+            return out, embed_for_dispersion
         return out

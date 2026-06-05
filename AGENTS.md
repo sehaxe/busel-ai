@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-06-05
 **Branch:** main
-**Test count:** 171 (unittest, no pytest)
+**Test count:** 172 (unittest, no pytest)
 
 ## [PRIORITY] — read first
 1. **Performance + LOC** — when in doubt, the faster + shorter option wins.
@@ -24,7 +24,7 @@ busel-ai/
 ├── multimodal/        # Any-to-token encoders (image/video/audio/PDF/docx) + 70-token special vocab
 ├── ui/                # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/             # Typer CLI (orchestrator, data_manager, plotter, inference, **tool_executor** v5.7)
-├── tests/             # unittest suite (168) + ultra-stable profiler v2.1 + consolidated 3-mode v58_profile.py (v5.8)
+├── tests/             # unittest suite (172) + ultra-stable profiler v2.1 + consolidated 4-mode v58_profile.py (v5.8 + v6.0 + v6.1)
 ├── busel_rust_io/     # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
 ├── configs/           # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest/Validation profiles
 ├── site/              # Astro+Starlight docs (GitHub Pages)
@@ -71,6 +71,13 @@ All flipped on by default. No opt-out. The whole arch is better for it.
 
 All 6 profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyzh, shpak, zubr) inherit these defaults. The CLI `tests/profiler_run.py` defaults are aligned.
 
+## v6.1 OPT-IN RESEARCH FEATURES (defaults OFF — profile before flipping)
+| Field | Default | Why OFF by default | Measured on shpak 52.8M |
+|---|---|---|---|
+| `use_dispersion_loss` (training) | `False` | **🆕 v6.1** — Dispersion Loss (Wang et al. 2026, arXiv:2602.00217). Uniformity loss (Wang & Isola 2020) on L2-normalised token embeddings. L = weight · log E[exp(−t·‖z_i−z_j‖²)] over a `sample_size` random subset. Backprop drives byte embeddings apart on the unit hypersphere — counters embedding condensation that hurts small LMs. Paper: +1.17 % avg on 10 benchmarks, +3.3 % over baseline. | Dispersion alone: −6.3 % loss@10, +2.5 % step, +9 MB. v6.1 winner (DA+Cautious+LCSB+Dispersion): −4.8 % loss@10 vs v6.0 winner, +1.8 % step, +519 MB VRAM (offsets LCSB's gain). |
+| `dispersion_weight` | `0.1` | Multiplicative scale on the uniformity loss. | — |
+| `dispersion_temperature` | `2.0` | t in the uniformity loss exp(−t·d²). | — |
+
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |------|----------|-------|
@@ -90,7 +97,7 @@ All 6 profiles in `configs/default.yaml` (validation, micro_test, quick_test, ch
 
 ## DO
 - **Use the registry** for any plug-in point (attention, optimizer, encoder, autopilot, curriculum, loss, stage). `@register("kind", "name")` — no central switch statements.
-- **Run 168 tests before pushing:** `uv run python -m unittest tests.test_suite` — all must pass.
+- **Run 172 tests before pushing:** `uv run python -m unittest tests.test_suite` — all must pass.
 - **Update README.md AND site/ docs** when a feature changes. The two-track rule: code change → README change → site/ change. Site/ is the human-friendly tour, README is the elevator pitch.
 - **Match existing patterns.** Sample 2-3 similar files before adding a new one. Busel is small — patterns are visible at a glance.
 - **Profile with `tests/profiler_run.py`** before claiming a speedup. Numbers, not vibes.
@@ -160,9 +167,10 @@ uv run python cli.py profile                      # hardware profiler only
 # Docs
 cd site && bun install && bun run build           # GitHub Pages deploy
 
-# Profile research features (3 modes: v5.8 ablations + v6.0 cumulative + scaling)
+# Profile research features (4 modes: v5.8 ablations + v6.0 cumulative + v6.1 dispersion + scaling)
 uv run python tests/v58_profile.py --mode shpak-5run   # v5.8 ablation on shpak 52.8M (baseline / +Sparse / +LCSB / +Sparse+LCSB)
 uv run python tests/v58_profile.py --mode shpak-v60    # v6.0 cumulative on shpak 52.8M (5 runs adding DA, Cautious, SF, LCSB)
+uv run python tests/v58_profile.py --mode shpak-disp   # v6.1 dispersion on shpak 52.8M (4 runs: baseline, +Dispersion, v6.0 winner, v6.1 winner)
 uv run python tests/v58_profile.py --mode scale-3sizes # 4 configs × 3 sizes (micro_test / shpak / zubr)
 ```
 
@@ -174,7 +182,7 @@ This file is the project-level summary. Module-specific rules, anti-patterns, an
 - [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) — Rust mmap streamer, Python fallback, multimodal dispatch
 - [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) — 70-token vocab, 6 encoders (image/video/audio/PDF/docx/text)
 - [tools/AGENTS.md](file:///home/sehaxe/busel-ai/tools/AGENTS.md) — Typer CLI, pipeline orchestrator, **REPL tool executor** (v5.7)
-- [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 168-test unittest suite, custom profiler, **consolidated 3-mode v58_profile.py** (v5.8)
+- [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 172-test unittest suite, custom profiler, **consolidated 4-mode v58_profile.py** (v5.8 + v6.0 + v6.1)
 - [busel_rust_io/AGENTS.md](file:///home/sehaxe/busel-ai/busel_rust_io/AGENTS.md) — PyO3 extension, mmap safety, Rayon threading
 - [site/AGENTS.md](file:///home/sehaxe/busel-ai/site/AGENTS.md) — Astro+Starlight, build commands, URL structure
 

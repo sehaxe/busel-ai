@@ -40,7 +40,8 @@ def _load_profile(name: str) -> dict:
 
 
 def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio,
-            use_schedule_free, use_cautious, use_differential_attention, device):
+            use_schedule_free, use_cautious, use_differential_attention,
+            use_dispersion_loss, device):
     cfg_profile = _load_profile(profile_name)
     profile = dict(cfg_profile)
     profile["model"] = dict(profile["model"])
@@ -54,6 +55,7 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
     profile["training"] = dict(profile["training"])
     profile["training"]["use_schedule_free"] = use_schedule_free
     profile["training"]["use_cautious"] = use_cautious
+    profile["training"]["use_dispersion_loss"] = use_dispersion_loss
 
     class Cfg:
         pass
@@ -94,10 +96,10 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
 def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
              sparse_6_8=False, selective_backward=False, backward_ratio=1.0,
              scale_stats=False, use_schedule_free=False, use_cautious=False,
-             use_differential_attention=False):
-    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free} cau={use_cautious} diff_attn={use_differential_attention}\n{'=' * 80}")
+             use_differential_attention=False, use_dispersion_loss=False):
+    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free} cau={use_cautious} diff_attn={use_differential_attention} disp={use_dispersion_loss}\n{'=' * 80}")
     model, patcher, opt, ap, loss_engine, cfg = _build(
-        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, use_schedule_free, use_cautious, use_differential_attention, device,
+        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, use_schedule_free, use_cautious, use_differential_attention, use_dispersion_loss, device,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"   params: {n_params:,} ({n_params * 2 / 1024**2:.2f} MB FP16)")
@@ -118,13 +120,22 @@ def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
             opt.zero_grad(set_to_none=True)
             ib = bb[:, :-patcher.stride] if bb.shape[1] > patcher.stride else bb
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                patches = patcher(ib)
+                if cfg.use_dispersion_loss:
+                    patches, embed_for_dispersion = patcher(ib, return_embedding=True)
+                else:
+                    patches = patcher(ib)
                 T = patches.shape[1]
                 tg = bb[:, 1::patcher.stride][:, :T]
                 if tg.shape[1] < T:
                     tg = torch.nn.functional.pad(tg, (0, T - tg.shape[1]), value=0)
                 (lo, _, _, _), aux = model(patches, None)
                 loss = loss_engine.compute_pretrain_loss(lo, tg) + aux.float()
+                if cfg.use_dispersion_loss:
+                    loss = loss + loss_engine.compute_dispersion_loss(
+                        embed_for_dispersion,
+                        weight=cfg.dispersion_weight,
+                        temperature=cfg.dispersion_temperature,
+                    )
             loss.backward()
             ap.inject_noise(model)
             opt.step()
@@ -172,7 +183,8 @@ def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
                             sparse_6_8=sparse_6_8, selective_backward=selective_backward,
                             backward_ratio=backward_ratio, scale_stats=scale_stats,
                             use_schedule_free=use_schedule_free, use_cautious=use_cautious,
-                            use_differential_attention=use_differential_attention)
+                            use_differential_attention=use_differential_attention,
+                            use_dispersion_loss=use_dispersion_loss)
         raise
     finally:
         if created_dir:
@@ -251,6 +263,29 @@ def mode_shpak_v60(device):
     return results
 
 
+def mode_shpak_disp(device):
+    print("🔵 busel SHPAK v6.1 DISPERSION PROFILER — Wang 2026 on token embeddings")
+    print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
+    print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
+    print("   Each run adds Dispersion Loss to the v6.0 winner (DA+Cautious+LCSB).")
+    print("   Expected: similar step time, lower loss if Wang 2026 claim holds at scale.\n")
+    runs = [
+        ("1. baseline",                                           {}),
+        ("2. + Dispersion",                                       {"use_dispersion_loss": True}),
+        ("3. + DA + Cautious + LCSB (v6.0 winner)",              {"use_differential_attention": True, "use_cautious": True, "selective_backward": True, "backward_ratio": 0.5}),
+        ("4. + DA + Cautious + LCSB + Dispersion (v6.1)",        {"use_differential_attention": True, "use_cautious": True, "selective_backward": True, "backward_ratio": 0.5, "use_dispersion_loss": True}),
+    ]
+    results = []
+    for name, flags in runs:
+        try:
+            results.append(_run_one(name, "shpak", BATCH, n_warmup=N_WARMUP_5RUN, n_measure=N_MEASURE_5RUN, **flags, device=device))
+        except Exception as e:
+            print(f"   ❌ FAILED: {type(e).__name__}: {e}")
+            results.append({"name": name, "error": str(e)})
+    _print_table("SHPAK v6.1 DISPERSION COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
+    return results
+
+
 def mode_scale_3sizes(device):
     print("🧪 busel 3-SIZE PAIR-INTERACTION PROFILER (v5.8)")
     print(f"   Uniform workload: batch=16 ctx=4096, {N_MEASURE_SCALE} measured steps each")
@@ -277,7 +312,7 @@ def mode_scale_3sizes(device):
 
 def main():
     parser = argparse.ArgumentParser(description="busel v5.8 profile suite")
-    parser.add_argument("--mode", choices=["shpak-5run", "shpak-v60", "scale-3sizes"],
+    parser.add_argument("--mode", choices=["shpak-5run", "shpak-v60", "shpak-disp", "scale-3sizes"],
                         default="shpak-5run", help="Which comparison to run (default: shpak-5run)")
     parser.add_argument("--out", default="checkpoints/v58_profile.json",
                         help="Output JSON path (default: checkpoints/v58_profile.json)")
@@ -288,6 +323,8 @@ def main():
         results = mode_shpak_5run(device)
     elif args.mode == "shpak-v60":
         results = mode_shpak_v60(device)
+    elif args.mode == "shpak-disp":
+        results = mode_shpak_disp(device)
     else:
         results = mode_scale_3sizes(device)
 

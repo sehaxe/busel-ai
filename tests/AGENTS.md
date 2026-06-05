@@ -1,13 +1,13 @@
 # tests/ — Test Suite & Step Profiler
 
-**Scope:** `unittest`-based smoke tests + custom stable step profiler (no `torch.profiler` on macOS). **171 tests** total (was 166 pre-v5.8; +3 in v5.8 for Sparse-BitNet 6:8, GradLite, LCSB; −1 in v6.0 cleanup for GradLite removal; +3 in v6.0 for Schedule-Free, Cautious, Differential Attn), plus a consolidated 3-mode shpak comparison script.
+**Scope:** `unittest`-based smoke tests + custom stable step profiler (no `torch.profiler` on macOS). **172 tests** total (was 166 pre-v5.8; +3 in v5.8 for Sparse-BitNet 6:8, GradLite, LCSB; −1 in v6.0 cleanup for GradLite removal; +3 in v6.0 for Schedule-Free, Cautious, Differential Attn; +1 in v6.1 for Dispersion Loss), plus a consolidated 4-mode shpak comparison script.
 
 ## STRUCTURE
 ```
 tests/
 ├── test_suite.py            # TestbuselFramework — 9 unittest cases (166→168 in v5.8) (210 LOC)
 ├── profiler_run.py          # StablebuselProfiler — manual step timing w/ memory stats (340 LOC)
-└── v58_profile.py           # 🆕 v5.8 — consolidated 3-mode profile suite (--mode shpak-5run | shpak-v60 | scale-3sizes)
+└── v58_profile.py           # 🆕 v5.8 — consolidated 4-mode profile suite (--mode shpak-5run | shpak-v60 | shpak-disp | scale-3sizes)
 ```
 
 ## WHERE TO LOOK
@@ -17,6 +17,7 @@ tests/
 | Profile step time | `profiler_run.py` | Uses `time.perf_counter()`, no `torch.profiler` |
 | Compare 4 configs on shpak 52.8M (baseline / +Sparse / +LCSB / +Sparse+LCSB) | `v58_profile.py --mode shpak-5run` | **🆕 v5.8** — 2 warmup + 10 measured steps, batch=16 ctx=4096. Prints deltas vs baseline. |
 | Compare 5 cumulative v6.0 configs on shpak 52.8M (baseline / +DA / +DA+Cautious / +DA+Cautious+LCSB / +DA+Cautious+SF+LCSB) | `v58_profile.py --mode shpak-v60` | **🆕 v6.0** — One sweep for the best v6.0 config. Final +DA+Cautious+SF+LCSB is the full stack. |
+| Compare 4 configs with Dispersion Loss (baseline / +Dispersion / +DA+Cautious+LCSB / +DA+Cautious+LCSB+Dispersion) | `v58_profile.py --mode shpak-disp` | **🆕 v6.1** — Validates Wang 2026 Dispersion Loss on token embeddings. Final config is the v6.1 winner. |
 | Scale 3 model sizes (micro_test/shpak/zubr) | `v58_profile.py --mode scale-3sizes` | **🆕 v5.8** — uniform batch=16 ctx=4096; 4 configs × 3 sizes. |
 | Add memory metric | `profiler_run.py` → `get_memory_stats` | CUDA / MPS / RSS-by-platform |
 | Skip test on CUDA-only | use `cls.device` from `setUpClass` | `mps → cuda → cpu` priority |
@@ -24,7 +25,7 @@ tests/
 ## KEY CLASSES / FUNCTIONS
 | Symbol | Type | Location | Role |
 |---|---|---|---|
-| `TestbuselFramework` | TestCase | test_suite.py | 13 tests (166→171 cumulative: +3 v5.8, −1 v6.0 cleanup, +3 v6.0 research): Rust IO, binary packer, BitLinear, attention, MoE, optimizer, loss, e2e, **Sparse-BitNet 6:8**, **LCSB**, **Schedule-Free**, **Cautious**, **Differential Attn** |
+| `TestbuselFramework` | TestCase | test_suite.py | 14 tests (166→172 cumulative: +3 v5.8, −1 v6.0 cleanup, +3 v6.0 research, +1 v6.1): Rust IO, binary packer, BitLinear, attention, MoE, optimizer, loss, e2e, **Sparse-BitNet 6:8**, **LCSB**, **Schedule-Free**, **Cautious**, **Differential Attn**, **Dispersion Loss** |
 | `StablebuselProfiler` | class | profiler_run.py | Per-step timing (forward/backward/opt/noise) |
 | `get_memory_stats` | method | profiler_run.py | `cuda: allocated+peak` / `mps: current` / `cpu: ru_maxrss` |
 | `_compiled_newton_schulz` (imported) | function | test_suite.py | Tests Muon NS orthogonalization correctness |
@@ -51,10 +52,10 @@ tests/
 - **NEVER** write to `data_train/` from tests — gitignored but pollutes dataset
 - **NEVER** test against `targets` > 5K tokens in unit tests — slow; use small synthetic
 - **NEVER** add `assertTrue(x == y)` — use `assertEqual` (better failure messages)
-- **NEVER** push code with fewer than 171 tests passing — `uv run python -m unittest tests.test_suite` must report `OK` with `Ran 171 tests` (was 166 pre-v5.8; +3 in v5.8 for Sparse-BitNet 6:8, GradLite, LCSB; −1 in v6.0 cleanup for GradLite removal; +3 in v6.0 for SF, Cautious, DA)
+- **NEVER** push code with fewer than 172 tests passing — `uv run python -m unittest tests.test_suite` must report `OK` with `Ran 172 tests` (was 166 pre-v5.8; +3 in v5.8 for Sparse-BitNet 6:8, GradLite, LCSB; −1 in v6.0 cleanup for GradLite removal; +3 in v6.0 for SF, Cautious, DA; +1 in v6.1 for Dispersion)
 
 ## NOTES
-- **171 total tests** across 13 named test methods (the 13 methods are parameterized into 171 sub-tests via `subTest` and inner loops). The named methods are:
+- **172 total tests** across 14 named test methods (the 14 methods are parameterized into 172 sub-tests via `subTest` and inner loops). The named methods are:
   1. `test_rust_io_streamer` — `ByteStreamer` mmap correctness
   2. `test_rust_binary_packer` — `append_to_binary_file`
   3. `test_bitlinear_quantization` — forward pass on random input
@@ -68,6 +69,7 @@ tests/
   11. `test_schedule_free_wrapper` — **🆕 v6.0** — 5-step SF sanity check: state['x'/'z'/'t'] present, no NaN, loss decreased, state_dict round-trip works
   12. `test_cautious_wrapper` — **🆕 v6.0** — 5-step Cautious sanity check: no NaN, loss decreased, state_dict round-trip works
   13. `test_differential_attention_mla` — **🆕 v6.0** — DA inside MLA: param count > std MLA, forward+backward non-NaN, gradients flow
+  14. `test_dispersion_loss` — **🆕 v6.1** — uniformity loss on L2-normalised embeddings: spread embeddings give lower loss than collapsed, gradients flow (no NaN), non-zero grads
 - **Profiler runs `tests/profiler_run.py` standalone:** Called by `cli.py profile` and `autopilot`
 - **Memory in profiler:** Different stats per device — not a single unified schema
 - **Step phases measured:** `forward`, `backward`, `optimizer.step`, `autopilot.update_parameters`, `autopilot.inject_noise`
