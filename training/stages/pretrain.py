@@ -67,6 +67,7 @@ class buselPretrainConfig:
     sf_beta: float = 0.9
     sf_gamma_factor: float = 2.0
     use_cautious: bool = False
+    use_differential_attention: bool = False
 
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
@@ -94,6 +95,7 @@ class buselPretrainConfig:
         cfg.sparse_6_8 = bool(m.get("sparse_6_8", cfg.sparse_6_8))
         cfg.selective_backward = bool(m.get("selective_backward", cfg.selective_backward))
         cfg.backward_ratio = float(m.get("backward_ratio", cfg.backward_ratio))
+        cfg.use_differential_attention = bool(m.get("use_differential_attention", cfg.use_differential_attention))
         cfg.use_schedule_free = bool(t.get("use_schedule_free", cfg.use_schedule_free))
         cfg.sf_beta = float(t.get("sf_beta", cfg.sf_beta))
         cfg.sf_gamma_factor = float(t.get("sf_gamma_factor", cfg.sf_gamma_factor))

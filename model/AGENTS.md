@@ -44,7 +44,7 @@ model/
 | `SwishGLUClamped` | nn.Module | layers.py | Fused gate-up GLU; gate × clamp × up → H_BitLinear down |
 | `StridedFastBLTPatcher` | nn.Module | patching.py | vocab→d_byte→d_model; mini-SwishGLU gate; conv stride=4 |
 | `BulbaGDN2SeRoPEBlock` | nn.Module | attention.py | Linear attention w/ decoupled b/w gates, log-decay α, SeRoPE |
-| `MultiHeadLatentAttention` | nn.Module | attention.py | Compresses KV to d_c=128 latent, F.scaled_dot_product_attention |
+| `MultiHeadLatentAttention` | nn.Module | attention.py | Compresses KV to d_c=128 latent, F.scaled_dot_product_attention. `use_differential=True` swaps softmax attn for `(A1 − A2)·V` (Differential Transformer, Ye et al. 2024) |
 | `MoDSequenceRouter` | nn.Module | routing.py | Token-level routing mask (currently capacity_factor=1.0 = disabled) |
 | `BulbaTernaryTitanMoE` | nn.Module | routing.py | 2 shared + N routed experts; Blackboard gate_signal; load-balance + z-loss |
 | `ManifoldConstrainedAttnRes` | nn.Module | backbone.py | mAR: n_hyper parallel streams, multi-query attn (q from current_x, k from each stream), Sinkhorn-Knopp ×n onto Birkhoff polytope |

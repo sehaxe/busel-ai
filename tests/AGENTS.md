@@ -19,6 +19,7 @@ tests/
 | Compare pair interactions on shpak 52.8M (baseline / +LCSB / +Sparse+LCSB) | `v58_profile.py --mode shpak-pairs` | **🆕 v5.8** — prints pair-overhead on top of LCSB alone. |
 | Compare 3 SF configs on shpak 52.8M (baseline / +SF / +SF+LCSB) | `v58_profile.py --mode shpak-sf` | **🆕 v6.0** — SF overhead at 10 steps is +1.2% (paper's 2-3× convergence benefit only shows at 50+ steps). Use `min_lr_ratio=1.0` in profile to disable cosine interference. |
 | Compare 4 Cautious configs on shpak 52.8M (baseline / +Cautious / +Cautious+LCSB / +Cautious+SF+LCSB) | `v58_profile.py --mode shpak-cautious` | **🆕 v6.0** — Cautious+LCSB is the v6.0 winner: -44% step, -32% mem, best loss at 10 steps. |
+| Compare 4 DA configs on shpak 52.8M (baseline / +DA / +DA+LCSB / +DA+Cautious+LCSB) | `v58_profile.py --mode shpak-diff-attn` | **🆕 v6.0** — DA is FREE on shpak (-0.9% step, only 2 of 8 MLA layers). DA+Cautious+LCSB is the new best: -44% step, +79% tps. Quality benefit (35% intelligence/param) needs 200+ step validation. |
 | Scale 3 model sizes (micro_test/shpak/zubr) | `v58_profile.py --mode scale-3sizes` | **🆕 v5.8** — uniform batch=16 ctx=4096; 4 configs × 3 sizes. |
 | Add memory metric | `profiler_run.py` → `get_memory_stats` | CUDA / MPS / RSS-by-platform |
 | Skip test on CUDA-only | use `cls.device` from `setUpClass` | `mps → cuda → cpu` priority |
@@ -69,6 +70,7 @@ tests/
   10. `test_lcsb_selective_backward` — **🆕 v5.8** — `buselModel(selective_backward=True, backward_ratio=0.5)` on n_layers=6 selects 3 layers, gradients non-NaN, `_selected_layers` set correctly
   11. `test_schedule_free_wrapper` — **🆕 v6.0** — 5-step SF sanity check: state['x'/'z'/'t'] present, no NaN, loss decreased, state_dict round-trip works
   12. `test_cautious_wrapper` — **🆕 v6.0** — 5-step Cautious sanity check: no NaN, loss decreased, state_dict round-trip works
+  13. `test_differential_attention_mla` — **🆕 v6.0** — DA inside MLA: param count > std MLA, forward+backward non-NaN, gradients flow
 - **Profiler runs `tests/profiler_run.py` standalone:** Called by `cli.py profile` and `autopilot`
 - **Memory in profiler:** Different stats per device — not a single unified schema
 - **Step phases measured:** `forward`, `backward`, `optimizer.step`, `autopilot.update_parameters`, `autopilot.inject_noise`

@@ -61,6 +61,7 @@ All flipped on by default. No opt-out. The whole arch is better for it.
 | `sf_beta` (training) | `0.9` | y = (1-β)·x + β·z interpolation coefficient. Paper default. | — |
 | `sf_gamma_factor` (training) | `2.0` | Multiplicative LR scale during the inner base.step() — SF allows 2-3× larger LRs than cosine-scheduled methods. | — |
 | `use_cautious` (training) | `False` | **🆕 v6.0** — Cautious Optimizer (Liang et al. 2024, arXiv:2411.16085). Masks the per-element update where `update * grad <= 0` (i.e., zeros out steps that go against the gradient). Drop-in wrapper around any optimizer; composes with SF. ~5-10 LoC. ~1.5× faster convergence per paper. | +0.4% step, near-zero loss regression at 10 steps (paper's 1.5× convergence benefit only shows at 50+ steps) |
+| `use_differential_attention` (model) | `False` | **🆕 v6.0** — Differential Transformer (Ye et al. 2024, arXiv:2410.05258). Replaces 25% MLA layers' softmax attn with `(A1 − A2)·V` diff using 2 separate Q/K compressions + 1 shared V. 35% better intelligence/param (paper: 65% params needed for same quality). Composes with FlashAttention. Reduces activation outliers (helps 1-bit). | −0.9% step on shpak (FREE at 10 steps — only 2 of 8 layers affected), +295K params (+0.5% of total). Quality benefit needs 200+ step validation. |
 
 **Removed in v6.0:**
 - **GradLite error feedback** (`use_error_feedback`) — LOTUS+bf16 round-trip is numerically exact → no error to feedback → framework is a no-op. **+1 GB VRAM overhead for 0% benefit.** All code, tests, and config lines deleted.

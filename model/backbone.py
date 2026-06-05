@@ -109,11 +109,11 @@ class ManifoldConstrainedAttnRes(nn.Module):
 
 
 class buselDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2):
+    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False):
         super().__init__()
         self.mod_router = MoDSequenceRouter(d_model, capacity_factor=capacity_factor)
         if is_global:
-            self.attn = MultiHeadLatentAttention(d_model, n_heads)
+            self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential)
         else:
             self.attn = BulbaGDN2SeRoPEBlock(d_model, n_heads)
         self.moe = BulbaTernaryTitanMoE(d_model, expert_hidden, num_experts=num_experts, top_k=top_k)
@@ -187,6 +187,7 @@ class buselModel(nn.Module):
                 config.d_model, config.n_heads, config.expert_hidden,
                 config.num_experts, is_global=is_global, capacity_factor=capacity,
                 top_k=int(getattr(config, "top_k", 2)),
+                use_differential=bool(getattr(config, "use_differential_attention", False)),
             ))
 
         self.m_residuals = nn.ModuleList([

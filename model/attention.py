@@ -176,22 +176,29 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
 
 @register("attention", "mla")
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, d_model=1536, n_heads=12, d_c=128):
+    def __init__(self, d_model=1536, n_heads=12, d_c=128, use_differential=False):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_c = d_c
         self.d_v = d_model // n_heads
-        
+        self.use_differential = use_differential
+
         self.kv_compress = BitLinear_a4_8(d_model, d_c)
         self.kv_norm = RMSNorm(d_c)
         self.k_decompress = BitLinear_a4_8(d_c, n_heads * self.d_v)
         self.v_decompress = BitLinear_a4_8(d_c, n_heads * self.d_v)
-        
+
         self.q_compress = BitLinear_a4_8(d_model, d_c)
         self.q_norm = RMSNorm(d_c)
         self.q_decompress = BitLinear_a4_8(d_c, n_heads * self.d_v)
-        
+
+        if use_differential:
+            self.q2_compress = BitLinear_a4_8(d_model, d_c)
+            self.q2_decompress = BitLinear_a4_8(d_c, n_heads * self.d_v)
+            self.k2_decompress = BitLinear_a4_8(d_c, n_heads * self.d_v)
+            self.diff_lambda = nn.Parameter(torch.tensor(1.0))
+
         self.out_norm = RMSNorm(n_heads * self.d_v)
         # o_proj заменена на H_BitLinear по спецификации BitNet v2
         self.o_proj = H_BitLinear(n_heads * self.d_v, d_model)
@@ -202,11 +209,18 @@ class MultiHeadLatentAttention(nn.Module):
         kv_latent = self.kv_norm(self.kv_compress(x))
         k = self.k_decompress(kv_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
         v = self.v_decompress(kv_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
-        
+
         q_latent = self.q_norm(self.q_compress(x))
         q = self.q_decompress(q_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
-        
-        context = F.scaled_dot_product_attention(q, k, v)
+
+        attn1 = F.scaled_dot_product_attention(q, k, v)
+        if self.use_differential:
+            q2 = self.q2_decompress(self.q_norm(self.q2_compress(x))).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
+            k2 = self.k2_decompress(kv_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
+            attn2 = F.scaled_dot_product_attention(q2, k2, v)
+            context = (attn1 - attn2) * self.diff_lambda
+        else:
+            context = attn1
         context = context.transpose(1, 2).contiguous().view(B, T, -1)
         out = self.o_proj(self.out_norm(context))
         nvtx_range_pop()

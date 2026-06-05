@@ -315,6 +315,24 @@ class TestbuselFramework(unittest.TestCase):
         self.assertIn('state', sd)
         print(f"   ✅ Cautious wrapper: 5 steps OK, loss={final_loss:.2f}")
 
+    def test_differential_attention_mla(self):
+        print("🪞 [DA] Differential Attention (Ye et al. 2024) inside MLA...")
+        torch.manual_seed(42)
+        x = torch.randn(2, 32, 192, device=self.device, dtype=torch.bfloat16)
+        mla_std = MultiHeadLatentAttention(d_model=192, n_heads=6, use_differential=False).to(self.device, dtype=torch.bfloat16)
+        mla_da  = MultiHeadLatentAttention(d_model=192, n_heads=6, use_differential=True).to(self.device, dtype=torch.bfloat16)
+        n_diff = sum(p.numel() for p in mla_da.parameters()) - sum(p.numel() for p in mla_std.parameters())
+        self.assertGreater(n_diff, 0, "DA should add params (q2_compress + k2_decompress + diff_lambda)")
+
+        out_std = mla_std(x)
+        out_da  = mla_da(x)
+        self.assertEqual(out_std.shape, out_da.shape)
+        self.assertFalse(torch.isnan(out_da).any(), "DA produced NaN")
+        out_da.sum().backward()
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in mla_da.parameters() if p.requires_grad)
+        self.assertTrue(has_grad, "DA has no flowing gradients")
+        print(f"   ✅ DA-MLA: +{n_diff:,} params, forward+backward OK, out.shape={tuple(out_da.shape)}")
+
 
     def test_complete_backbone_and_gradients(self):
         print("🧪 [8] Complete Backbone & Backpropagation...")

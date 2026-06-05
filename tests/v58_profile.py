@@ -40,13 +40,14 @@ def _load_profile(name: str) -> dict:
 
 
 def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio,
-            use_schedule_free, use_cautious, device):
+            use_schedule_free, use_cautious, use_differential_attention, device):
     cfg_profile = _load_profile(profile_name)
     profile = dict(cfg_profile)
     profile["model"] = dict(profile["model"])
     profile["model"]["sparse_6_8"] = sparse_6_8
     profile["model"]["selective_backward"] = selective_backward
     profile["model"]["backward_ratio"] = backward_ratio
+    profile["model"]["use_differential_attention"] = use_differential_attention
     profile["data"] = dict(profile["data"])
     profile["data"]["batch_size"] = batch_size
     profile["data"]["chunk_size"] = CHUNK_SIZE_FORCED
@@ -92,10 +93,11 @@ def _build(profile_name, batch_size, sparse_6_8, selective_backward, backward_ra
 
 def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
              sparse_6_8=False, selective_backward=False, backward_ratio=1.0,
-             scale_stats=False, use_schedule_free=False, use_cautious=False):
-    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free} cau={use_cautious}\n{'=' * 80}")
+             scale_stats=False, use_schedule_free=False, use_cautious=False,
+             use_differential_attention=False):
+    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=sparse={sparse_6_8} lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free} cau={use_cautious} diff_attn={use_differential_attention}\n{'=' * 80}")
     model, patcher, opt, ap, loss_engine, cfg = _build(
-        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, use_schedule_free, use_cautious, device,
+        profile_name, batch_size, sparse_6_8, selective_backward, backward_ratio, use_schedule_free, use_cautious, use_differential_attention, device,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"   params: {n_params:,} ({n_params * 2 / 1024**2:.2f} MB FP16)")
@@ -169,7 +171,8 @@ def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
             return _run_one(name, profile_name, BATCH_FALLBACK_FOR_ZUBR, device, n_warmup, n_measure,
                             sparse_6_8=sparse_6_8, selective_backward=selective_backward,
                             backward_ratio=backward_ratio, scale_stats=scale_stats,
-                            use_schedule_free=use_schedule_free, use_cautious=use_cautious)
+                            use_schedule_free=use_schedule_free, use_cautious=use_cautious,
+                            use_differential_attention=use_differential_attention)
         raise
     finally:
         if created_dir:
@@ -267,6 +270,30 @@ def mode_shpak_cautious(device):
     return results
 
 
+def mode_shpak_diff_attn(device):
+    print("🪞 busel SHPAK DIFFERENTIAL-ATTENTION PROFILER (v6.0 research validation)")
+    print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
+    print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
+    print("   DA replaces 25% MLA layers' softmax attn with (A1 - A2)·V diff.")
+    print("   Paper: 35% better intelligence/param (i.e., 65% params for same quality).")
+    print("   No measured step-time cost on shpak 52.8M (only MLA layers, 2 of 8).\n")
+    runs = [
+        ("1. baseline (MLA)",                        {}),
+        ("2. + Differential Attn (DA)",              {"use_differential_attention": True}),
+        ("3. + DA + LCSB",                           {"use_differential_attention": True, "selective_backward": True, "backward_ratio": 0.5}),
+        ("4. + DA + Cautious + LCSB",                {"use_differential_attention": True, "use_cautious": True, "selective_backward": True, "backward_ratio": 0.5}),
+    ]
+    results = []
+    for name, flags in runs:
+        try:
+            results.append(_run_one(name, "shpak", BATCH, n_warmup=N_WARMUP_5RUN, n_measure=N_MEASURE_5RUN, **flags, device=device))
+        except Exception as e:
+            print(f"   ❌ FAILED: {type(e).__name__}: {e}")
+            results.append({"name": name, "error": str(e)})
+    _print_table("SHPAK DIFF-ATTN COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
+    return results
+
+
 def mode_shpak_pairs(device):
     print("🧪 busel SHPAK PAIR-INTERACTION PROFILER (v5.8)")
     print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
@@ -313,7 +340,7 @@ def mode_scale_3sizes(device):
 
 def main():
     parser = argparse.ArgumentParser(description="busel v5.8 profile suite")
-    parser.add_argument("--mode", choices=["shpak-5run", "shpak-pairs", "shpak-sf", "shpak-cautious", "scale-3sizes"],
+    parser.add_argument("--mode", choices=["shpak-5run", "shpak-pairs", "shpak-sf", "shpak-cautious", "shpak-diff-attn", "scale-3sizes"],
                         default="shpak-5run", help="Which comparison to run (default: shpak-5run)")
     parser.add_argument("--out", default="checkpoints/v58_profile.json",
                         help="Output JSON path (default: checkpoints/v58_profile.json)")
@@ -328,6 +355,8 @@ def main():
         results = mode_shpak_sf(device)
     elif args.mode == "shpak-cautious":
         results = mode_shpak_cautious(device)
+    elif args.mode == "shpak-diff-attn":
+        results = mode_shpak_diff_attn(device)
     else:
         results = mode_scale_3sizes(device)
 
