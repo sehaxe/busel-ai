@@ -294,6 +294,16 @@ model:
 
 Don't combine `sparse_6_8: true` with `backward_ratio: 0.5` expecting a multiplicative speedup — shpak shows Sparse+GradLite overhead partially cancels LCSB's win. **🆕 v5.8**
 
+### Pair-interaction overhead on top of LCSB alone (shpak 52.8M, 10 steps)
+
+| Pair | Step overhead | Memory overhead |
+|---|---:|---:|
+| + Sparse-BitNet 6:8 | +6.4 % | +273 MB |
+| + GradLite | +3.8 % | +1016 MB |
+| + Sparse + GradLite | +6.0 % | +1077 MB |
+
+**LCSB alone is the recommended config** (1666 ms / 4102 MB / 39,322 tok/s on shpak). Don't add Sparse or GradLite to LCSB without a specific reason. Validate with `tests/shpak_profile_pairs.py`. **🆕 v5.8**
+
 ## How to add a new profile
 
 1. Edit `configs/default.yaml`:

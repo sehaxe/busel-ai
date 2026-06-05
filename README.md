@@ -371,7 +371,9 @@ Add new tests there — never spawn a second test file.
 
 For v5.8 research validation, run
 `uv run python tests/shpak_profile_5runs.py` to compare baseline vs
-Sparse-BitNet 6:8, GradLite, LCSB, and all-combined on shpak 52.8M.
+Sparse-BitNet 6:8, GradLite, LCSB, and all-combined on shpak 52.8M,
+and `uv run python tests/shpak_profile_pairs.py` to measure
+pair-interaction overhead on top of LCSB alone.
 
 The **multimodal** module follows the same pattern: encoders are registered
 via `@register("encoder", name)`. To add a new modality, write a class that

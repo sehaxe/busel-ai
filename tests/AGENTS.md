@@ -7,7 +7,8 @@
 tests/
 ├── test_suite.py            # TestbuselFramework — 9 unittest cases (166→169 in v5.8) (210 LOC)
 ├── profiler_run.py          # StablebuselProfiler — manual step timing w/ memory stats (340 LOC)
-└── shpak_profile_5runs.py   # 🆕 v5.8 — 5-run shpak 52.8M comparison (baseline / +Sparse / +GradLite / +LCSB / +all)
+├── shpak_profile_5runs.py   # 🆕 v5.8 — 5-run shpak 52.8M per-feature ablation (baseline / +Sparse / +GradLite / +LCSB / +all)
+└── shpak_profile_pairs.py   # 🆕 v5.8 — 5-run shpak 52.8M pair-interaction (baseline / +LCSB / +Sparse+LCSB / +GradLite+LCSB / +all)
 ```
 
 ## WHERE TO LOOK
@@ -16,6 +17,7 @@ tests/
 | Add unit test | `test_suite.py` → new `def test_...(self)` | unittest (not pytest) |
 | Profile step time | `profiler_run.py` | Uses `time.perf_counter()`, no `torch.profiler` |
 | Compare 5 configs on shpak 52.8M | `shpak_profile_5runs.py` | **🆕 v5.8** — baseline / +Sparse / +GradLite / +LCSB / +all. Prints deltas vs baseline. |
+| Compare pair interactions on shpak 52.8M | `shpak_profile_pairs.py` | **🆕 v5.8** — baseline / +LCSB / +Sparse+LCSB / +GradLite+LCSB / +all. Prints pair-overhead on top of LCSB. |
 | Add memory metric | `profiler_run.py` → `get_memory_stats` | CUDA / MPS / RSS-by-platform |
 | Skip test on CUDA-only | use `cls.device` from `setUpClass` | `mps → cuda → cpu` priority |
 
@@ -27,6 +29,7 @@ tests/
 | `get_memory_stats` | method | profiler_run.py | `cuda: allocated+peak` / `mps: current` / `cpu: ru_maxrss` |
 | `_compiled_newton_schulz` (imported) | function | test_suite.py | Tests Muon NS orthogonalization correctness |
 | `run_one` (in shpak_profile_5runs) | function | shpak_profile_5runs.py | **🆕 v5.8** — single shpak 52.8M profile run (2 warmup + 10 measured steps, batch=16 ctx=4096) |
+| `run_one` (in shpak_profile_pairs) | function | shpak_profile_pairs.py | **🆕 v5.8** — same as above; used for the pair-interaction study |
 
 ## CONVENTIONS
 - **Test framework:** `unittest` (NOT pytest). Discoverable via `python -m unittest tests.test_suite`

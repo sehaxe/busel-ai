@@ -24,7 +24,7 @@ busel-ai/
 ├── multimodal/        # Any-to-token encoders (image/video/audio/PDF/docx) + 70-token special vocab
 ├── ui/                # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/             # Typer CLI (orchestrator, data_manager, plotter, inference, **tool_executor** v5.7)
-├── tests/             # unittest suite (169) + ultra-stable profiler v2.1 + shpak 5-run profile (v5.8)
+├── tests/             # unittest suite (169) + ultra-stable profiler v2.1 + shpak 5-run + shpak pair-interaction (v5.8)
 ├── busel_rust_io/     # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
 ├── configs/           # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest/Validation profiles
 ├── site/              # Astro+Starlight docs (GitHub Pages)
@@ -58,6 +58,15 @@ All flipped on by default. No opt-out. The whole arch is better for it.
 | `use_error_feedback` (training) | `False` | GradLite per-param error buffers — safety net for future quantization errors. Currently a no-op (LOTUS+bf16 round-trip is exact). | +0.08% step, +219 MB (4% mem overhead) |
 | `selective_backward` (model) | `False` | LCSB ratio=0.5: 50% of layers run under `no_grad` per forward. mAR residual identity still carries grad. | **−44% step, −25% mem, +80% tok/s, 0 quality cost** |
 | `backward_ratio` (model) | `1.0` | Used when `selective_backward=True`. Practical range: 0.3-0.7. | n/a |
+
+### v5.8 pair-interaction overhead (added on top of LCSB alone, shpak 52.8M)
+| Pair | Step overhead | Memory overhead | Verdict |
+|---|---:|---:|---|
+| LCSB + Sparse 6:8 | +6.4% | +273 MB | Don't add Sparse to LCSB on CUDA — mask computation overhead. |
+| LCSB + GradLite | +3.8% | **+1016 MB** | Don't add GradLite to LCSB — +1 GB VRAM for marginal speedup. |
+| LCSB + Sparse + GradLite | +6.0% | +1077 MB | Roughly additive. Worst combo. |
+
+**Recommendation:** flip LCSB to default ON; keep `sparse_6_8` and `use_error_feedback` OFF. Validate with `tests/shpak_profile_pairs.py`.
 
 All 6 profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyzh, shpak, zubr) inherit these defaults. The CLI `tests/profiler_run.py` defaults are aligned.
 
@@ -153,6 +162,7 @@ cd site && bun install && bun run build           # GitHub Pages deploy
 
 # Profile v5.8 research features (5 runs on shpak 52.8M)
 uv run python tests/shpak_profile_5runs.py       # baseline / +Sparse / +GradLite / +LCSB / +all
+uv run python tests/shpak_profile_pairs.py       # baseline / +LCSB / +Sparse+LCSB / +GradLite+LCSB / +all
 ```
 
 ## PER-MODULE RULES
@@ -163,7 +173,7 @@ This file is the project-level summary. Module-specific rules, anti-patterns, an
 - [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) — Rust mmap streamer, Python fallback, multimodal dispatch
 - [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) — 70-token vocab, 6 encoders (image/video/audio/PDF/docx/text)
 - [tools/AGENTS.md](file:///home/sehaxe/busel-ai/tools/AGENTS.md) — Typer CLI, pipeline orchestrator, **REPL tool executor** (v5.7)
-- [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 169-test unittest suite, custom profiler, **shpak 5-run profile** (v5.8)
+- [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 169-test unittest suite, custom profiler, **shpak 5-run + shpak pair-interaction** (v5.8)
 - [busel_rust_io/AGENTS.md](file:///home/sehaxe/busel-ai/busel_rust_io/AGENTS.md) — PyO3 extension, mmap safety, Rayon threading
 - [site/AGENTS.md](file:///home/sehaxe/busel-ai/site/AGENTS.md) — Astro+Starlight, build commands, URL structure
 

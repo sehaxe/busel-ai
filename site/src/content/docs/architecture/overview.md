@@ -247,6 +247,21 @@ model:
 
 **🆕 v5.8**
 
+### Pair-interaction overhead (added on top of LCSB alone)
+
+A focused study on shpak 52.8M (10 steps) — what's the cost of
+adding each of the other two features to LCSB?
+
+| Pair added to LCSB | Step overhead | Memory overhead | Verdict |
+|---|---:|---:|---|
+| + Sparse-BitNet 6:8 | +6.4 % | +273 MB | Mask computation overhead on CUDA. Win on CPU/inference only. |
+| + GradLite | +3.8 % | **+1016 MB** | Per-param fp32 buffer cost. Huge VRAM for marginal speedup. |
+| + Sparse + GradLite | +6.0 % | +1077 MB | Roughly additive. Worst combo. |
+
+**LCSB alone remains the optimal config** — 1666 ms / 4102 MB /
+39,322 tok/s. Don't combine with Sparse or GradLite unless you have
+a specific reason. See `tests/shpak_profile_pairs.py`.
+
 ## What it doesn't get you
 
 - State-of-the-art quality. The 50 M parameter ceiling is a
