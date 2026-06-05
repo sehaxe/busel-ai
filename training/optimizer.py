@@ -83,9 +83,6 @@ class Muon(torch.optim.Optimizer):
                 p.mul_(1.0 - lr * wd)
                 p.add_(O_t.to(p.dtype), alpha=-lr * scale)
 
-    def hybrid_newton_schulz(self, M, steps=10):
-        return _newton_schulz_core(M, steps)
-
 @register("optimizer", "lotus_muon")
 class LotusMuon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, weight_decay=0.1, momentum=0.95,

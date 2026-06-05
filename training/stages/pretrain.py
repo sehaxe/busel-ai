@@ -62,7 +62,6 @@ class buselPretrainConfig:
     lr_multipliers: Any = None
     selective_backward: bool = False
     backward_ratio: float = 1.0
-    sparse_6_8: bool = False
     use_schedule_free: bool = False
     sf_beta: float = 0.9
     sf_gamma_factor: float = 2.0
@@ -95,7 +94,6 @@ class buselPretrainConfig:
         cfg.lotus_rank = int(t.get("lotus_rank", cfg.lotus_rank))
         cfg.lotus_lr_scale = float(t.get("lotus_lr_scale", cfg.lotus_lr_scale))
         cfg.lr_multipliers = t.get("lr_multipliers", None)
-        cfg.sparse_6_8 = bool(m.get("sparse_6_8", cfg.sparse_6_8))
         cfg.selective_backward = bool(m.get("selective_backward", cfg.selective_backward))
         cfg.backward_ratio = float(m.get("backward_ratio", cfg.backward_ratio))
         cfg.use_differential_attention = bool(m.get("use_differential_attention", cfg.use_differential_attention))
