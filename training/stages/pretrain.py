@@ -60,6 +60,10 @@ class buselPretrainConfig:
     lotus_rank: int = 8
     lotus_lr_scale: float = 0.5
     lr_multipliers: Any = None
+    use_error_feedback: bool = False
+    selective_backward: bool = False
+    backward_ratio: float = 1.0
+    sparse_6_8: bool = False
 
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
@@ -84,6 +88,10 @@ class buselPretrainConfig:
         cfg.lotus_rank = int(t.get("lotus_rank", cfg.lotus_rank))
         cfg.lotus_lr_scale = float(t.get("lotus_lr_scale", cfg.lotus_lr_scale))
         cfg.lr_multipliers = t.get("lr_multipliers", None)
+        cfg.use_error_feedback = bool(t.get("use_error_feedback", cfg.use_error_feedback))
+        cfg.sparse_6_8 = bool(m.get("sparse_6_8", cfg.sparse_6_8))
+        cfg.selective_backward = bool(m.get("selective_backward", cfg.selective_backward))
+        cfg.backward_ratio = float(m.get("backward_ratio", cfg.backward_ratio))
         if cfg.d_model % cfg.n_hyper != 0:
             raise ValueError(
                 f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
@@ -317,6 +325,7 @@ class buselPretrainStage:
             lotus_rank=self.cfg.lotus_rank,
             lotus_lr_scale=self.cfg.lotus_lr_scale,
             lr_multipliers=self.cfg.lr_multipliers,
+            use_error_feedback=self.cfg.use_error_feedback,
         )
         self.autopilot = buselAutoPilot(
             self.opt_engine,
