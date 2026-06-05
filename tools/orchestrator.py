@@ -314,23 +314,26 @@ def plan_escalation(target: str, max_steps: int | None = None, vram_gb: float = 
     return {"target": target, "ladder": ladder, "stages": stages, "vram_gb": vram_gb, "max_steps": max_steps}
 
 
-def _write_escalation_yaml(plan: dict, path: str) -> None:
+def _write_escalation_yaml(plan: dict, path: str, recompile: bool = False) -> None:
     import yaml as _yaml
 
     stages_yaml = []
     for s in plan["stages"]:
+        params = {
+            "profile_name": s["profile"],
+            "max_steps": s["max_steps"],
+            "warmup_steps": max(50, int(0.05 * s["max_steps"])),
+            "batch_size": s["batch_size"],
+            "chunk_size": s["chunk_size"],
+        }
+        if recompile:
+            params["inductor_cache_clean"] = True
         stages_yaml.append(
             {
                 "name": "pretrain",
                 "data_preset": s["profile"],
                 "checkpoint_out": f"checkpoints/busel_escalate_{s['profile']}_FINAL.pt",
-                "params": {
-                    "profile_name": s["profile"],
-                    "max_steps": s["max_steps"],
-                    "warmup_steps": max(50, int(0.05 * s["max_steps"])),
-                    "batch_size": s["batch_size"],
-                    "chunk_size": s["chunk_size"],
-                },
+                "params": params,
             }
         )
     cap_note = f"max_steps={plan['max_steps']}" if plan.get("max_steps") else "as long as possible (Chinchilla)"
@@ -361,6 +364,7 @@ def escalate(
     target: str = typer.Option("shpak", "--target", "-t", help="Target profile: chyzh | shpak | zubr"),
     max_steps: int | None = typer.Option(None, "--max-steps", help="Cap total training across all stages (default: train to Chinchilla)"),
     vram_gb: float = typer.Option(16.0, "--vram", help="Available VRAM in GB (clamps batch_size)"),
+    recompile: bool = typer.Option(False, "--recompile", help="Wipe Inductor cache before compiling (default: reuse cache)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan only, do not execute"),
 ):
     print_tui_header()
@@ -371,7 +375,9 @@ def escalate(
         return
     yaml_name = f".escalate-{target}-{max_steps}" if max_steps else f".escalate-{target}-chinchilla"
     yaml_path = f"configs/pipelines/{yaml_name}.yaml"
-    _write_escalation_yaml(plan, yaml_path)
+    _write_escalation_yaml(plan, yaml_path, recompile=recompile)
     typer.echo(typer.style(f"📝 Plan persisted to {yaml_path}", fg=typer.colors.GREEN))
+    if recompile:
+        typer.echo(typer.style("🔥 --recompile: Inductor cache will be wiped before compile.", fg=typer.colors.YELLOW))
     typer.echo(typer.style("🚀 Handing off to pipeline()...\n", fg=typer.colors.GREEN, bold=True))
     pipeline(name=yaml_name, config_dir="configs/pipelines")

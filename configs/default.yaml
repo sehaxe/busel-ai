@@ -117,7 +117,7 @@ profiles:
     perf:
       step_ms_est: 250
       inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: true
+      inductor_cache_clean: false
       inductor_cache_max_gb: 0.0
 
   shpak:
@@ -134,7 +134,7 @@ profiles:
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 128
+      batch_size: 64
     training:
       max_steps: "auto"
       warmup_steps: "auto"
@@ -149,7 +149,7 @@ profiles:
     perf:
       step_ms_est: 380
       inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: true
+      inductor_cache_clean: false
       inductor_cache_max_gb: 0.0
 
   zubr:
@@ -182,5 +182,5 @@ profiles:
     perf:
       step_ms_est: 800
       inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: true
+      inductor_cache_clean: false
       inductor_cache_max_gb: 0.0

@@ -117,7 +117,7 @@ class buselPretrainConfig:
     dispersion_weight: float = 0.1
     dispersion_temperature: float = 2.0
     inductor_cache_dir: str = "~/.cache/busel/inductor"
-    inductor_cache_clean: bool = True
+    inductor_cache_clean: bool = False
     inductor_cache_max_gb: float = 0.0
 
     @classmethod
@@ -288,6 +288,8 @@ class buselPretrainStage:
         self._checkpoint_out = stage_params.get("checkpoint_out")
         if stage_params.get("no_compile") and not no_compile:
             no_compile = True
+        if "inductor_cache_clean" in stage_params:
+            self._override_cache_clean = bool(stage_params["inductor_cache_clean"])
         if isinstance(profile, str):
             with open("configs/default.yaml", "r", encoding="utf-8") as f:
                 full = yaml.safe_load(f)
@@ -323,6 +325,8 @@ class buselPretrainStage:
             self.cfg.max_steps = int(override_max_steps)
         if override_warmup_steps is not None:
             self.cfg.warmup_steps = int(override_warmup_steps)
+        if hasattr(self, "_override_cache_clean"):
+            self.cfg.inductor_cache_clean = self._override_cache_clean
 
         _enforce_stability()
         self._logger = setup_logging()
