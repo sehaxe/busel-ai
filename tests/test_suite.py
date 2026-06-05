@@ -115,7 +115,6 @@ class _MockConfig:
         default_vocab = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
         self.vocab_size = kw.get("vocab_size", default_vocab)
         self.n_hyper = kw.get("n_hyper", 2)
-        self.sparse_6_8 = kw.get("sparse_6_8", False)
         self.selective_backward = kw.get("selective_backward", False)
         self.backward_ratio = kw.get("backward_ratio", 1.0)
 
@@ -183,28 +182,6 @@ class TestbuselFramework(unittest.TestCase):
         self.assertEqual(out.shape, (2, 128))
         self.assertFalse(torch.isnan(out).any())
         print("   ✅ BitLinear Quantization passed.")
-
-    def test_sparse_bitnet_6_8(self):
-        print("🧪 [4b] Sparse-BitNet 6:8 (Dual STE, 6/8 weights kept)...")
-        torch.manual_seed(0)
-        lin_dense = BitLinear_a4_8(64, 128, is_sparse_6_8=False).to(self.device)
-        lin_sparse = BitLinear_a4_8(64, 128, is_sparse_6_8=True).to(self.device)
-        lin_sparse.load_state_dict(lin_dense.state_dict())
-        x = torch.randn(2, 64, device=self.device, requires_grad=True)
-        x_sparse = x.detach().clone().requires_grad_(True)
-        out_dense = lin_dense(x).sum()
-        out_sparse = lin_sparse(x_sparse).sum()
-        out_dense.backward()
-        out_sparse.backward()
-        self.assertEqual(out_sparse.shape, out_dense.shape)
-        self.assertFalse(torch.isnan(out_sparse).any())
-        self.assertIsNotNone(x_sparse.grad)
-        self.assertFalse(torch.isnan(x_sparse.grad).any())
-        sparse_grad_density = (x_sparse.grad.abs() > 0).float().mean().item()
-        self.assertGreater(sparse_grad_density, 0.5)
-        self.assertTrue(lin_sparse.is_sparse_6_8)
-        self.assertFalse(lin_dense.is_sparse_6_8)
-        print("   ✅ Sparse-BitNet 6:8 forward+backward passed.")
 
     def test_lcsb_selective_backward(self):
         print("🧪 [4c] LCSB selective per-layer backward (buselModel)...")

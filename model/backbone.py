@@ -203,11 +203,6 @@ class buselModel(nn.Module):
         self.backward_ratio = max(0.0, min(1.0, float(getattr(config, "backward_ratio", 1.0))))
         self._selected_layers: list[int] = list(range(config.n_layers))
 
-        if getattr(config, "sparse_6_8", False):
-            for module in self.modules():
-                if isinstance(module, BitLinear_a4_8):
-                    module.is_sparse_6_8 = True
-
     def enable_gradient_checkpointing(self, every: int = 1): self.use_gradient_checkpointing = True; self.checkpoint_every = max(1, int(every))
     def disable_gradient_checkpointing(self): self.use_gradient_checkpointing = False
 
