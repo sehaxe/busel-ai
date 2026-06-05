@@ -134,6 +134,9 @@ def _download_text(limit: int, source: str):
     elif source_clean in ["smollm", "cosmopedia"]:
         dataset_name, split_name, name_param, text_key = "HuggingFaceTB/smollm-corpus", "train", "cosmopedia-v2", "text"
         output_file = os.path.join(DATA_DIR, "pretrain_cosmopedia.txt")
+    elif source_clean == "wikipedia":
+        dataset_name, split_name, name_param, text_key = "wikimedia/wikipedia", "20231101.en", "train", "text"
+        output_file = os.path.join(DATA_DIR, "pretrain_wiki.txt")
     else:
         typer.echo(typer.style("❌ Unsupported source!", fg=typer.colors.RED))
         return
@@ -285,7 +288,7 @@ def download_vision(
 @app.command()
 def download_text(
     limit: int = typer.Option(5000, "--limit", "-l", help="Number of pretrain texts to download"),
-    source: str = typer.Option("smollm", "--source", "-s", help="Source: 'smollm', 'fineweb', 'tinystories'"),
+    source: str = typer.Option("smollm", "--source", "-s", help="Source: 'smollm', 'fineweb', 'tinystories', 'wikipedia'"),
     preset: str = typer.Option(None, "--preset", "-p", help="Automatic profile preset: 'shpak'")
 ):
     if preset:
