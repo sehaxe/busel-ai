@@ -58,6 +58,18 @@ in whether the *scaling-laws ceiling* can be pushed down by:
    smoother loss + lower variance, **selective activation checkpointing**
    (`every=2` — half the layers are recomputed during backward, halving
    activation memory).
+9. **v5.8 opt-in research features** — three new backward-pass optimizations,
+   all off by default, all validated on shpak 52.8M:
+   - **Sparse-BitNet 6:8** (Dual STE) — 2/8 weight sparsity mask. No win on
+     CUDA (no N:M-aware GEMM kernels), CPU/inference win.
+   - **GradLite error feedback** — per-param fp32 error buffers in
+     `buselOptimizerEngine`. Framework for future quantization errors.
+   - **LCSB selective per-layer backward** — 50% of layers run under
+     `no_grad` per forward. **−44% step, −25% peak VRAM, +80% tok/s**
+     on shpak, no convergence regression. The clear winner — flip
+     `selective_backward: true, backward_ratio: 0.5` in your profile
+     after extended validation. See `tests/shpak_profile_5runs.py`
+     for the 5-run comparison.
 
 The codebase is intentionally small — the entire model + training + data
 pipeline is ~3,000 lines of Python and ~140 lines of Rust, so you can read
@@ -129,8 +141,9 @@ data loader auto-dispatches by extension.
             ║     h = ManifoldConstrainedAttnRes  ║  ← mAR: Sinkhorn on
             ║         (current + n_hyper streams)║     Birkhoff polytope
             ║     h = buselDecoderLayer(h)        ║  ← attn (GDN-2 or MLA)
-            ║                                     ║     + MoE (2 shared +
-            ║                                     ║       N routed, Top-1)
+            ║     [opt-in: LCSB skips 50% of     ║     + MoE (2 shared +
+            ║      layer forwards via no_grad]   ║       N routed, Top-1)
+            ║     [opt-in: 6:8 weight mask]       ║  ← −44% step, +80% tps
             ╚═════════════════════════════════════╝
                               │  hidden (B × T/4 × d_model)
                               ▼
@@ -159,7 +172,7 @@ busel-ai/
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (166 tests) + ultra-stable profiler v2.1
+├── tests/              # unittest suite (169 tests) + ultra-stable profiler v2.1 + shpak 5-run profile (v5.8)
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
 ├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
 ├── site/               # Astro+Starlight docs site (this wiki)
@@ -352,9 +365,13 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (166 tests,
-verbose mode by default, no pytest, no torch.profiler on MPS). Add new
-tests there — never spawn a second test file.
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (169 tests
+in v5.8, verbose mode by default, no pytest, no torch.profiler on MPS).
+Add new tests there — never spawn a second test file.
+
+For v5.8 research validation, run
+`uv run python tests/shpak_profile_5runs.py` to compare baseline vs
+Sparse-BitNet 6:8, GradLite, LCSB, and all-combined on shpak 52.8M.
 
 The **multimodal** module follows the same pattern: encoders are registered
 via `@register("encoder", name)`. To add a new modality, write a class that

@@ -272,6 +272,28 @@ def effective_max_steps(self) -> int:
 
 `_chinchilla_solve()` computes the Chinchilla-optimal step count from the non-embedding param count and the per-step tokens. See [Curriculum](file:///home/sehaxe/busel-ai/site/src/content/docs/training/curriculum.md) for the math.
 
+## v5.8 opt-in research flags
+
+Four new flags landed in v5.8. All default OFF — **profile before flipping**. The 5-run shpak comparison script is `uv run python tests/shpak_profile_5runs.py`.
+
+| Flag | Section | Default | Effect on shpak 52.8M (batch=16 ctx=4096, 10 steps) |
+|---|---|---|---|
+| `sparse_6_8` | `model:` | `False` | +1 % step, +2 % mem. **No win on CUDA** (no N:M-aware GEMM kernels). Win on CPU/inference. |
+| `selective_backward` | `model:` | `False` | When ON, activates LCSB (see `backward_ratio`). |
+| `backward_ratio` | `model:` | `1.0` | Used when `selective_backward=True`. Practical: 0.3-0.7. **−44 % step, −25 % mem, +80 % tok/s at 0.5.** |
+| `use_error_feedback` | `training:` | `False` | Enables GradLite per-param error buffers in `buselOptimizerEngine`. +0.08 % step, +219 MB. Framework-only benefit. |
+
+To flip LCSB (the recommended default after extended validation):
+
+```yaml
+# configs/default.yaml — shpak profile
+model:
+  selective_backward: true
+  backward_ratio: 0.5
+```
+
+Don't combine `sparse_6_8: true` with `backward_ratio: 0.5` expecting a multiplicative speedup — shpak shows Sparse+GradLite overhead partially cancels LCSB's win. **🆕 v5.8**
+
 ## How to add a new profile
 
 1. Edit `configs/default.yaml`:

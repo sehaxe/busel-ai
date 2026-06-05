@@ -171,6 +171,82 @@ final 10 %).
   catastrophic spikes.
 - **Tunable** through a single YAML config and a Typer CLI.
 
+## v5.8 opt-in research features
+
+Three v5.8 features are **opt-in** (default OFF) — measure before
+flipping the switch.
+
+### Sparse-BitNet 6:8 (model)
+
+A 2/8 weight sparsity mask computed in `no_grad` from
+`w.abs().topk(6, dim=-1)` over groups of 8, applied via a custom
+`DualMaskSTE` autograd function. Forward: 2 of every 8 weights are
+zeroed → 25 % of multiplications skipped. Backward: **full** gradient
+through the master weight (Dual STE — the mask can adapt if the
+gradient demands it).
+
+**Validation on shpak 52.8M:** +1 % step time, +2 % peak VRAM. No win
+on CUDA (no N:M-aware GEMM kernels). Useful for CPU/inference with
+Rust `ternary_matmul_cpu`. See [1-bit weights](/busel-ai/architecture/one-bit-weights/#sparse-bitnet-68-v58-opt-in) for the
+implementation.
+
+### GradLite error feedback (training)
+
+A safety-net framework for future quantization errors. When
+`use_error_feedback: true`, `buselOptimizerEngine` keeps an fp32
+error buffer per param: `g' = g + buf; buf = -buf` on every step.
+Mathematically a no-op when the optimizer is exact; provides the
+structure to absorb LOTUS rank-r residuals, bf16 precision loss,
+or sparse-mask gradient correction. See [Hybrid Muon+AdamW](/busel-ai/training/optimizer/#gradlite-error-feedback-v58-opt-in).
+
+### LCSB selective per-layer backward (model)
+
+The big v5.8 win. Each forward, randomly selects
+`n_select = max(1, int(n_layers × backward_ratio))` layers to run
+with grad; non-selected layers run under `torch.no_grad()`. The
+mAR residual identity path (`x = mixed + layer_out`) still carries
+gradient even when the layer is skipped.
+
+```python
+# buselModel.forward
+if self.selective_backward and self.training and self.backward_ratio < 1.0:
+    import random
+    n_select = max(1, int(len(self.layers) * self.backward_ratio))
+    self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
+else:
+    self._selected_layers = list(range(len(self.layers)))
+
+for i, layer in enumerate(self.layers):
+    mixed = self.m_residuals[i](x, streams)
+    if i in self._selected_layers:
+        layer_out, aux_loss = layer(mixed, progress=progress)
+    else:
+        with torch.no_grad():
+            layer_out, aux_loss = layer(mixed, progress=progress)
+    x = mixed + layer_out
+```
+
+**Validation on shpak 52.8M, `backward_ratio=0.5`:**
+
+| Configuration | Step (ms) | Peak VRAM | tok/s | Loss@10 |
+|---|---:|---:|---:|---:|
+| Baseline | 2763.5 | 5475 MB | 23,715 | 5.892 |
+| **+ LCSB ratio=0.5** | **1533.4** | **4099 MB** | **42,738** | 5.874 |
+| + LCSB + Sparse + GradLite | 1658.1 | 5284 MB | 39,526 | 5.903 |
+
+**−44 % step time, −25 % peak VRAM, +80 % tok/s, no convergence
+regression.** Sparse+GradLite overhead partially cancels LCSB's win,
+so use LCSB alone. To enable:
+
+```yaml
+# configs/default.yaml — shpak profile
+model:
+  selective_backward: true
+  backward_ratio: 0.5
+```
+
+**🆕 v5.8**
+
 ## What it doesn't get you
 
 - State-of-the-art quality. The 50 M parameter ceiling is a
