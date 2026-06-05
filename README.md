@@ -3,10 +3,11 @@
 > *Pronounced **[ˈbusɛl]** — from Belarusian **бусел** (stork).*
 >
 > A token-free, 1.58-bit, hybrid linear-attention LLM with **mAR** residuals,
-> MoE, byte-level patching, and MTP-4. **Any-to-text**: trains on images,
-> video, audio, PDF, docx in the same byte stream as text. Runs on consumer
-> hardware (RTX 5060 Ti 16 GB / Apple Silicon Mac) without any external
-> tokenizer.
+> **LOTUS+Muon** optimizer, **Top-1 MoE**, byte-level patching, **selective
+> activation checkpointing**, **decoupled per-layer LR**, **EMA of weights**,
+> and MTP-4. **Any-to-text**: trains on images, video, audio, PDF, docx in
+> the same byte stream as text. Runs on consumer hardware (RTX 5060 Ti 16 GB
+> / Apple Silicon Mac) without any external tokenizer.
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org)
 [![CUDA / MPS / CPU](https://img.shields.io/badge/device-CUDA%20%7C%20MPS%20%7C%20CPU-green.svg)](#hardware-support)
@@ -38,10 +39,14 @@ in whether the *scaling-laws ceiling* can be pushed down by:
 4. **3:1 GDN-2 / MLA attention** — 75 % of layers are linear (GDN-2,
    O(1) cache); 25 % are MLA (latent KV, `d_c=128`). A 128 K-token context
    uses ~98 MB of MLA cache.
-5. **Hybrid Muon + AdamW** — `proj` weights go through the Muon Newton-Schulz
-   orthogonaliser; everything else (norms, biases, embeddings, router) uses
-   AdamW. Plus `buselAutoPilot` v6.0 — predictive 3σ dampening, adaptive
-   gradient clipping, dynamic weight decay.
+5. **LOTUS+Muon hybrid optimizer (default)** — 2D weight tensors go through
+   **LOTUS** (rank-8 factorised Muon, ~85× less optimizer state than
+   full Muon) and everything else (norms, biases, embeddings, router) goes
+   through AdamW. Params are subdivided by layer type (attn, ffn, mtp,
+   norm, embed, router) for **decoupled per-layer LR multipliers**.
+   `buselAutoPilot` v6.0 — predictive 3σ dampening, adaptive gradient
+   clipping, dynamic weight decay. **MoE Top-1** routing (1 of N experts
+   per token) cuts routed FFN FLOPs by ~35 %.
 6. **Curriculum + Chinchilla auto-planner** — context grows 64 → 128 → 256
    patches, batch adapts inversely to hold VRAM constant, and the exact step
    count is derived from the Chinchilla byte-law
@@ -49,9 +54,13 @@ in whether the *scaling-laws ceiling* can be pushed down by:
 7. **OpenCV fast paths** — image and video encoders use cv2 (`cv2.resize`
    with `INTER_AREA`, `cv2.VideoCapture` with `CAP_PROP_FRAME_COUNT` +
    `cap.grab()` for seek-skipping). ~5-10× faster than PIL/imageio.
+8. **Quality machinery on by default** — **EMA of weights** (decay 0.999) for
+   smoother loss + lower variance, **selective activation checkpointing**
+   (`every=2` — half the layers are recomputed during backward, halving
+   activation memory).
 
 The codebase is intentionally small — the entire model + training + data
-pipeline is ~2,500 lines of Python and ~140 lines of Rust, so you can read
+pipeline is ~3,000 lines of Python and ~140 lines of Rust, so you can read
 the whole thing in an afternoon.
 
 ---
@@ -121,7 +130,7 @@ data loader auto-dispatches by extension.
             ║         (current + n_hyper streams)║     Birkhoff polytope
             ║     h = buselDecoderLayer(h)        ║  ← attn (GDN-2 or MLA)
             ║                                     ║     + MoE (2 shared +
-            ║                                     ║       N routed, Top-2)
+            ║                                     ║       N routed, Top-1)
             ╚═════════════════════════════════════╝
                               │  hidden (B × T/4 × d_model)
                               ▼
@@ -145,12 +154,12 @@ Read the deep dive in the docs:
 ```
 busel-ai/
 ├── model/              # BitNet v2 architecture (BitLinear, mAR, attention mix) + checkpoint I/O
-├── training/           # Muon+AdamW hybrid optimizer, AutoPilot v6.0, MTP-4 loss
+├── training/           # LOTUS+Muon+AdamW hybrid optimizer, EMA, AutoPilot v6.0, MTP-4 loss
 ├── data/               # Stream-interleaving token loader (list[int], Rust mmap or Python)
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (137 tests) + ultra-stable profiler v2.0
+├── tests/              # unittest suite (166 tests) + ultra-stable profiler v2.1
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
 ├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
 ├── site/               # Astro+Starlight docs site (this wiki)
@@ -209,6 +218,19 @@ Tested on **NVIDIA RTX 5060 Ti (16 GB, sm_120)** with PyTorch 2.12 + CUDA 13.0.
 End-to-end training of the **validation** profile (200 steps, 3.28 M tokens):
 **~33 k tok/s average, loss 10.46 → 7.17 in 0.03 h.**
 
+### Memory savings (36.9 M-param model, batch=4 ctx=512, measured on CUDA)
+
+| Configuration                          | Peak VRAM | Δ vs baseline |
+|----------------------------------------|----------:|--------------:|
+| Baseline (Muon, top_k=2, ckpt every=2) | 1754 MB   | —             |
+| + LOTUS+Muon                           | 1686 MB   | **−68 MB**    |
+| + MoE top_k=1                          | 1636 MB   | **−119 MB**   |
+| + LOTUS+Muon + top_k=1                 | **1569 MB** | **−186 MB (−10.6 %)** |
+
+LOTUS+Muon's 85× per-param optimizer-state reduction lets the shpak profile
+(~52.8 M params) train in ~7 MB of optimizer state instead of ~624 MB,
+unlocking 2-3× larger models on the same 16 GB GPU.
+
 See [Performance tuning](https://sehaxe.github.io/busel-ai/performance/compile-modes/)
 for the full guide and the torch.compile / FakeTensor gotcha.
 
@@ -225,7 +247,12 @@ uv run train.py --profile shpak --compile-mode reduce-overhead
 uv run python tools/inference.py --checkpoint checkpoints/shpak_FINAL.pt
 uv run python tools/inference.py --repl   # interactive chat
 
-uv run python tools/profiler_run.py       # one-step CPU/GPU breakdown
+# Profiler (v2.1 — accepts new optimizer / MoE / ckpt flags)
+uv run python tests/profiler_run.py                                      # defaults: LOTUS, top_k=1, ckpt every=2
+uv run python tests/profiler_run.py --optimizer-type muon --top-k 2      # ablation: pre-LOTUS, pre-Top-1
+uv run python tests/profiler_run.py --backend torch --trace checkpoints/profiler.json   # CUDA kernel-level
+uv run python tests/profiler_run.py --steps 50 --no-grad-ckpt            # 50 steps, no checkpointing
+
 uv run python tools/plotter.py            # plot loss / lr / grad norm
 uv run python tools/orchestrator.py download --preset shpak
 
@@ -290,7 +317,8 @@ web-dashboard's primary input. Stable schema:
 Events emitted: `training_start`, `model_initialized`, `chinchilla_planned`,
 `curriculum_upgrade`, `step_complete`, `checkpoint_saved` /
 `checkpoint_rejected` / `checkpoint_failed`, `emergency_save_requested`,
-`emergency_checkpoint`, `training_complete`.
+`emergency_checkpoint`, `stage_complete`, `pipeline_start` /
+`pipeline_complete`, `stage_failed`, `training_complete`.
 
 ---
 
@@ -324,7 +352,7 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (137 tests,
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (166 tests,
 verbose mode by default, no pytest, no torch.profiler on MPS). Add new
 tests there — never spawn a second test file.
 
@@ -354,6 +382,7 @@ Busel stands on the shoulders of:
 - **MLA** (DeepSeek, 2024) — multi-head latent attention with `d_c=128`
 - **Muon** (Keller Jordan, 2024) — Newton-Schulz orthogonaliser for 2D
   weights
+- **LOTUS** (arXiv:2602.01233) — rank-r factorised Muon momentum
 - **Multi-Token Prediction** (DeepSeek, 2024) — t+1..t+4 heads with
   decaying loss
 - **Chinchilla scaling** (Hoffmann et al., 2022) — the byte-law

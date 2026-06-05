@@ -9,7 +9,7 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 busel's MoE is a small, deliberately over-engineered design that solves a 1-bit-specific problem: **expert collapse**. In dense fp16 transformers, MoE collapse is rare — the router's logits can drift apart because gradients are smooth. In 1.58-bit transformers, every weight and every activation is rounded, so two experts that happen to receive the same input distribution will quantize to *exactly* the same weights within ~2k steps, permanently.
 
-We solve this with three independent mechanisms layered on top of a standard Top-2 router.
+We solve this with three independent mechanisms layered on top of a standard Top-1 router.
 
 ## Top-level architecture
 
@@ -18,9 +18,9 @@ input x ∈ (B, S, D)
   │
   ├─► 2 shared experts       (always fire, run on full x)
   │
-  ├─► N routed experts       (Top-2 selection by router)
+  ├─► N routed experts       (Top-1 selection by router)
   │     router(x_enriched.detach()) → logits
-  │     Top-2 + capacity_factor=1.0 (full sequence per expert)
+  │     Top-1 + capacity_factor=1.0 (full sequence per expert)
   │     weighted sum of expert outputs
   │
   └─► Blackboard Memory bus  (cross-expert communication channel)
@@ -33,7 +33,7 @@ input x ∈ (B, S, D)
 |---|---|---|
 | `n_shared` | Always-active experts | 2 |
 | `n_routed` | Router-selected experts | 4 (Shpak) / 8 (Zubr) / 16 (Chyzh) |
-| `top_k` | Experts per token | 2 |
+| `top_k` | Experts per token | 1 |
 | `capacity_factor` | Max tokens per expert | 1.0 (no dropping) |
 | `aux_loss_coeff` | Load-balancing weight | 0.01 (linear warmup over 1k steps) |
 | `z_loss_coeff` | Router logit magnitude penalty | 0.001 |

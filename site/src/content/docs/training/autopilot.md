@@ -25,10 +25,11 @@ class buselAutoPilot:
         wd = self._dynamic_wd(step)
         adamw.set_weight_decay(wd)
 
-        # 3. Curriculum-aware LR
+        # 3. Curriculum-aware LR (× sub-group multiplier)
         lr_new = self._curriculum_lr(step, lr)
-        muon.set_lr(lr_new * 10)        # Muon LR is 10× AdamW's
-        adamw.set_lr(lr_new)
+        for sub_group, mult in self.subgroup_multipliers.items():
+            muon.set_lr_for(sub_group, lr_new * 10 * mult)
+            adamw.set_lr_for(sub_group, lr_new * mult)
 
         # 4. 3σ spike dampening
         if self._is_spike(loss):
@@ -37,6 +38,12 @@ class buselAutoPilot:
 
         return {"event": "ok", "lr": lr_new, "wd": wd}
 ```
+
+The sub-group multiplier step is the **decoupled per-layer LR** — see
+[Optimizer § Decoupled per-layer LR](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md#decoupled-per-layer-lr).
+AutoPilot's `set_lr` walks every one of the 6 sub-groups (attn / ffn / mtp / norm / embed / router)
+and applies the curriculum LR × the sub-group multiplier. This is the only way the per-layer
+multipliers get re-applied each step; if you bypass AutoPilot, the multipliers freeze at init.
 
 ## 1. Adaptive Gradient Clipping (AGC)
 

@@ -45,9 +45,10 @@ tests/
 - **NEVER** write to `data_train/` from tests — gitignored but pollutes dataset
 - **NEVER** test against `targets` > 5K tokens in unit tests — slow; use small synthetic
 - **NEVER** add `assertTrue(x == y)` — use `assertEqual` (better failure messages)
+- **NEVER** push code with fewer than 166 tests passing — `uv run python -m unittest tests.test_suite` must report `OK` with `Ran 166 tests`
 
 ## NOTES
-- **8 test cases (current):**
+- **166 total tests** across 8 named test methods (the 8 methods are parameterized into 166 sub-tests via `subTest` and inner loops). The named methods are:
   1. `test_rust_io_streamer` — `ByteStreamer` mmap correctness
   2. `test_rust_binary_packer` — `append_to_binary_file`
   3. `test_bitlinear_quantization` — forward pass on random input

@@ -28,7 +28,7 @@ class buselConfig:
     use_moe: bool = True
     n_shared: int = 2
     n_routed: int = 4
-    top_k: int = 2
+    top_k: int = 1
     d_c: int = 128
     # Training
     micro_batch_size: int = 16
@@ -132,7 +132,7 @@ shpak:
   use_moe: true
   n_shared: 2
   n_routed: 4
-  top_k: 2
+  top_k: 1
   aux_loss_coeff: 0.01
   z_loss_coeff: 0.001
   lr: 0.002

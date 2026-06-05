@@ -102,19 +102,18 @@ The BitLinear STE (`x + (round(x/Δ)·Δ - x).detach()` in forward) handles the 
 
 ### Stage 8: Hybrid Muon step
 
-This is the most algorithmically interesting step. Each parameter goes through **either** Muon (orthogonalized momentum) **or** AdamW depending on its shape:
+This is the most algorithmically interesting step. Each parameter goes through **either** LOTUS+Muon (rank-8 factorised Muon momentum, orthogonalized) **or** AdamW depending on its shape, then further subdivided by **layer type** for decoupled per-layer LR:
 
 ```python
 # training/optimizer.py
-@register("optimizer", "hybrid_muon_adamw")
+@register("optimizer", "lotus_muon")
 class buselOptimizerEngine:
-    def step(self, model):
-        for name, p in model.named_parameters():
-            opt = self.muon_opt if p.dim() >= 2 and "embed" not in name else self.adamw_opt
-            opt.step(p, grad=p.grad)
+    def step(self):
+        for sub_group, opt in self.subgroups.items():
+            opt.step()  # Muon for attn/ffn, AdamW for norm/mtp/embed/router
 ```
 
-The exact routing rule is in [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md). The short version: **2D projection params get Newton-Schulz orthogonalization, everything else gets AdamW.**
+The exact routing rule is in [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md). The short version: **2D projection params get LOTUS+Muon (rank-8 factorised, ~85× less optimizer state than full Muon), everything else gets AdamW, and the 6 layer-type sub-groups (attn / ffn / mtp / norm / embed / router) each get their own LR multiplier.**
 
 ### Stage 9: AutoPilot adjustments
 

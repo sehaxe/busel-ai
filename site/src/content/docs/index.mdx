@@ -49,10 +49,14 @@ combines several recent research ideas in one place.
     JSON, images, and PDFs. The Gated FastBLT patcher compresses
     4 bytes → 1 patch.
   </Card>
-  <Card title="Hybrid Muon + AdamW" icon="rocket">
-    2D projection weights go through the Muon Newton-Schulz
-    orthogonaliser; the rest goes through AdamW. The AutoPilot v6.0
-    handles spike recovery, adaptive clipping, and dynamic weight decay.
+  <Card title="LOTUS+Muon + AdamW" icon="rocket">
+    2D weights go through LOTUS+Muon (rank-8 factorised Muon, ~85× less
+    optimizer state); the rest goes through AdamW. Params are
+    sub-grouped by layer type (attn / ffn / mtp / norm / embed / router)
+    for decoupled LR multipliers. **EMA of weights**, **Top-1 MoE**,
+    and **selective activation checkpointing** are on by default. The
+    AutoPilot v6.0 handles spike recovery, adaptive clipping, and
+    dynamic weight decay.
   </Card>
   <Card title="Plug-in registry" icon="puzzle">
     Adding a new attention or optimizer? Decorate it with

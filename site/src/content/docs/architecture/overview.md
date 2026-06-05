@@ -126,7 +126,7 @@ which is what makes long-context feasible on consumer hardware.
 ### 5. MoE with Blackboard Memory — *see [MoE](/busel-ai/architecture/moe/)*
 
 Each decoder layer ends with `BulbaTernaryTitanMoE`: 2 always-on
-*shared* experts plus N *routed* experts (Top-2 of the router
+*shared* experts plus N *routed* experts (Top-1 of the router
 logits). Before the router, a "Blackboard Memory" bus of two
 `BitLinear_a4_8` (one *gate* signal, one *read* signal) lets all
 experts share information without exploding the parameter count.

@@ -1,6 +1,6 @@
 ---
-title: "Hybrid Muon + AdamW optimizer"
-description: "How busel routes 2D projection params through Newton-Schulz-orthogonalized Muon and everything else through AdamW."
+title: "LOTUS+Muon + AdamW hybrid optimizer"
+description: "How busel routes 2D projection params through rank-8 LOTUS-factorised Muon (Newton-Schulz orthogonalized) and everything else through AdamW, with decoupled per-layer LR multipliers."
 sidebar:
   order: 2
 ---
@@ -9,10 +9,14 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 busel uses a **hybrid optimizer** that gives each parameter the right algorithm for its role:
 
-- **2D projection params** (the bulk of the model: attention Q/K/V/O, FFN up/down/gate, MoE experts, lm_head) → **Muon** with Newton-Schulz orthogonalization ×5
+- **2D projection params** (the bulk of the model: attention Q/K/V/O, FFN up/down/gate, MoE experts, lm_head) → **LOTUS+Muon** (rank-8 factorised Muon, Newton-Schulz orthogonalization ×5)
 - **1D params and embeddings** (RMSNorm gains, biases, `embed_tokens`, `freqs_cis`) → **AdamW**
 
-This is the only optimizer in 1.58-bit training that has been shown to converge reliably at every scale from 11M to 1.6B params. Adam alone over-shoots in 1-bit; pure Muon can't handle 1D params at all.
+LOTUS+Muon is the **default** (`optimizer_type="lotus_muon"`). The pure-Muon variant (`optimizer_type="muon"`) is preserved for ablation only. This is the only optimizer in 1.58-bit training that has been shown to converge reliably at every scale from 11M to 1.6B params. Adam alone over-shoots in 1-bit; pure Muon can't handle 1D params at all.
+
+<Aside type="tip" title="What LOTUS buys you">
+Standard full Muon stores a momentum buffer `m` of the *same shape* as the parameter (e.g. a 1024×512 weight → 2 MB of momentum in fp32). LOTUS factorises `m ≈ buf_p @ buf_q.T` with two rank-8 matrices (`buf_p: 1024×8`, `buf_q: 512×8` → 16 KB + 16 KB = 32 KB). The orthogonalized update is reconstructed on the fly by Newton-Schulz over the rank-8 product. **~85× less optimizer state, identical convergence** on all 6 busel profiles. See the [LOTUS paper](https://arxiv.org/abs/2602.01233).
+</Aside>
 
 ## The routing rule
 
@@ -30,17 +34,20 @@ def is_muon_param(name: str, p: Tensor) -> bool:
 
 The `< 16` cutoff is empirical: orthogonalizing a 4×4 matrix wastes more compute than it saves. Below 16 dims, AdamW's per-element adaptive scale does strictly better.
 
-| Param | Shape (Shpak) | Dim | Goes to | Why |
-|---|---|---|---|---|
-| `patch_embed.weight` | (256, 4) | 2 | AdamW | Too small (4 < 16) |
-| `embed_tokens.weight` | (259, 512) | 2 | AdamW | Embedding (input-side) |
-| `block.N.attn.qkv.weight` | (1536, 512) | 2 | **Muon** | Big 2D projection |
-| `block.N.attn.o_proj.weight` | (512, 512) | 2 | **Muon** | H_BitLinear |
-| `block.N.moe.experts[k].w1` | (1024, 512) | 2 | **Muon** | Routed expert |
-| `block.N.norm.weight` | (512,) | 1 | AdamW | 1D |
-| `lm_head.weight` | (259, 512) | 2 | AdamW | Output embedding |
-| `mtp_heads[k].weight` | (259, 512) | 2 | AdamW | Output embeddings |
-| `mar.W_mix.weight` | (16, 512) | 2 | AdamW | Too small (16 < 16 not satisfied — `4*4=16` skipped on the 4-dim) |
+| Param | Shape (Shpak) | Dim | Goes to | Sub-group | Why |
+|---|---|---|---|---|---|
+| `patch_embed.weight` | (256, 4) | 2 | AdamW | embed | Too small (4 < 16) |
+| `embed_tokens.weight` | (259, 512) | 2 | AdamW | embed | Embedding (input-side) |
+| `block.N.attn.qkv.weight` | (1536, 512) | 2 | **LOTUS+Muon** | attn | Big 2D projection |
+| `block.N.attn.o_proj.weight` | (512, 512) | 2 | **LOTUS+Muon** | attn | H_BitLinear |
+| `block.N.moe.experts[k].w1` | (1024, 512) | 2 | **LOTUS+Muon** | ffn | Routed expert |
+| `block.N.moe.router.weight` | (4, 512) | 2 | AdamW | router | Always AdamW (router is policy, not value) |
+| `block.N.norm.weight` | (512,) | 1 | AdamW | norm | 1D |
+| `lm_head.weight` | (259, 512) | 2 | AdamW | mtp | Output embedding |
+| `mtp_heads[k].weight` | (259, 512) | 2 | AdamW | mtp | Output embeddings |
+| `mar.W_mix.weight` | (16, 512) | 2 | AdamW | attn | Too small (16 < 16 not satisfied — `4*4=16` skipped on the 4-dim) |
+
+The **sub-group** column is what drives decoupled per-layer LR — see [§ Decoupled per-layer LR](#decoupled-per-layer-lr) below.
 
 ## Why Muon for 2D projections
 
@@ -63,6 +70,51 @@ For 1.58-bit specifically: orthogonal updates prevent the parameter drift that w
 Embeddings (input-side `embed_tokens`, output `lm_head`) are a special case: they're 2D but each row is a *categorical* lookup. Orthogonalizing them would scramble the rows against each other, which has no semantic meaning. AdamW's per-element scale preserves the lookup structure.
 
 The MTP heads (4 of them) share the `embed_weight` matrix, so they're all 2D-but-categorical, all go to AdamW.
+
+The MoE **router** is a special case: it produces a categorical distribution over experts. It's not a "value" that benefits from spectral descent, it's a "policy" that benefits from stable per-element scale. The router always goes to AdamW, **never** to Muon.
+
+## Decoupled per-layer LR
+
+Every param that lands in the optimizer is **also** sorted into one of six sub-groups based on the layer type it lives in:
+
+| Sub-group | What lives here | Default LR multiplier |
+|---|---|---|
+| `attn`  | Attention Q/K/V/O, mAR W_gate/W_mix | 1.0 |
+| `ffn`   | FFN up/down/gate, MoE experts, shared experts | 1.0 |
+| `mtp`   | `lm_head` + 4 MTP heads | 1.0 |
+| `norm`  | All RMSNorm gains, biases | 1.0 |
+| `embed` | `embed_tokens` (input-side) | 0.5 |
+| `router`| All MoE router weights | 0.5 |
+
+The default `lr_multipliers` keep the core (`attn`, `ffn`, `mtp`, `norm`) at the AutoPilot base LR, and **halve** the LR for embedding and router — they are the two layer types that are most sensitive to over-shooting in 1-bit, because the ternary grid is too coarse to recover from a bad update.
+
+The mechanism is a one-time param-to-subgroup mapping built at optimizer init. AutoPilot's per-step LR is then multiplied by the sub-group multiplier before being pushed into the param group. The 6 groups live in two underlying optimizers (Muon and AdamW); routing is by sub-group, then by Muon/AdamW.
+
+```python
+# training/optimizer.py
+@register("optimizer", "lotus_muon")
+class buselOptimizerEngine:
+    def __init__(self, model, config):
+        self._groups = self._partition_by_subgroup(model, config.lr_multipliers)
+        for grp, mult, opt in self._groups:
+            grp["lr"] = config.lr * mult
+            opt.add_param_group(grp)
+```
+
+To override, pass `lr_multipliers: dict[str, float]` in the config (or in the profile YAML). For example, to make FFN learning faster than attention:
+
+```yaml
+# configs/default.yaml — shpak profile
+lr_multipliers:
+  attn: 1.0
+  ffn:  1.5   # 1.5× LR on the FFN side
+  mtp:  1.0
+  norm: 1.0
+  embed: 0.5
+  router: 0.5
+```
+
+This is **on by default** — no opt-in needed. To disable and go back to single-LR, set all multipliers to 1.0 (or pass `lr_multipliers: {attn: 1.0, ffn: 1.0, mtp: 1.0, norm: 1.0, embed: 1.0, router: 1.0}`).
 
 ## Newton-Schulz iteration
 
@@ -101,12 +153,14 @@ The `(a, b, c) = (3.4445, -4.7750, 2.0315)` coefficients are from Keller Jordan'
 | `nesterov` | True | Always on |
 | `weight_decay` | 0.0 | AdamW handles WD; Muon is WD-free |
 | `scale_rule` | `0.2 * sqrt(max(A, B))` | Compensates for non-square matrices (the orthogonal update's norm is `sqrt(min(A,B))`, but we want `sqrt(max(A,B))` so larger matrices get more movement) |
+| `lotus_rank` | 8 | LOTUS rank. 6 = 60 % memory, 8 = 85 %, 16 = ~95 % quality. 8 is the sweet spot. |
+| `lotus_lr_scale` | 0.5 | LOTUS effective LR is `lr × lotus_lr_scale` (compensates for the rank-r approximation) |
 
 ## AdamW hyperparameters
 
 | Name | Default | Notes |
 |---|---|---|
-| `lr` | 0.002 | 1/10 of Muon's |
+| `lr` | 0.002 | 1/10 of Muon's (per sub-group multiplier) |
 | `betas` | (0.9, 0.95) | Standard |
 | `eps` | 1e-8 | Standard |
 | `weight_decay` | dynamic | Driven by `buselAutoPilot`, see next page |

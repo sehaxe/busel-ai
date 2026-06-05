@@ -270,7 +270,7 @@ uv run python cli.py profile --profile shpak
 
 **Symptom:** During MoE forward, the stack of expert outputs fails.
 
-**Root cause:** The Top-2 router selected different numbers of tokens for different experts (capacity factor issue).
+**Root cause:** The Top-1 router selected different numbers of tokens for different experts (capacity factor issue).
 
 **Fix:** Make sure `capacity_factor=1.0` (no dropping). If you're using a custom MoE, check that all experts process the same number of tokens.
 

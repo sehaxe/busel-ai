@@ -18,7 +18,7 @@ busel's custom profiler bypasses this entirely — it doesn't use Metal at all. 
 ## Quick start
 
 ```bash
-# 30-second profile run on shpak
+# 30-second profile run on shpak (defaults: LOTUS+Muon, top_k=1, ckpt every=2)
 uv run python cli.py profile --profile shpak
 
 # 5-minute deep profile
@@ -26,7 +26,18 @@ uv run python cli.py profile --profile shpak --duration 300 --warmup 60
 
 # Profile a specific phase
 uv run python cli.py profile --profile shpak --phase training --steps 100
+
+# Ablation: pre-LOTUS, pre-Top-1 (re-run with old defaults)
+uv run python tests/profiler_run.py --optimizer-type muon --top-k 2
+
+# Direct invocation (bypasses the CLI wrapper, gives you all flags)
+uv run python tests/profiler_run.py --help
 ```
+
+`tests/profiler_run.py` accepts `--optimizer-type {muon,lotus_muon}` (default `lotus_muon`),
+`--top-k N` (default `1`), `--backend {torch,kineto}` (default `torch`), `--steps N` (step-count
+mode), and `--no-grad-ckpt` (disable selective ckpt). Use this for A/B comparisons — the CLI
+`profile` subcommand only exposes the subset needed for daily use.
 
 The CLI subcommand shells out to `tests/profiler_run.py` via `tools/orchestrator.py`.
 

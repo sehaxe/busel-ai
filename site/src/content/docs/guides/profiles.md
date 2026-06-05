@@ -112,7 +112,7 @@ my_profile:
     n_heads: 4
     expert_hidden: 512
     num_experts: 4
-    top_k: 2
+    top_k: 1
     vocab_size: 259      # DO NOT change this — vocab=259 is byte-level
   data:
     data_path: "data_train"

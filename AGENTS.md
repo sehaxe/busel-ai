@@ -1,85 +1,124 @@
 # PROJECT KNOWLEDGE BASE — busel (Бусел)
 
-**Generated:** 2026-06-03 17:23 UTC
-**Commit:** d731f9a
+**Last updated:** 2026-06-05
 **Branch:** main
+**Test count:** 166 (unittest, no pytest)
+
+## [PRIORITY] — read first
+1. **Performance + LOC** — when in doubt, the faster + shorter option wins.
+2. **Stage of project: EARLY.** Compatibility is NOT a constraint. Breaking changes are fine.
+3. **Ship working code > elegant code.** We iterate on what runs, refactor later.
+4. **Code is small** — entire model + training + data is ~3,000 LoC Python + ~140 LoC Rust. Do not add files without justification.
 
 ## OVERVIEW
-**busel v5.1** — Sovereign 1-bit (1.58b) Any-to-Text LLM with hybrid linear attention (GDN-2/MLA), mAR (Manifold Constrained Attention Residuals), MoE, byte-level patching (no BPE), and MTP-4. Targets consumer HW (RTX 5060 Ti 16GB / Apple Silicon). Hybrid Python + Rust (PyO3 via maturin). Trained/inferred via CLI. Docs site is Astro+Starlight (Bun).
+**busel v5.7.1+** — Sovereign 1-bit (1.58b) Any-to-Text LLM. Hybrid Python + Rust (PyO3 via maturin). Targets consumer HW (RTX 5060 Ti 16 GB / Apple Silicon). Trained via CLI, documented in `site/` (Astro+Starlight, Bun).
+
+**Architecture:** 1.58-bit ternary weights · byte-level vocab=326 · `stride=4` patching · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope) · **Top-1 MoE** with Blackboard Memory · MTP-4 heads · **LOTUS+Muon** (rank-8 factorised) + AdamW hybrid · **EMA of weights** · **selective activation checkpointing** (every=2) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval, v5.5) · **REPL tool executor** (v5.7) · **compile-safe checkpoint loader** (v5.7.1).
 
 ## STRUCTURE
 ```
 busel-ai/
-├── model/              # BitNet v2 architecture (patching/layers/attention/routing/backbone)
-├── training/           # Muon+AdamW hybrid optimizer, AutoPilot v6.0, MTP-4 loss
-├── data/               # Stream-interleaving token loader (list[int], Rust mmap or Python fallback)
-├── multimodal/         # 🛰️ Any-to-token encoders (image, video, audio, PDF, docx) — cv2 fast path
-├── ui/                 # 🎵 Teto Vocaloid emoticon avatar + max-beauty rich terminal helpers
-├── busel_registry.py   # 🛸 Plug-in extension-point registry (attention/optimizer/encoder/...)
-├── busel_logging.py    # 📚 Structured JSONL event stream (checkpoints/busel.log.jsonl)
-├── tools/              # Typer CLI, data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (77 tests) + ultra-stable profiler v2.0
-├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
-├── configs/            # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest profiles
-├── site/               # Astro+Starlight docs (GitHub Pages)
-├── checkpoints/        # *.pt training state + busel.log.jsonl (gitignored)
-├── data_train/         # Raw training data (gitignored)
-├── train.py            # Cybernetic training orchestrator (curriculum + Chinchilla auto-planner)
-├── cli.py              # Typer entrypoint (all user commands)
-└── pyproject.toml      # uv-managed, maturin build backend
+├── model/             # BitNet v2 architecture (layers/attention/routing/backbone/patching/checkpoint)
+├── training/          # LOTUS+Muon+AdamW hybrid, EMA, AutoPilot v6.0, MTP-4 loss, **stages/** (v5.5+)
+├── data/              # Stream-interleaving token loader (list[int], Rust mmap or Python fallback)
+├── multimodal/        # Any-to-token encoders (image/video/audio/PDF/docx) + 70-token special vocab
+├── ui/                # Teto Vocaloid emoticon + rich terminal helpers
+├── tools/             # Typer CLI (orchestrator, data_manager, plotter, inference, **tool_executor** v5.7)
+├── tests/             # unittest suite (166) + ultra-stable profiler v2.1
+├── busel_rust_io/     # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
+├── configs/           # default.yaml — Shpak/Zubr/Chyzh/MicroTest/QuickTest/Validation profiles
+├── site/              # Astro+Starlight docs (GitHub Pages)
+├── checkpoints/       # *.pt + busel.log.jsonl (gitignored)
+├── data_train/        # Raw training data (gitignored)
+├── busel_registry.py  # 🛸 Plug-in extension-point registry (attention/optimizer/encoder/autopilot/curriculum/loss/stage)
+├── busel_logging.py   # 📚 Structured JSONL event stream
+├── train.py           # Legacy training orchestrator (v5.5+ also has cli.py pipeline)
+├── cli.py             # Typer entrypoint (root-level — all user commands)
+└── pyproject.toml     # uv-managed, maturin build backend
 ```
+
+## DEFAULTS (buselPretrainConfig — single source of truth)
+All flipped on by default. No opt-out. The whole arch is better for it.
+
+| Field | Default | Was | Why |
+|---|---|---|---|
+| `optimizer_type` | `"lotus_muon"` | `"muon"` | Rank-8 LOTUS factorises Muon momentum — **~85× less optimizer state** |
+| `top_k` (MoE) | `1` | `2` | 1 of N experts per token. **−35 % routed FFN FLOPs**, no quality loss |
+| `use_ema` | `True` | `False` | EMA shadow of weights. **10-15 % fewer steps to same loss** |
+| `ema_decay` | `0.999` | — | Standard EMA decay |
+| `lotus_rank` | `8` | — | LOTUS rank-r. 6 = 60 % memory, 8 = 85 %, 16 = 95 % quality |
+| `lotus_lr_scale` | `0.5` | — | LOTUS effective LR = `lr × lotus_lr_scale` |
+| `lr_multipliers` | `{attn:1.0, ffn:1.0, mtp:1.0, norm:1.0, embed:0.5, router:0.5}` | `None` (single LR) | Decoupled per-layer LR — embed/router are noise-sensitive in 1-bit |
+| `grad_ckpt_every` | `2` | `0` (off) | Selective activation checkpointing — **halves activation memory** at <5 % step-time cost |
+
+All 6 profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyzh, shpak, zubr) inherit these defaults. The CLI `tests/profiler_run.py` defaults are aligned.
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |------|----------|-------|
-| Add new model layer | [model/](file:///home/sehaxe/busel-ai/model/AGENTS.md) | Must use BitLinear_a4_8 / H_BitLinear |
-| Modify training loop | [train.py](file:///home/sehaxe/busel-ai/train.py) + [training/](file:///home/sehaxe/busel-ai/training/AGENTS.md) | Cybernetic curriculum is here |
-| Add CLI command | [cli.py](file:///home/sehaxe/busel-ai/cli.py) → register in `tools.orchestrator` or `tools.data_manager` | Typer-based |
-| Modify data loader | [data/pipeline.py](file:///home/sehaxe/busel-ai/data/pipeline.py) | Prefers Rust `ByteStreamer`; Python fallback exists; auto-dispatches to multimodal encoders |
-| Add a new modality | [multimodal/](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) → new `@register("encoder", "...")` class | Must return `list[int]` with values in `[0, 259)` |
-| Tune model size | [configs/default.yaml](file:///home/sehaxe/busel-ai/configs/default.yaml) | Profile: shpak/zubr/chyzh/micro_test/quick_test |
-| Profile step perf | [tests/profiler_run.py](file:///home/sehaxe/busel-ai/tests/profiler_run.py) | No torch.profiler (MPS hangs) |
-| Edit docs site | [site/](file:///home/sehaxe/busel-ai/site/) | `bun install && bun run build` |
-| Add a new attention/optimizer/... | `@register("kind", "name")` in [busel_registry.py](file:///home/sehaxe/busel-ai/busel_registry.py) | Plug-in point; auto-registered on import |
-| Customise terminal UX | [ui/](file:///home/sehaxe/busel-ai/ui/) | Teto emoticon + rich panels, spinners, progress bars, trees |
-| Consume training event stream | [busel_logging.py](file:///home/sehaxe/busel-ai/busel_logging.py) | `checkpoints/busel.log.jsonl` — one JSON per event |
+| Add new model layer | [model/](file:///home/sehaxe/busel-ai/model/AGENTS.md) | Must use `BitLinear_a4_8` or `H_BitLinear` (no raw `nn.Linear`) |
+| Modify training loop | [training/](file:///home/sehaxe/busel-ai/training/AGENTS.md) | Pretrain is `buselPretrainStage`; SFT/DPO/eval in `training/stages/` |
+| Add CLI command | [tools/](file:///home/sehaxe/busel-ai/tools/AGENTS.md) | Typer `@app.command`; subprocess pattern, never `import train` |
+| Modify data loader | [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) | Prefers Rust `ByteStreamer`; Python fallback exists |
+| Add a new modality | [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) | `@register("encoder", ...)`; return `list[int]` in `[0, 326)` |
+| Tune model size | [configs/default.yaml](file:///home/sehaxe/busel-ai/configs/default.yaml) | 6 profiles: shpak / zubr / chyzh / micro_test / quick_test / validation |
+| Profile step perf | [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) | No `torch.profiler` (MPS hangs); use `tests/profiler_run.py` |
+| Edit docs site | [site/AGENTS.md](file:///home/sehaxe/busel-ai/site/AGENTS.md) | Bun + Starlight; 7 stable URL sections |
+| Add attention/optimizer/etc. | [busel_registry.py](file:///home/sehaxe/busel-ai/busel_registry.py) | `@register("kind", "name")` — auto-discovered, no switch stmt |
+| Customise terminal UX | [ui/](file:///home/sehaxe/busel-ai/ui/) | Teto emoticon + rich panels/spinners/trees |
+| Consume event stream | [busel_logging.py](file:///home/sehaxe/busel-ai/busel_logging.py) | `checkpoints/busel.log.jsonl` — one JSON per event |
+| Add a new pipeline stage | [training/AGENTS.md](file:///home/sehaxe/busel-ai/training/AGENTS.md) | `@register_stage("name")` in `training/stages/<name>.py` |
+| Load a checkpoint | [model/checkpoint.py](file:///home/sehaxe/busel-ai/model/checkpoint.py) | `load_state_dict_safely(model, sd)` — never raw `load_state_dict` |
 
-## ARCHITECTURE (1-bit LLM)
-- **Weights:** 1.58-bit ternary `{-1, 0, +1}` via STE (`BitLinear_a4_8` in [model/layers.py](file:///home/sehaxe/busel-ai/model/layers.py))
-- **Tokens:** Raw UTF-8 bytes (vocab=259), `stride=4` conv → patches (`StridedFastBLTPatcher` in [model/patching.py](file:///home/sehaxe/busel-ai/model/patching.py))
-- **Attention:** 3:1 GDN-2 (linear, O(1) cache) : MLA (latent KV, d_c=128)
-- **Residuals:** mAR — Birkhoff-polytope projection (Sinkhorn-Knopp ×3) over all previous layers
-- **MoE:** 2 shared + N routed (Top-2), Blackboard Memory bus to prevent collapse
-- **Heads:** MTP-4 (predict t+1, t+2, t+3, t+4) with decaying loss weights [1.0, 0.5, 0.25, 0.125]
-- **Optimizer:** Hybrid Muon (2D `proj` params, Newton-Schulz ×5) + AdamW (rest)
-- **Curriculum:** 1024 → 2048 → 4096 ctx warmup; AutoPilot v6.0 spike dampening
+## DO
+- **Use the registry** for any plug-in point (attention, optimizer, encoder, autopilot, curriculum, loss, stage). `@register("kind", "name")` — no central switch statements.
+- **Run 166 tests before pushing:** `uv run python -m unittest tests.test_suite` — all must pass.
+- **Update README.md AND site/ docs** when a feature changes. The two-track rule: code change → README change → site/ change. Site/ is the human-friendly tour, README is the elevator pitch.
+- **Match existing patterns.** Sample 2-3 similar files before adding a new one. Busel is small — patterns are visible at a glance.
+- **Profile with `tests/profiler_run.py`** before claiming a speedup. Numbers, not vibes.
+- **Use `uv run python cli.py`** — never `python cli.py` (maturin ext needs venv).
+- **Add new files sparingly.** Default bias: extend an existing module. A 3,000 LoC codebase doesn't need more files.
+- **Document anti-patterns in per-module AGENTS.md** when you discover one. The DO/NEVER list is the institutional memory.
+- **Subprocess for train.py, direct call for everything else.** `tools/orchestrator.py` shells out; `model/`, `training/`, `data/`, `multimodal/` are in-process.
+- **Single source of truth for checkpoint loading:** `model.checkpoint.load_state_dict_safely`. Four cross-config cases (compiled↔eager, save↔load) — the helper handles all of them.
+- **Keep tests in `tests/test_suite.py`.** Never spawn a second test file. The suite is one big `unittest.TestCase` class.
 
-## CONVENTIONS
-- **Build:** `uv` for Python+deps, `maturin develop --release` for Rust ext, `bun` for site
-- **Device:** Auto-detect (CUDA → MPS → CPU). MPS uses `bf16`/`fp16`, CUDA uses `bf16`
-- **Stability:** Seed 42, TF32 on, cuDNN benchmark on, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-- **NVTX:** All major ops wrapped in `nvtx_range_push/pop` for profiling (CUDA only)
-- **Env vars:** `DEFAULT_PROFILE`
-- **Config loading:** profiles from `configs/default.yaml`; `max_steps`/`warmup_steps` support `"auto"`
-- **License:** CC BY-NC-SA 4.0 (NC clause — NO commercial use)
-
-## ANTI-PATTERNS (THIS PROJECT)
-- **NEVER** use BPE/tokenizers — model is byte-level (vocab=259 only)
-- **NEVER** add new `nn.Linear` to model — must use `BitLinear_a4_8` or `H_BitLinear`
-- **NEVER** checkpoint `*.pt < 10MB` — auto-rejected as corrupted by `tools/inference.py`
-- **NEVER** use `torch.profiler` on macOS — known to hang; use `tests/profiler_run.py` instead
-- **NEVER** set `PYTORCH_MPS_HIGH_WATERMARK_RATIO` > 0.0 — `train.py` enforces 0.0
-- **NEVER** mix `H_BitLinear` for non-`o_proj` outputs — reserved for output projection per BitNet v2 spec
-- **NEVER** bypass `BitLinear_a4_8` `is_intermediate=True` path in FFN experts — needed for INT8 TopK quantization
-- **NEVER** commit `data_train/`, `checkpoints/`, `.env`, `Cargo.lock`, `uv.lock`
+## NEVER
+- **BPE / tokenizers** — model is byte-level, vocab=326 (256 raw bytes + 70 plug-in specials). See [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) for the 70-token breakdown.
+- **Raw `nn.Linear` in model** — must use `BitLinear_a4_8` or `H_BitLinear`. Breaks the 1.58-bit guarantee.
+- **`H_BitLinear` for non-`o_proj`** — BitNet v2 spec mandates it for output projection only (massive-activation mitigation).
+- **Disable any default in [DEFAULTS](#defaults-buselpretrainconfig--single-source-of-truth) without measuring** — LOTUS+Muon, EMA, Top-1, decoupled LR, selective ckpt all help. Re-enabling them is the right move, not disabling.
+- **`torch.profiler` on macOS** — known to hang; use `tests/profiler_run.py` (`time.perf_counter` + `cuda.max_memory_allocated`).
+- **`model.load_state_dict(sd)` directly** — always `load_state_dict_safely(model, sd)`. Direct loads fail when saved with `--compile` (the default). The helper strips `_orig_mod.` and unwraps `OptimizedModule`.
+- **Drop the `File` handle in `ByteStreamer`** — macOS mmap segfaults without it. Comment in `busel_rust_io/lib.rs:13` explains.
+- **`cargo build`** — only `uv run maturin develop --release` produces a working Python ext.
+- **PyO3 `unsafe` outside `Mmap::map`** — keep memory safety intact.
+- **`import train` from `orchestrator.py`** — always `subprocess.run([sys.executable, "train.py", ...])`. The legacy `train.py` is reachable; the new pipeline is via `cli.py pipeline`.
+- **`python-dotenv`** — project has its own `load_env()` parser in `tools/orchestrator.py`.
+- **`assertTrue(x == y)` in tests** — use `assertEqual`. Better failure messages.
+- **`nn.Embedding` for tokens** — use `nn.Parameter(torch.randn(vocab_size(), d_byte))`. Size auto-tracks the special-token registry.
+- **Hardcoded vocab IDs** — import from `multimodal.special_tokens`. IDs are auto-allocated and may shift when tokens are added/disabled.
+- **Hardcoded `259` in embedding shape** — use `vocab_size()`. (Old constant from before the 70-token expansion.)
+- **Softmax on mAR logits** — Sinkhorn-Knopp projects to the Birkhoff polytope (doubly-stochastic), not softmax.
+- **Muon on 1D params** (norms, biases) — `buselOptimizerEngine` filters them.
+- **Muon on anything with `router` or `embed` in name** — `_MUON_EXCLUDE = ("router", "embed")`. Routers are policy, not value; embed is categorical.
+- **Add `@torch.compile` to the whole `step()`** — only to inner Newton-Schulz function. Outer compile breaks the mAR FIFO buffer aliasing.
+- **Change `momentum=0.95` of Muon** — spec is brittle; verify on validation profile if you must.
+- **`F.cross_entropy` on CUDA when Liger is available** — 2-3× slower. Liger auto-falls back to vanilla.
+- **`max_steps < warmup_steps` in any preset** — produces NaN spikes.
+- **Skip the `Profile` step in `autopilot`** — HW profiling catches VRAM/RNG bugs early.
+- **Execute a model-emitted tool call without user confirmation** — `tools/tool_executor.py:interactive_confirm` is the gate. `/auto on` is a per-session opt-in only.
+- **Shrink `config.vocab_size` below `multimodal.special_tokens.vocab_size()`** — `buselModel.__init__` raises `ValueError`. Catches stale YAML.
+- **Commit `data_train/`, `checkpoints/`, `.env`, `Cargo.lock`, `target/`** — all gitignored. The `.gitignore` is the single source of truth for what to never commit; do not duplicate that list in a NEVER rule.
+- **Commit without explicit user request** — always wait for `commit` / `push` / `merge` instruction.
 
 ## UNIQUE STYLES
-- **Emoji-prefixed module headers:** Every Python file starts with `"""🦩 / ⚙️ / 💡 / 📚 / 🤖 / 🎯 / 🛸 ..."""` docstring
-- **Russian-language comments:** Heavy use of Cyrillic comments throughout (technical)
-- **`busel*` prefix:** All custom classes (`buselModel`, `buselOptimizerEngine`, `buselLossEngine`, `buselAutoPilot`, `buselOmnivoreTextExtractor`)
-- **`cfg.profile` in checkpoint dict:** Every saved `.pt` carries its profile name for auto-detect
-- **Rust parallel iterators:** `rayon::prelude::*` for `ternary_matmul_cpu` (no GPU on inference)
-- **Subprocess CLI orchestration:** `tools/orchestrator.py` shells out to `train.py`, `profiler_run.py` via `subprocess.run`
+- **Emoji-prefixed module headers:** every Python file starts with `"""🦩 / ⚙️ / 💡 / 📚 / 🤖 / 🎯 / 🛸 ..."""` docstring.
+- **Russian-language comments:** heavy Cyrillic throughout (technical).
+- **`busel*` prefix** on all custom classes (`buselModel`, `buselOptimizerEngine`, `buselLossEngine`, `buselAutoPilot`, `buselPretrainStage`, …).
+- **`cfg.profile` in checkpoint dict** — every saved `.pt` carries its profile name for auto-detect.
+- **Rust parallel iterators** (`rayon::prelude::*`) for `ternary_matmul_cpu` (no GPU on inference).
+- **Subprocess CLI orchestration** in `tools/orchestrator.py` — shells out to `train.py` and `tests/profiler_run.py` via `subprocess.run`.
 
 ## COMMANDS
 ```bash
@@ -94,26 +133,34 @@ uv run python cli.py download-all --preset shpak
 
 # Train
 uv run python cli.py autopilot --profile shpak   # one-click: data + profiler + train
-uv run train.py --profile shpak                   # manual
+uv run train.py --profile shpak                   # manual (legacy)
+uv run python cli.py pipeline --name pretrain-only # new (v5.5+)
 uv run python cli.py profile                      # hardware profiler only
 
 # Docs
 cd site && bun install && bun run build           # GitHub Pages deploy
 ```
 
-## NOTES
-- **Checkpoint size guard:** Reject `<10MB` `.pt` (corrupt) in `tools/inference.py`
-- **Target bit size:** 11MB (Shpak) / 30MB (Zubr) — 1.58-bit weights compress ~10x vs fp16
-- **Metrics log:** `checkpoints/metrics.jsonl` (one JSON per step, for ETA calc)
-- **Event stream:** `checkpoints/busel.log.jsonl` — structured JSON for downstream (TG bot, web)
-- **Registry kinds:** `attention` (`gdn2`, `mla`), `optimizer` (`muon`, `hybrid_muon_adamw`) — add more via `@register("kind", "name")` decorator
-- **Teto emoticon cycle:** 12-frame kawaii idle loop (e.g. `ξ(｡•̀ᴗ-)✧ξ`, `▼ᗜˬᗜ▼`, `ξ(≧◡≦)ξ`) — see `ui.teto.frames()`
-- **macOS Rust flag:** `.cargo/config.toml` uses `link-arg=-undefined,dynamic_lookup` for macOS
-- **License:** Commercial use requires written permission from `sehaxe`
+## PER-MODULE RULES
+This file is the project-level summary. Module-specific rules, anti-patterns, and the per-class API live in per-module AGENTS.md:
 
-## UI / REGISTRY / LOGGING ARCHITECTURE
-- **`ui/teto.py`** — Kasane Teto 12-frame emoticon cycle (`(ᗜˬᗜ)`, `ξ(｡•̀ᴗ-)✧ξ`, `ξ(≧◡≦)ξ`, `▼ᗜˬᗜ▼`, …). States: `idle`, `blink`, `smile`, `think`, `wave`, `training`, `done`.
-- **`ui/animation.py`** — `teto_animate()` context manager wrapping `rich.live.Live`; state-coloured panel (green idle → cyan think → yellow training → gold done). No-op in non-TTY / CI / when rich absent.
-- **`ui/cli.py`** — Rich helpers: `gradient_text()`, `animated_header()`, `spinner()`, `progress_bar()`, `stats_table()`, `project_tree()`, `safe_print()`. All auto-fall back to plain print without rich.
-- **`busel_registry.py`** — `@register(kind, name)` decorator + `get/list_registered/is_registered/unregister/clear_registry` API. Thread-safe, collision-detect, `override=True` opt-in. Use to plug in new attention/optimizer/activation/... when a new paper drops.
-- **`busel_logging.py`** — `JSONFormatter` + `setup_logging()` writing one JSON object per line to `checkpoints/busel.log.jsonl`. Schema: `ts`, `level`, `event`, plus hoisted step fields (`step`, `loss`, `lr`, `aux_loss`, `tokens_per_s`, `vram_mb`) and a freeform `extra` dict. Idempotent — re-running `train.py` appends to the same file.
+- [model/AGENTS.md](file:///home/sehaxe/busel-ai/model/AGENTS.md) — BitLinear, H_BitLinear, GDN-2, MLA, mAR, MoE, MTP, compile-safe checkpoint loader
+- [training/AGENTS.md](file:///home/sehaxe/busel-ai/training/AGENTS.md) — LOTUS+Muon routing, AutoPilot v6.0, loss engine, **stages/ framework** (v5.5)
+- [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) — Rust mmap streamer, Python fallback, multimodal dispatch
+- [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) — 70-token vocab, 6 encoders (image/video/audio/PDF/docx/text)
+- [tools/AGENTS.md](file:///home/sehaxe/busel-ai/tools/AGENTS.md) — Typer CLI, pipeline orchestrator, **REPL tool executor** (v5.7)
+- [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 166-test unittest suite, custom profiler
+- [busel_rust_io/AGENTS.md](file:///home/sehaxe/busel-ai/busel_rust_io/AGENTS.md) — PyO3 extension, mmap safety, Rayon threading
+- [site/AGENTS.md](file:///home/sehaxe/busel-ai/site/AGENTS.md) — Astro+Starlight, build commands, URL structure
+
+## NOTES
+- **Checkpoint size guard:** reject `<10MB` `.pt` (corrupt) in `tools/inference.py`.
+- **Target bit size:** 11 MB (Shpak) / 30 MB (Zubr) — 1.58-bit weights compress ~10× vs fp16.
+- **Metrics log:** `checkpoints/metrics.jsonl` (one JSON per step, for ETA).
+- **Event stream:** `checkpoints/busel.log.jsonl` — structured JSON for downstream (TG bot, web). Events: `training_start`, `model_initialized`, `chinchilla_planned`, `curriculum_upgrade`, `step_complete`, `checkpoint_saved`/`checkpoint_rejected`/`checkpoint_failed`, `emergency_save_requested`, `emergency_checkpoint`, `stage_complete`, `pipeline_start`/`pipeline_complete`, `stage_failed`, `training_complete`, `autopilot`.
+- **Registry kinds:** `attention` (`gdn2`, `mla`), `optimizer` (`muon`, `lotus_muon`, `hybrid_muon_adamw`), `autopilot` (`v6`), `curriculum` (`doubling`), `encoder` (`image`, `video`, `audio`, `pdf`, `docx`, `text`), `loss`, `stage` (`pretrain`, `sft`, `dpo`, `eval`).
+- **Teto emoticon cycle:** 12-frame kawaii idle loop (`(ᗜˬᗜ)`, `ξ(｡•̀ᴗ-)✧ξ`, `ξ(≧◡≦)ξ`, `▼ᗜˬᗜ▼`, …) — see `ui.teto.frames()`. States: `idle`, `blink`, `smile`, `think`, `wave`, `training`, `done`.
+- **macOS Rust flag:** `.cargo/config.toml` uses `link-arg=-undefined,dynamic_lookup` for macOS.
+- **License:** CC BY-NC-SA 4.0 (NC clause — NO commercial use). Contact `sehaxe` for commercial licence.
+- **LOTUS paper:** arXiv:2602.01233. Rank-r factorised Muon momentum.
+- **Muon repo:** github.com/KellerJordan/Muon — original implementation.

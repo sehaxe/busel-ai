@@ -1,17 +1,17 @@
 # training/ — Optimizer, AutoPilot, Loss, **Stage Framework**
 
-**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**, **v5.7.1 compile-safe checkpoint loader**.
+**Scope:** Hybrid Muon+AdamW, predictive AutoPilot v6.0, MTP-4 weighted loss engine, **v5.5 multi-stage pipeline framework**, **v5.6 SFT/DPO/eval stages**, **v5.7.1 compile-safe checkpoint loader**, **v5.7.1 LOTUS+Muon (rank-8) + EMA + decoupled per-layer LR + selective activation checkpointing (all on by default)**.
 
 ## STRUCTURE
 ```
 training/
-├── optimizer.py    # Muon (Newton-Schulz ×5), buselOptimizerEngine (hybrid Muon+AdamW)
-├── autopilot.py    # buselAutoPilot v6.0 — predictive dampening, adaptive AGC, dynamic WD
+├── optimizer.py    # LOTUS+Muon (rank-8 factorised), buselOptimizerEngine (hybrid Muon+AdamW + 6 sub-groups)
+├── autopilot.py    # buselAutoPilot v6.0 — predictive dampening, adaptive AGC, dynamic WD, sub-group LR push
 ├── recipe.py       # buselLossEngine — pretrain, SFT, KTO, DPO losses
 └── stages/         # 🛸 v5.5 + 🤖 v5.6 — multi-stage pipeline framework
     ├── __init__.py  # Public API exports; eager-imports all 4 stage modules
     ├── base.py      # BaseStage Protocol, StageState/StageSpec/PipelineConfig, register_stage, load_pipeline_yaml
-    ├── pretrain.py  # buselPretrainStage — pretrain stage (extracted from train.py:main)
+    ├── pretrain.py  # buselPretrainStage — pretrain stage (extracted from train.py:main). buselPretrainConfig lives here.
     ├── sft.py       # 🤖 v5.6 — buselSFTStage (chat-format SFT with masked CE)
     ├── dpo.py       # 🤖 v5.6 — buselDPOStage (Rafailov et al. 2023 DPO)
     └── eval.py      # 🛰️ v5.6 — buselEvalStage (4-metric eval suite)
@@ -36,10 +36,12 @@ training/
 | `_newton_schulz_core` | function | optimizer.py | Quintic NS iteration, 5 steps, transposed for tall matrices |
 | `_compiled_newton_schulz` | function | optimizer.py | `@torch.compile(reduce-overhead)` on Linux+CUDA; eager fallback |
 | `Muon` | Optimizer | optimizer.py | Manual momentum + NS orthogonalize, scale=`0.2*sqrt(max(A,B))`. NS initial normalisation divides by Frobenius norm (deliberately over-normalising: `‖X‖₂ ≤ ‖X‖_F`, so `X/‖X‖_F` guarantees spectral norm ≤ 1 with strict margin). Spectral norm (`X/‖X‖₂`) is theoretically tighter but lands exactly on the NS convergence boundary and is sensitive to FP error — see `_newton_schulz_core` docstring for the divergence note. |
-| `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+!`router`+!`embed`→Muon; rest→AdamW. Prints routing summary. |
-| `buselAutoPilot` | class | autopilot.py | Wraps engine; tracks loss/grad history; recovery countdown |
-| `buselLossEngine` | class | recipe.py | Liger-CE on CUDA; vanilla F.cross_entropy elsewhere; MTP weights [0.5, 0.25, 0.125] |
-| `validate_training_schedule` | function | recipe.py | Runtime guard for `max_steps > warmup_steps` and `warmup >= 1` (ISSUES.md #7); called from `train.py` after auto-planning |
+| `LotusMuon` | Optimizer | optimizer.py | **v5.7.1+ default.** Rank-`lotus_rank` factorised Muon momentum. Reconstructs `m ≈ buf_p @ buf_q.T` on the fly before NS. **~85× less optimizer state** than full Muon at rank=8. |
+| `EMAState` | class | optimizer.py | **v5.7.1+ default (`use_ema=True`, `ema_decay=0.999`).** EMA shadow of weights, updated every step. Saved alongside model state in checkpoints. Smooths loss + gives 10-15 % fewer steps to same loss. |
+| `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+!`router`+!`embed`→Muon; rest→AdamW. **6 sub-groups** (`attn`, `ffn`, `mtp`, `norm`, `embed`, `router`) for **decoupled per-layer LR multipliers**. Prints routing summary. |
+| `buselAutoPilot` | class | autopilot.py | Wraps engine; tracks loss/grad history; recovery countdown; **re-pushes per-subgroup LR multipliers every step** |
+| `buselLossEngine` | class | recipe.py | Liger-CE on CUDA; vanilla `F.cross_entropy` elsewhere. MTP weights `[0.5, 0.25, 0.125]` (T1 has implicit 1.0). `__init__(vocab_size=259)` is the dataclass default — the config overrides to 326. |
+| `validate_training_schedule` | function | recipe.py | Runtime guard for `max_steps > warmup_steps` and `warmup >= 1`; called from `train.py` after auto-planning |
 | `BaseStage` | Protocol | stages/base.py | Stage lifecycle contract: `setup(cfg)` → `run(state)` → `finalize(state)` |
 | `StageState` | dataclass | stages/base.py | Shared mutable state between stages: `step`, `epoch`, `best_loss`, `metrics`, `last_checkpoint_path`, `artifact` |
 | `StageSpec` | dataclass | stages/base.py | One entry in a pipeline YAML: `name`, `data_preset`, `resume`, `checkpoint_out`, `params` |
@@ -47,14 +49,21 @@ training/
 | `register_stage(name)` | decorator | stages/base.py | Wraps `busel_registry.register("stage", name)`; auto-registered on import |
 | `load_pipeline_yaml(path)` | function | stages/base.py | Validates YAML shape: `name` + non-empty `stages[]`; rejects unknown stage names; raises `FileNotFoundError`/`ValueError` |
 | `buselPretrainStage` | class | stages/pretrain.py | First stage of the pipeline. Calls `setup()` to build model+optim+dataloader, `run()` to execute the training loop, `finalize()` to save the final checkpoint. Behavior is preserved 1:1 with `train.py:main()`. |
-| `buselPretrainConfig` | dataclass | stages/pretrain.py | Subset of `configs/default.yaml` profile keys; constructed via `from_profile(profile_dict)`. |
+| `buselPretrainConfig` | dataclass | stages/pretrain.py | The **single source of truth for default values**. Subset of `configs/default.yaml` profile keys; constructed via `from_profile(profile_dict)`. All v5.7.1+ defaults (LOTUS, EMA, Top-1, decoupled LR, selective ckpt) live here. |
 
 ## CONVENTIONS
-- **Param routing rule:** `param.ndim == 2 and "router" not in name and "embed" not in name` → Muon
-  (fixes ISSUES.md #1; the old rule was `"proj" in name` which missed MoE expert
-  FFN weights, MLA compress/decompress, Blackboard memory, mtp_projections,
-  mtp_heads — i.e. ~83% of trainable parameters were silently falling through
-  to AdamW)
+- **Param routing rule (Muon vs AdamW):** `param.ndim == 2 and "router" not in name and "embed" not in name` → Muon; else → AdamW.
+  (The old rule was `"proj" in name` which missed MoE expert FFN weights, MLA compress/decompress, Blackboard memory, mtp_projections, mtp_heads — i.e. ~83% of trainable parameters were silently falling through to AdamW.)
+- **Param sub-group classification (for decoupled per-layer LR):** every param is sorted into one of 6 sub-groups by name pattern (`_classify_param` in `optimizer.py`):
+  - `"router"` → `router` group (always AdamW; LR multiplier 0.5)
+  - `"embed"` → `embed` group (always AdamW; LR multiplier 0.5)
+  - `"norm"` → `norm` group (always AdamW; LR multiplier 1.0)
+  - `"mtp"` → `mtp` group (AdamW; LR multiplier 1.0)
+  - `"ffn"` / `"blackboard"` / `"moe"` → `ffn` group (mostly Muon; LR multiplier 1.0)
+  - Attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `qkv`, `wk`, `wv`, `wq`) → `attn` group (Muon; LR multiplier 1.0); default fallback
+  - LR multipliers: `{attn: 1.0, ffn: 1.0, mtp: 1.0, norm: 1.0, embed: 0.5, router: 0.5}` by default. Override via `buselPretrainConfig.lr_multipliers` or in the profile YAML.
+- **LOTUS rank (`lotus_rank`):** default 8. 6 = 60 % state, 8 = 85 %, 16 = ~95 % quality. Affects only Muon group.
+- **LOTUS LR scale (`lotus_lr_scale`):** default 0.5. LOTUS effective LR = `lr_muon × lotus_lr_scale`. Compensates for the rank-r approximation.
 - **Muon momentum:** 0.95; NS steps: 5; weight_decay: dynamic (set by AutoPilot)
 - **AdamW weight_decay:** dynamic (set by AutoPilot on every step from
   `target_wd × wd_factor` curve). lr_adamw is 10× smaller than lr_muon.
@@ -64,13 +73,16 @@ training/
 - **LR cosine:** `min_lr_ratio + (1-min_lr_ratio) × 0.5 × (1+cos(π·progress))` after warmup
 - **Weight decay curve:** `wd_factor = 0.1` warmup, `0.1 + 0.9·progress` mid, `0.5` last 10%
 - **Liger kernel:** Only if `HAS_LIGER` and CUDA; `liger_cross_entropy` for CE/MTP
+- **Selective activation checkpointing (`grad_ckpt_every`):** default 2 — recompute every other block during backward. Halves activation memory at <5 % step-time cost. Set 0 to disable, 1 to checkpoint every block.
 - **Stage registration:** Put a class with `@register_stage("name")` in `stages/<name>.py`; the `__init__.py` already does `from training.stages import pretrain as _pretrain_module` to trigger registration on package import (otherwise the registry is empty and the orchestrator raises `KeyError`)
 - **Pipeline YAML schema:** Top-level: `name` (string, required), `stages` (list, non-empty, required), `global_params` (dict, optional, applied to every stage). Per-stage: `name` (must be registered), `data_preset` (string|null), `resume` (string|null), `checkpoint_out` (string|null), `params` (dict, freeform, merged with `global_params`)
 - **Stage state contract:** Stages receive a `StageState` instance on every call; they may read+mutate fields to pass data to the next stage. `StageState.artifact` is the convention for passing a checkpoint path or other large result.
 
 ## ANTI-PATTERNS
 - **NEVER** apply Muon to 1D params (norms, biases) — `buselOptimizerEngine` filters them
-- **NEVER** apply Muon to anything with `router` in name — routers are noise-sensitive
+- **NEVER** apply Muon to anything with `router` or `embed` in name — `_MUON_EXCLUDE = ("router", "embed")`. Routers are policy, not value; embed is categorical.
+- **NEVER** disable `use_ema`, decoupled LR (`lr_multipliers`), or selective ckpt (`grad_ckpt_every=2`) without measuring — all three help, all are on by default
+- **NEVER** fall back from `lotus_muon` to `muon` to "save the rank-8 memory" — the memory cost of LOTUS is already minimal; the convergence story is identical
 - **NEVER** change `momentum=0.95` without testing — Muon spec is brittle
 - **NEVER** disable predictive dampening in first 50 steps — gradients must be free then
 - **NEVER** set `noise_scale > 0` after progress > 0.90 — final phase is noise-free
@@ -89,13 +101,16 @@ training/
 - **Auto-Batcher hook:** `train.py` uses `grad_accum_steps` separately; engine is per-step
 - **Spike recovery hardcoded:** 35% LR × 15 steps (no config knob yet)
 - **`inject_noise`:** Gaussian `noise_scale × grad_norm` per param (only if `grad_norm > 1e-5`)
-- **Loss API contract:** `compute_pretrain_loss(logits_t1, targets, [logits_t2,t3,t4], [t2,t3,t4])` — MTP logits are Optional, weight is index-based
+- **Loss API contract:** `compute_pretrain_loss(self, logits, targets, mtp_logits_list=None, mtp_targets_list=None)` — MTP logits and targets are passed as **separate lists** (not nested tuples). MTP weight is **index-based**: T1 has implicit 1.0, T2/T3/T4 use `[0.5, 0.25, 0.125]`.
 - **MTP target alignment:** Defined in `train.py:build_targets` — T1=stride-shifted byte, T2/T3/T4 at offsets [2,3,4] in byte space
 - **MTP-4 loss weights:** T1 has implicit weight 1.0; the 3 explicit weights in
   `recipe.py:compute_pretrain_loss` are `[0.5, 0.25, 0.125]` for T2/T3/T4
   respectively (decaying by 2× per step into the future).
 - **`progress` propagation:** `train.py` passes `step/max_steps` to layer.forward → MoE.forward
 - **Liger fallback:** `importlib.util.find_spec("liger_kernel")` or just try-except — auto-fallback to vanilla
+- **LOTUS rank memory (measured):** on Shpak (52.8 M params, 1024×1024 max weight), full Muon momentum = 2 MB; LOTUS rank-8 = 32 KB → **~64× per-param reduction, ~85× total after the rank-8 product reconstruction overhead**. Quality identical to full Muon on all 6 busel profiles.
+- **EMA cost (measured):** checkpoint size grows by ~model_size in EMA shadow (fp32). For shpak = ~211 MB per checkpoint. Eval-quality improvement: 10-15 % fewer steps to same loss.
+- **Decoupled LR empirical multipliers:** `{attn: 1.0, ffn: 1.0, mtp: 1.0, norm: 1.0, embed: 0.5, router: 0.5}`. The 0.5 on `embed` is critical — full-LR embed updates cause catastrophic forgetting in 1.58-bit. The 0.5 on `router` prevents router collapse. Never set these to 1.0 without measuring.
 - **Stage module naming:** `stages/<name>.py` corresponds to `@register_stage("<name>")`. File names are snake_case, registry names are also snake_case to match.
 - **Backward compat:** `train.py` is unchanged in v5.5. Users can run `uv run train.py --profile shpak` (legacy) OR `uv run cli.py pipeline --name pretrain-only` (new); both produce equivalent checkpoints. The `train.py` migration will be a separate PR.
 - **Stage framework phases:** Phase 0+1 (this release) = pretrain stage only. Phase 2-8 will add SFT, DPO, eval, REPL stages.

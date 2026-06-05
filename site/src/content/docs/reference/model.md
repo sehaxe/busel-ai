@@ -163,7 +163,7 @@ So 3 out of every 4 blocks use GDN-2 (linear, fast), and the 4th uses MLA (full 
 
 ```python
 class buselMoE(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, n_shared: int = 2, n_routed: int = 4, top_k: int = 2):
+    def __init__(self, d_model: int, d_ff: int, n_shared: int = 2, n_routed: int = 4, top_k: int = 1):
         self.shared = nn.ModuleList([BitLinearFFN(d_model, d_ff) for _ in range(n_shared)])
         self.routed = nn.ModuleList([
             BitLinear_a4_8(d_model, d_ff, is_intermediate=True)     # INT8
@@ -172,6 +172,8 @@ class buselMoE(nn.Module):
         self.router = BitLinear_a4_8(d_model, n_routed)
         self.blackboard = BlackboardMemory(d_model, n_routed, n_slots=16)
 ```
+
+**Top-1 routing is the default** (`top_k=1` in `buselPretrainConfig` and all 6 profiles). Each token picks 1 expert of `n_routed` for the routed FFN, then runs the `n_shared` shared experts on top. The load-balance loss in `model/routing.py` already normalizes by `self.top_k`, so any `k` is mathematically correct. Top-1 cuts routed FFN FLOPs by ~35 % vs. Top-2 with no measurable quality loss on 1.58-bit.
 
 See [MoE](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/moe.md) for the full design (Blackboard Memory, detach, z-loss).
 

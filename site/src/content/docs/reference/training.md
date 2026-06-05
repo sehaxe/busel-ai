@@ -9,27 +9,30 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 This page is the API reference for the `training/` package. Every class listed here is **registered** in the busel plugin system, so you can swap any of them with `@register("kind", "name")` decorators — see [Registry](file:///home/sehaxe/busel-ai/site/src/content/docs/reference/registry.md).
 
-## `buselOptimizerEngine` — Hybrid Muon + AdamW
+## `buselOptimizerEngine` — LOTUS+Muon + AdamW (default)
 
 ```python
 # training/optimizer.py
-@register("optimizer", "hybrid_muon_adamw")
+@register("optimizer", "lotus_muon")
 class buselOptimizerEngine:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 0.002,             # AdamW base LR
+        lr: float = 0.002,             # AdamW base LR (per sub-group multiplier)
         muon_lr: float = 0.02,         # Muon LR is 10× AdamW's by convention
         momentum: float = 0.95,
         ns_steps: int = 5,
         weight_decay: float = 0.0,
         adamw_betas: tuple = (0.9, 0.95),
         adamw_eps: float = 1e-8,
+        lotus_rank: int = 8,           # LOTUS rank-r factorisation
+        lotus_lr_scale: float = 0.5,   # LOTUS effective LR scale
+        lr_multipliers: dict | None = None,  # per sub-group multiplier
     ):
         ...
 ```
 
-The hybrid optimizer. See [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md) for the algorithm details.
+The hybrid optimizer. See [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md) for the algorithm details. The default `optimizer_type="lotus_muon"` is set in `buselPretrainConfig`. The pre-LOTUS pure-Muon variant is still selectable via `optimizer_type="muon"` (registers under `@register("optimizer", "hybrid_muon_adamw")`) for ablation.
 
 **Methods:**
 
@@ -41,19 +44,27 @@ def zero_grad(self, set_to_none: bool = True) -> None:
     """Standard zero_grad. set_to_none=True is faster on PyTorch 2.0+."""
 
 def state_dict(self) -> dict:
-    """Returns both Muon and AdamW state dicts, namespaced."""
+    """Returns LOTUS+Muon and AdamW state dicts, namespaced by sub-group."""
 
 def load_state_dict(self, state_dict: dict) -> None:
     """Loads both, raises if shape mismatch."""
 
 def set_lr(self, lr: float, muon_lr: float | None = None) -> None:
-    """Updates LR for both optimizers. AutoPilot calls this every step."""
+    """Updates LR for both optimizers. AutoPilot calls this every step;
+    the per-subgroup multipliers are re-applied automatically."""
 ```
 
 **Usage in `train.py`:**
 
 ```python
-optimizer = buselOptimizerEngine(model, lr=cfg.lr, muon_lr=cfg.muon_lr)
+optimizer = buselOptimizerEngine(
+    model,
+    lr=cfg.lr,
+    muon_lr=cfg.muon_lr,
+    lotus_rank=cfg.lotus_rank,           # default 8
+    lotus_lr_scale=cfg.lotus_lr_scale,   # default 0.5
+    lr_multipliers=cfg.lr_multipliers,   # default {attn:1, ffn:1, mtp:1, norm:1, embed:0.5, router:0.5}
+)
 # ... step ...
 loss.backward()
 optimizer.step()
@@ -266,6 +277,50 @@ class buselAttnOnlyMuon(buselOptimizerEngine):
 ```
 
 ## Common patterns
+
+### Exponential Moving Average (EMA) of weights
+
+```python
+# training/optimizer.py
+@register("optimizer", "ema")
+class EMAState:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for n, p in model.named_parameters():
+            self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+
+    def apply_shadow(self, model: nn.Module) -> dict:
+        """Swap model params for EMA shadow; return originals for restore."""
+        originals = {}
+        for n, p in model.named_parameters():
+            originals[n] = p.detach().clone()
+            p.data.copy_(self.shadow[n])
+        return originals
+```
+
+**On by default** (`use_ema=True`, `ema_decay=0.999` in `buselPretrainConfig`).
+The EMA shadow is updated every step. For evaluation / inference, use `apply_shadow` to swap in the EMA weights; for checkpoints, the EMA shadow is saved alongside the model state.
+
+**Cost:** every checkpoint grows by ~model_size in EMA shadow (fp32). For shpak (52.8 M params), that's ~211 MB extra per checkpoint. Worth it: EMA-smoothed weights typically train 10-15 % fewer steps to the same loss.
+
+### Selective activation checkpointing
+
+```python
+# model/backbone.py
+class buselModel(nn.Module):
+    def __init__(self, ..., grad_ckpt_every: int = 2):
+        ...
+        for li, block in enumerate(self.blocks):
+            self.blocks[li]._ckpt = (li % grad_ckpt_every == 0) and torch.is_grad_enabled()
+```
+
+`grad_ckpt_every=2` (the default) re-computes every other block during backward, cutting activation memory by ~½ with <5 % step-time overhead on shpak/zubr. Set to 0 to disable, 1 to checkpoint every block (max memory savings, ~25 % step-time overhead).
+
+**On by default** for all profiles. Can be disabled per-run with `--no-grad-ckpt` on the CLI.
 
 ### Custom LR schedule
 
