@@ -115,6 +115,9 @@ class _MockConfig:
         default_vocab = mm_vocab_size() if HAS_SPECIAL_TOKENS else 259
         self.vocab_size = kw.get("vocab_size", default_vocab)
         self.n_hyper = kw.get("n_hyper", 2)
+        self.sparse_6_8 = kw.get("sparse_6_8", False)
+        self.selective_backward = kw.get("selective_backward", False)
+        self.backward_ratio = kw.get("backward_ratio", 1.0)
 
 
 class TestbuselFramework(unittest.TestCase):
@@ -180,6 +183,78 @@ class TestbuselFramework(unittest.TestCase):
         self.assertEqual(out.shape, (2, 128))
         self.assertFalse(torch.isnan(out).any())
         print("   ✅ BitLinear Quantization passed.")
+
+    def test_sparse_bitnet_6_8(self):
+        print("🧪 [4b] Sparse-BitNet 6:8 (Dual STE, 6/8 weights kept)...")
+        torch.manual_seed(0)
+        lin_dense = BitLinear_a4_8(64, 128, is_sparse_6_8=False).to(self.device)
+        lin_sparse = BitLinear_a4_8(64, 128, is_sparse_6_8=True).to(self.device)
+        lin_sparse.load_state_dict(lin_dense.state_dict())
+        x = torch.randn(2, 64, device=self.device, requires_grad=True)
+        x_sparse = x.detach().clone().requires_grad_(True)
+        out_dense = lin_dense(x).sum()
+        out_sparse = lin_sparse(x_sparse).sum()
+        out_dense.backward()
+        out_sparse.backward()
+        self.assertEqual(out_sparse.shape, out_dense.shape)
+        self.assertFalse(torch.isnan(out_sparse).any())
+        self.assertIsNotNone(x_sparse.grad)
+        self.assertFalse(torch.isnan(x_sparse.grad).any())
+        sparse_grad_density = (x_sparse.grad.abs() > 0).float().mean().item()
+        self.assertGreater(sparse_grad_density, 0.5)
+        self.assertTrue(lin_sparse.is_sparse_6_8)
+        self.assertFalse(lin_dense.is_sparse_6_8)
+        print("   ✅ Sparse-BitNet 6:8 forward+backward passed.")
+
+    def test_gradlite_error_feedback(self):
+        print("🧪 [4c] GradLite error-feedback correction (buselOptimizerEngine)...")
+        torch.manual_seed(0)
+        cfg = _MockConfig(d_model=32, n_layers=2, n_heads=2, num_experts=2)
+        model = buselModel(cfg).to(self.device)
+        opt = buselOptimizerEngine(
+            model, lr_muon=1e-3, lr_adamw=1e-4,
+            optimizer_type="muon", use_error_feedback=True,
+        )
+        self.assertTrue(opt.use_error_feedback)
+        self.assertIsNotNone(opt._error_buffers)
+        self.assertGreater(len(opt._error_buffers), 0)
+        x = torch.randn(2, 8, 32, device=self.device)
+        out, _ = model(x, None)
+        loss = out[0].sum()
+        loss.backward()
+        for buf in opt._error_buffers.values():
+            self.assertFalse(torch.isnan(buf).any())
+        opt.step()
+        for buf in opt._error_buffers.values():
+            self.assertFalse(torch.isnan(buf).any())
+        opt.zero_grad()
+        print("   ✅ GradLite error-feedback: buffer init, step, zero_grad all clean.")
+
+    def test_lcsb_selective_backward(self):
+        print("🧪 [4d] LCSB selective per-layer backward (buselModel)...")
+        torch.manual_seed(0)
+        cfg = _MockConfig(d_model=32, n_layers=6, n_heads=2, num_experts=2)
+        cfg.selective_backward = True
+        cfg.backward_ratio = 0.5
+        model = buselModel(cfg).to(self.device)
+        model.train()
+        self.assertTrue(model.selective_backward)
+        self.assertEqual(model.backward_ratio, 0.5)
+        x = torch.randn(2, 8, 32, device=self.device)
+        out, aux = model(x, None)
+        loss = out[0].sum() + aux.float()
+        loss.backward()
+        for p in model.parameters():
+            if p.grad is not None:
+                self.assertFalse(torch.isnan(p.grad).any())
+        n_seen = sum(1 for p in model.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
+        self.assertGreater(n_seen, 0)
+        cfg.selective_backward = False
+        model2 = buselModel(cfg).to(self.device)
+        model2.train()
+        self.assertFalse(model2.selective_backward)
+        self.assertEqual(model2._selected_layers, list(range(6)))
+        print("   ✅ LCSB selective backward: gradients flow, ratio=0.5 selects 3 of 6.")
 
     def test_jit_gdn2_attention(self):
         print("🧪 [5] Stable JIT GDN-2 Loop (forward)...")

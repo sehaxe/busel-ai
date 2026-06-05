@@ -198,6 +198,14 @@ class buselModel(nn.Module):
         self.mtp_pipeline = buselMTP4Pipeline(config)
         self.use_gradient_checkpointing = False
         self.checkpoint_every = 1
+        self.selective_backward = bool(getattr(config, "selective_backward", False))
+        self.backward_ratio = max(0.0, min(1.0, float(getattr(config, "backward_ratio", 1.0))))
+        self._selected_layers: list[int] = list(range(config.n_layers))
+
+        if getattr(config, "sparse_6_8", False):
+            for module in self.modules():
+                if isinstance(module, BitLinear_a4_8):
+                    module.is_sparse_6_8 = True
 
     def enable_gradient_checkpointing(self, every: int = 1): self.use_gradient_checkpointing = True; self.checkpoint_every = max(1, int(every))
     def disable_gradient_checkpointing(self): self.use_gradient_checkpointing = False
@@ -209,15 +217,26 @@ class buselModel(nn.Module):
         ckpt_every = self.checkpoint_every if self.use_gradient_checkpointing else 1
         ckpt_eligible = self.training and self.use_gradient_checkpointing and x.device.type in ["cuda", "mps"]
 
+        if self.selective_backward and self.training and self.backward_ratio < 1.0:
+            import random
+            n_select = max(1, int(len(self.layers) * self.backward_ratio))
+            self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
+        else:
+            self._selected_layers = list(range(len(self.layers)))
+
         for i, layer in enumerate(self.layers):
             mixed = self.m_residuals[i](x, streams)
 
-            if ckpt_eligible and (i % ckpt_every == 0):
-                layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
-                    layer, mixed, progress, use_reentrant=False, determinism_check="none"
-                )
+            if i in self._selected_layers:
+                if ckpt_eligible and (i % ckpt_every == 0):
+                    layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
+                        layer, mixed, progress, use_reentrant=False, determinism_check="none"
+                    )
+                else:
+                    layer_out, aux_loss = layer(mixed, progress=progress)
             else:
-                layer_out, aux_loss = layer(mixed, progress=progress)
+                with torch.no_grad():
+                    layer_out, aux_loss = layer(mixed, progress=progress)
 
             x = mixed + layer_out
             total_aux_loss += aux_loss

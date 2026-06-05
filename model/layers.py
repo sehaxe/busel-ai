@@ -36,15 +36,45 @@ class RoundSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output): return grad_output
 
+class DualMaskSTE(torch.autograd.Function):
+    """N:M sparsity STE (Sparse-BitNet 6:8).
+
+    Forward: ``x * mask`` (sparse — hardware can skip 2/8 multiplications).
+    Backward: **full** gradient for ``x`` (Dual STE — masked positions still
+    receive updates, so the mask can adapt if the gradient demands it).
+    """
+    @staticmethod
+    def forward(ctx, x, mask):
+        ctx.save_for_backward(mask)
+        return x * mask
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+def _n_m_6_8_mask(w: torch.Tensor) -> torch.Tensor:
+    """Compute 6:8 N:M semi-structured mask (keep top-6 of every 8 by magnitude).
+
+    Returns a 0/1 mask of the same shape as ``w``. No gradient flows through
+    the mask itself.
+    """
+    orig_shape = w.shape
+    w_flat = w.view(-1, 8)
+    _, topk_idx = w_flat.abs().topk(6, dim=-1)
+    return torch.zeros_like(w_flat).scatter_(-1, topk_idx, 1.0).view(orig_shape)
+
 class BitLinear_a4_8(nn.Linear):
-    def __init__(self, in_features, out_features, is_intermediate=False, topk_ratio=0.5):
+    def __init__(self, in_features, out_features, is_intermediate=False,
+                 topk_ratio=0.5, is_sparse_6_8=False):
         super().__init__(in_features, out_features, bias=False)
         self.is_intermediate = is_intermediate
         self.topk_ratio = topk_ratio
+        self.is_sparse_6_8 = is_sparse_6_8
         nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
         w = self.weight
+        if self.is_sparse_6_8 and w.numel() % 8 == 0:
+            w = DualMaskSTE.apply(w, _n_m_6_8_mask(w))
         alpha = w.abs().mean().detach() + 1e-5
         w_scaled = w / alpha
         w_clipped = torch.clamp(w_scaled, -1, 1)
