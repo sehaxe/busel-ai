@@ -14,7 +14,6 @@ profiles:
       num_experts: 2
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      sparse_6_8: false      # 🆕 Sparse-BitNet 6:8 (off by default; needs profiling before flipping)
       selective_backward: false  # 🆕 LCSB selective per-layer backward
       backward_ratio: 1.0    # 🆕 fraction of layers backprop'd (1.0 = all, 0.5 = half)
     data:
@@ -43,7 +42,6 @@ profiles:
       num_experts: 2         # 2 experts for speed
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      sparse_6_8: false
       selective_backward: false
       backward_ratio: 1.0
     data:
@@ -72,7 +70,6 @@ profiles:
       num_experts: 2
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      sparse_6_8: false
       selective_backward: false
       backward_ratio: 1.0
     data:
@@ -100,7 +97,6 @@ profiles:
       num_experts: 4        # 4 эксперта MoE
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      sparse_6_8: false
       selective_backward: true
       backward_ratio: 0.5
     data:
@@ -128,7 +124,6 @@ profiles:
       num_experts: 4
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      sparse_6_8: false
       selective_backward: true
       backward_ratio: 0.5
     data:
@@ -157,7 +152,6 @@ profiles:
       top_k: 1
       vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
       n_hyper: 4
-      sparse_6_8: false
       selective_backward: true
       backward_ratio: 0.5
     data:
