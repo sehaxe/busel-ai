@@ -22,8 +22,9 @@ def load_env(filepath=".env"):
 
 
 def print_tui_header():
+    from ui.teto import frame as _teto_frame
     typer.echo(typer.style("╔═══════════════════════════════════════════════════════════════════════════╗", fg=typer.colors.MAGENTA, bold=True))
-    typer.echo(typer.style("║                            busel OMNI-LLM v6.1                            ║", fg=typer.colors.CYAN, bold=True))
+    typer.echo(typer.style(f"║  {_teto_frame('wave')}  busel OMNI-LLM v6.1                                            ║", fg=typer.colors.CYAN, bold=True))
     typer.echo(typer.style("║                 Sovereign 1-bit Any-to-Text AI Framework                  ║", fg=typer.colors.CYAN, bold=True))
     typer.echo(typer.style("╚═══════════════════════════════════════════════════════════════════════════╝", fg=typer.colors.MAGENTA, bold=True))
 

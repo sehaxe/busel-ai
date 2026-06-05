@@ -20,6 +20,8 @@ app = typer.Typer(
 @app.callback()
 def _default_callback(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
+        from ui.teto import frame as _teto_frame
+        typer.echo(typer.style(f"  {_teto_frame('think')}  busel is thinking…", fg=typer.colors.GREEN, bold=True))
         typer.echo(typer.style("🪜 No subcommand → defaulting to `escalate --target shpak`", fg=typer.colors.CYAN, bold=True))
         typer.echo(typer.style("   (batch/chunk/LR come from configs/default.yaml — edit there, not in code)\n", fg=typer.colors.CYAN))
         escalate(target="shpak")

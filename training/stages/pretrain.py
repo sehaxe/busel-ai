@@ -26,6 +26,7 @@ import yaml
 
 from training.stages.base import BaseStage, StageState, register_stage, _apply_model_profile
 from busel_logging import setup_logging, log_event
+from ui.teto import frame as _teto_frame
 
 _STOP_FILE = os.environ.get("BUSEL_STOP_FILE", "/tmp/busel_stop")
 
@@ -685,6 +686,7 @@ class buselPretrainStage:
                     eta_str = f"{int(eta_s)}s"
 
                 print(
+                    f"{_teto_frame('idle', step // 10)} "
                     f"Step {step:05d}/{self.cfg.max_steps:05d} | "
                     f"Total: {accumulated_loss:.2f} | "
                     f"Aux: {accumulated_aux_loss / max(1, self.cfg.grad_accum_steps):.2f} | "
