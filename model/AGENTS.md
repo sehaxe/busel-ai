@@ -1,12 +1,12 @@
 # model/ — BitNet v2 Architecture
 
-**Scope:** 1.58-bit ternary LLM architecture. `buselModel` orchestrator + 5 module families.
+**Scope:** 1.58-bit ternary LLM architecture. `buselModel` orchestrator + 5 module families. **v5.8 — Sparse-BitNet 6:8 (Dual STE) + LCSB selective per-layer backward.**
 
 ## STRUCTURE
 ```
 model/
 ├── patching.py    # StridedFastBLTPatcher — byte→patch (vocab=326, stride=4, GLU gate)
-├── layers.py      # BitLinear_a4_8, H_BitLinear, RMSNorm, SwishGLUClamped, RoundSTE, LearnableClampSTE
+├── layers.py      # BitLinear_a4_8, H_BitLinear, RMSNorm, SwishGLUClamped, RoundSTE, **DualMaskSTE** 🆕, LearnableClampSTE
 ├── attention.py   # BulbaGDN2SeRoPEBlock (GDN-2 linear), MultiHeadLatentAttention (MLA d_c=128)
 ├── routing.py     # MoDSequenceRouter, BulbaTernaryTitanMoE (2 shared + N routed, Blackboard bus)
 ├── backbone.py    # ManifoldConstrainedAttnRes (mAR), buselDecoderLayer, buselMTP4Pipeline, buselModel
@@ -30,13 +30,16 @@ model/
 | Modify residuals | `backbone.py` → `ManifoldConstrainedAttnRes` | Sinkhorn-Knopp on layer-mix logits |
 | Add MTP head | `backbone.py` → `buselMTP4Pipeline` | Currently 4 heads; projections ×3 |
 | **Load a checkpoint** (any source) | `checkpoint.py` → `load_state_dict_safely` | Handles `_orig_mod.` prefix + `OptimizedModule` wrapper transparently. **🆕 v5.7.1** |
+| **Add Sparse-BitNet 6:8** | `layers.py` → `BitLinear_a4_8(is_sparse_6_8=True)` | Or set `config.sparse_6_8=True` — `buselModel.__init__` walks all submodules and enables the flag on every `BitLinear_a4_8`. **🆕 v5.8** |
+| **Add LCSB selective backward** | `backbone.py` → `buselModel` | `config.selective_backward=True, config.backward_ratio=0.5` → 50% of layers run under `no_grad` per forward. **🆕 v5.8** |
 
 ## KEY CLASSES
 | Symbol | Type | Location | Role |
 |---|---|---|---|
-| `BitLinear_a4_8` | nn.Module | layers.py | 1.58-bit weight quant, INT4/INT8 act quant, TopK sparsity for intermediates |
+| `BitLinear_a4_8` | nn.Module | layers.py | 1.58-bit weight quant, INT4/INT8 act quant, TopK sparsity for intermediates, optional **Sparse-BitNet 6:8** weight mask |
 | `H_BitLinear` | nn.Module | layers.py | BitLinear + Fast Walsh-Hadamard Transform; o_proj only |
 | `RoundSTE` | autograd.Function | layers.py | Straight-Through Estimator for `torch.round` |
+| `DualMaskSTE` | autograd.Function | layers.py | **🆕 v5.8** — Sparse-BitNet 6:8 STE. Forward: `x*mask` (2/8 sparse). Backward: full grad for `x` (Dual STE). |
 | `LearnableClampSTE` | autograd.Function | layers.py | STE for learnable per-channel clipping bounds |
 | `SwishGLUClamped` | nn.Module | layers.py | Fused gate-up GLU; gate × clamp × up → H_BitLinear down |
 | `StridedFastBLTPatcher` | nn.Module | patching.py | vocab→d_byte→d_model; mini-SwishGLU gate; conv stride=4 |
@@ -47,7 +50,8 @@ model/
 | `ManifoldConstrainedAttnRes` | nn.Module | backbone.py | mAR: n_hyper parallel streams, multi-query attn (q from current_x, k from each stream), Sinkhorn-Knopp ×n onto Birkhoff polytope |
 | `buselDecoderLayer` | nn.Module | backbone.py | Attn + MoE block; `is_global` swaps GDN-2↔MLA |
 | `buselMTP4Pipeline` | nn.Module | backbone.py | 4 parallel heads (t+1..t+4) sharing embed_weight for projection |
-| `buselModel` | nn.Module | backbone.py | Top-level: `n_layers` decoder layers + mAR residuals + MTP-4; sanity-checks vocab_size |
+| `buselModel` | nn.Module | backbone.py | Top-level: `n_layers` decoder layers + mAR residuals + MTP-4; sanity-checks vocab_size; **🆕 v5.8** — wires `sparse_6_8` to all sub-`BitLinear_a4_8` and supports **LCSB selective per-layer backward** via `selective_backward` + `backward_ratio` |
+| `_n_m_6_8_mask` | function | layers.py | **🆕 v5.8** — `topk(6, dim=-1)` over groups of 8 by magnitude → binary 6:8 N:M mask |
 | `strip_compile_prefix` | function | checkpoint.py | Remove `_orig_mod.` / `compiled_model.` / `_dynamo.` prefixes from a state_dict. Returns a NEW dict; input is not mutated. **🆕 v5.7.1** |
 | `load_state_dict_safely` | function | checkpoint.py | Load `sd` into `obj` (nn.Module or OptimizedModule wrapper) handling all 4 cross-config cases. When `strict=False`, returns `_IncompatibleKeys` for diagnostics. **🆕 v5.7.1** |
 
@@ -75,6 +79,9 @@ model/
 - **NEVER** call `model.load_state_dict(sd)` directly — always go through `load_state_dict_safely(model, sd)`. Direct loads fail with key-mismatch errors when the checkpoint was saved with `--compile` (default in `train.py`). **🆕 v5.7.1**
 - **NEVER** duplicate the `_strip_compile_prefix` logic in a new file — `model.checkpoint.strip_compile_prefix` is the only implementation. If a new compile-prefix variant appears, add it to `_COMPILE_PREFIXES` in `model/checkpoint.py`. **🆕 v5.7.1**
 - **NEVER** reach into `model._orig_mod` manually — let `load_state_dict_safely` do the unwrapping. **🆕 v5.7.1**
+- **NEVER** apply `sparse_6_8=True` on layers with weight `numel() % 8 != 0` — silently no-ops (the `% 8` guard in `BitLinear_a4_8.forward`). If your layer has an odd shape, expect zero speedup.
+- **NEVER** set `backward_ratio=0.0` with `selective_backward=True` — the layer loop would select 0 layers (clamped to `max(1, ...)`). Gradient still flows through the mAR residual identity path even when all layer forwards run under `no_grad`.
+- **NEVER** use `sparse_6_8=True` AND `backward_ratio=0.5` together expecting multiplicative speedup — shpak 52.8M profile shows Sparse+GradLite overhead partially cancels the LCSB win. Use LCSB alone. **🆕 v5.8**
 
 ## NOTES
 - **GDN-2 fallback:** If `fla.ops.gdn2` unavailable OR not CUDA, falls back to `stable_gdn2_recurrent_jit` (slow but correct)
@@ -87,3 +94,6 @@ model/
 - **Aux-loss schedule:** `current_aux_weight` ramps 0.01 → 0.08 over training progress 0.1→0.55
 - **Checkpoint compatibility (v5.4.0):** Old 259-vocab checkpoints are NOT loadable. `embed_weight` shape is `(326, d_byte)` and a `(259, d_byte)` checkpoint will fail with strict-state-dict mismatch. Re-train from scratch.
 - **Checkpoint format (v5.7.1):** Checkpoint dict has 4 keys: `model_state_dict` (with `_orig_mod.` prefix when saved with `--compile`), `patcher_state_dict` (also prefixed), `optimizer_state_dict`, and `cfg` (the profile dict). Use `load_state_dict_safely(model, ckpt["model_state_dict"])` to load. Saves from non-compiled (CPU inference) checkpoints load into compiled models and vice-versa.
+- **Sparse-BitNet 6:8 (v5.8):** 2 of every 8 weights are zeroed via a 6:8 N:M mask, computed as `topk(6, dim=-1)` over flattened weight groups of 8. Dual STE: forward sees the sparse weight (compute-skip on N:M-aware hardware, e.g. cuSPARSELt); backward flows the **full** gradient to the master weight, so the mask can adapt. Orthogonal to activation TopK sparsity (which is on intermediates). **Validation on shpak 52.8M (batch=16, ctx=4096):** +1% step time, +2% peak VRAM (mask overhead) — **not a win on CUDA** without N:M-aware GEMM kernels. Future benefit on CPU/inference (Rust ternary matmul). Default OFF.
+- **LCSB selective per-layer backward (v5.8):** Each forward, randomly selects `n_select = max(1, int(n_layers × backward_ratio))` layers to run with grad; non-selected layers run under `torch.no_grad()`. The mAR residual identity path (`x = mixed + layer_out`) still carries gradient even when the layer is skipped. **Validation on shpak 52.8M, backward_ratio=0.5: −44% step time, −25% peak VRAM, +80% tok/s, no convergence regression over 10 steps.** Loss at step 10: 5.874 (LCSB) vs 5.892 (baseline). Default OFF — flip ON for shpak/zubr after extended validation.
+- **Sparse+LCSB combined (v5.8):** Shpak 52.8M shows Sparse+GradLite overhead partially cancels LCSB's win (1658 ms vs LCSB-alone 1533 ms). Use LCSB alone for now. **🆕 v5.8**
