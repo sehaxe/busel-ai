@@ -9,6 +9,10 @@ detect() {
         echo "cu130"
         return
     fi
+    if command -v rocm-smi >/dev/null 2>&1 || [ -d /opt/rocm ]; then
+        echo "rocm63"
+        return
+    fi
     if [ "$(uname -m)" = "Darwin" ] || [ "$(uname -s)" = "MINGW"* ] || [ "$(uname -s)" = "CYGWIN"* ]; then
         echo "cpu"
         return
@@ -21,11 +25,10 @@ if [ -z "$EXTRA" ]; then
 fi
 
 case "$EXTRA" in
-    cpu|cu118|cu126|cu128|cu130) ;;
+    cpu|cu118|cu126|cu128|cu130|rocm63) ;;
     *)
         echo "Unknown extra: $EXTRA"
-        echo "Valid extras: cpu cu118 cu126 cu128 cu130"
-        echo "AMD ROCm is currently broken upstream (pytorch-triton-rocm 3.x dep). Use cpu on AMD for now."
+        echo "Valid extras: cpu cu118 cu126 cu128 cu130 rocm63"
         exit 1
         ;;
 esac

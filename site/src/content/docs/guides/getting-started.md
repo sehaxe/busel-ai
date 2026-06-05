@@ -34,30 +34,31 @@ The extras are mutually exclusive — only one is selected per `uv sync`:
 | `cu126`  | NVIDIA Ampere / RTX 30xx          | ≥ 535   | 2.9   | ≈ 2.0 GB     |
 | `cu128`  | NVIDIA Ada / RTX 40xx             | ≥ 545   | 2.9   | ≈ 2.2 GB     |
 | `cu130`  | NVIDIA Blackwell / RTX 50xx       | ≥ 555   | 2.12  | ≈ 2.5 GB     |
+| `rocm63` | AMD RDNA / Vega (RX 6000/7000+)   | ROCm 6.3| 2.9   | ≈ 2.5 GB     |
 
 The **`scripts/setup.sh`** auto-detects your GPU (NVIDIA → `cu130`,
-otherwise → `cpu`):
+AMD → `rocm63`, otherwise → `cpu`):
 
 ```bash
 ./scripts/setup.sh          # auto-detect
-./scripts/setup.sh cu128    # force a specific extra
+./scripts/setup.sh rocm63   # force a specific extra
 ```
 
 …or run the underlying commands yourself:
 
 ```bash
-uv sync --extra cu130
+uv sync --extra cu130       # or rocm63 / cpu / cu128 / cu126 / cu118
 uv run maturin develop --release
 ```
 
 import { Aside } from '@astrojs/starlight/components';
 
-<Aside type="caution" title="AMD ROCm is not yet supported">
-The `pytorch-triton-rocm 3.x` dependency that all `torch==2.7+rocm6.3`
-builds reference does not exist on PyPI — the rocm6.3 index is broken
-upstream. AMD users should use the `cpu` extra for now. (Busel inference
-still works on AMD via the Rust ternary matmul extension — only training
-requires the right torch wheel.)
+<Aside type="caution" title="AMD ROCm is community-tested only">
+The maintainers have no AMD test bench, so `rocm63` is verified at the
+resolver level (torch 2.9.1+rocm6.3 + pytorch-triton-rocm 3.5.1 install
+cleanly) but not end-to-end on actual AMD hardware. If you hit a runtime
+issue, please open an issue with the output of
+`uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`.
 </Aside>
 
 <Aside type="tip" title="Switching hardware later">

@@ -89,11 +89,12 @@ the whole thing in an afternoon.
 #      • cu126  — NVIDIA driver ≥ 535
 #      • cu128  — NVIDIA driver ≥ 545
 #      • cu130  — NVIDIA driver ≥ 555  (RTX 5060 Ti / Blackwell)
-#    AMD ROCm is currently broken upstream (pytorch-triton-rocm 3.x dep).
-#    Auto-detect (NVIDIA → cu130, otherwise → cpu):
+#      • rocm63 — AMD ROCm 6.3 (RX 6000/7000/9000 + gfx900-gfx1201)
+#    Auto-detect (NVIDIA → cu130, AMD → rocm63, else → cpu):
 ./scripts/setup.sh
 #    Or pick explicitly:
 uv sync --extra cu130       # default for modern NVIDIA
+uv sync --extra rocm63      # AMD GPU
 uv sync --extra cpu         # no GPU
 uv sync --extra cu128       # driver too old for cu130
 
@@ -224,17 +225,17 @@ the Chinchilla byte-law `D ≈ 80 × N` divided by `batch × ctx / 4`.
 
 ## Hardware support
 
-| Device | Extra    | Driver  | Notes |
-|--------|----------|---------|-------|
-| NVIDIA Blackwell / RTX 50xx | `cu130` | ≥ 555 | Tested on RTX 5060 Ti 16 GB. PyTorch 2.12 + CUDA 13.0. |
-| NVIDIA Ada / RTX 40xx       | `cu128` | ≥ 545 | PyTorch 2.9. |
-| NVIDIA Ampere+ / RTX 30xx+  | `cu126` | ≥ 535 | PyTorch 2.9. |
-| NVIDIA Turing / RTX 20xx    | `cu118` | ≥ 470 | PyTorch 2.7. Legacy. |
-| Apple Silicon (MPS)         | `cpu`   | n/a   | Wheel auto-selected on macOS. No `torch.profiler` (hangs). |
-| CPU-only Linux / Windows    | `cpu`   | n/a   | ~700 MB torch, no CUDA. |
-| AMD ROCm                    | —       | —     | Broken upstream (pytorch-triton-rocm 3.x not on PyPI). Use `cpu` extra on AMD. |
+| Device | Extra    | Driver / ROCm | Notes |
+|--------|----------|---------------|-------|
+| NVIDIA Blackwell / RTX 50xx | `cu130` | driver ≥ 555 | Tested on RTX 5060 Ti 16 GB. PyTorch 2.12 + CUDA 13.0. |
+| NVIDIA Ada / RTX 40xx       | `cu128` | driver ≥ 545 | PyTorch 2.9. |
+| NVIDIA Ampere+ / RTX 30xx+  | `cu126` | driver ≥ 535 | PyTorch 2.9. |
+| NVIDIA Turing / RTX 20xx    | `cu118` | driver ≥ 470 | PyTorch 2.7. Legacy. |
+| AMD RDNA / Vega             | `rocm63`| ROCm 6.3      | RX 6000/7000/9000, gfx900-gfx1201. PyTorch 2.9. Untested on AMD hardware by maintainers (no AMD test bench). |
+| Apple Silicon (MPS)         | `cpu`   | n/a           | Wheel auto-selected on macOS. No `torch.profiler` (hangs). |
+| CPU-only Linux / Windows    | `cpu`   | n/a           | ~700 MB torch, no CUDA. |
 
-All NVIDIA extras use bf16 + cudnn.benchmark. CPU inference uses the Rust ternary matmul extension (no GPU required).
+All NVIDIA extras use bf16 + cudnn.benchmark. CPU and AMD inference use the Rust ternary matmul extension when no GPU matmul path is available.
 
 ---
 
