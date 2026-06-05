@@ -4,9 +4,11 @@
 ║                 Sovereign 1-bit Any-to-Text AI Framework                  ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
+import os
+
 import typer
 from tools.data_manager import download_all, download_vision, download_text, download_sft, label_vision, download_multimodal, download_preset, list_presets_cmd, download_data
-from tools.orchestrator import autopilot, train, train_all, profile, pipeline
+from tools.orchestrator import autopilot, train, train_all, profile, pipeline, escalate
 
 app = typer.Typer(
     help="busel Master CLI Engine - Sovereign 1-bit Omni-LLM",
@@ -29,6 +31,23 @@ app.command(name="autopilot", help="🛸 ULTIMATE ONE-CLICK AUTOPILOT: Verifies 
 app.command(name="train", help="🔥 Manually start the core training loop (single-stage, legacy).")(train)
 app.command(name="train-all", help="🚀 ONE-CLICK FULL TRAINING: pretrain → SFT → DPO → eval (requires `download-data` first).")(train_all)
 app.command(name="pipeline", help="🛸 Run a multi-stage training pipeline (configs/pipelines/<name>.yaml).")(pipeline)
+app.command(name="escalate", help="🪜 Smart auto-escalation: chyzh→shpak→zubr with optimal config from scaling laws.")(escalate)
+
+
+@app.command(name="stop", help="🛑 Graceful stop: create /tmp/busel_stop so training saves and exits at next step boundary.")
+def stop_cmd():
+    """🛑 Trigger a graceful save-and-exit for any running training run.
+
+    The pretrain stage checks BUSEL_STOP_FILE (default /tmp/busel_stop) at the
+    top of every step. If present, it logs the stop event, sets state.step to
+    the current step, and returns from run() — which lets finalize() save the
+    final checkpoint normally. No Ctrl+C required.
+    """
+    import pathlib
+    path = os.environ.get("BUSEL_STOP_FILE", "/tmp/busel_stop")
+    pathlib.Path(path).touch()
+    typer.echo(typer.style(f"✅ Stop signal sent: {path}", fg=typer.colors.GREEN, bold=True))
+    typer.echo("   Training will save FINAL checkpoint and exit at the next step boundary.")
 app.command(name="profile", help="📊 Run the ultra-stable step-by-step performance profiler (v2.0) on Mac/CUDA.")(profile)
 
 # 💬 НОВАЯ КОМАНДА: Локальный интерактивный чат

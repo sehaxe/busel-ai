@@ -25,6 +25,8 @@ import yaml
 from training.stages.base import BaseStage, StageState, register_stage, _apply_model_profile
 from busel_logging import setup_logging, log_event
 
+_STOP_FILE = os.environ.get("BUSEL_STOP_FILE", "/tmp/busel_stop")
+
 
 @dataclass
 class buselPretrainConfig:
@@ -228,6 +230,13 @@ class buselPretrainStage:
             lotus_lr_scale = stage_params.get("lotus_lr_scale")
         if lr_multipliers is None:
             lr_multipliers = stage_params.get("lr_multipliers")
+        override_batch_size = stage_params.get("batch_size")
+        override_chunk_size = stage_params.get("chunk_size")
+        override_max_steps = stage_params.get("max_steps")
+        override_warmup_steps = stage_params.get("warmup_steps")
+        self._checkpoint_out = stage_params.get("checkpoint_out")
+        if stage_params.get("no_compile") and not no_compile:
+            no_compile = True
         if isinstance(profile, str):
             with open("configs/default.yaml", "r", encoding="utf-8") as f:
                 full = yaml.safe_load(f)
@@ -255,6 +264,14 @@ class buselPretrainStage:
             self.cfg.lotus_lr_scale = float(lotus_lr_scale)
         if lr_multipliers is not None:
             self.cfg.lr_multipliers = dict(lr_multipliers)
+        if override_batch_size is not None:
+            self.cfg.batch_size = int(override_batch_size)
+        if override_chunk_size is not None:
+            self.cfg.chunk_size = int(override_chunk_size)
+        if override_max_steps is not None:
+            self.cfg.max_steps = int(override_max_steps)
+        if override_warmup_steps is not None:
+            self.cfg.warmup_steps = int(override_warmup_steps)
 
         _enforce_stability()
         self._logger = setup_logging()
@@ -427,6 +444,15 @@ class buselPretrainStage:
         for step_offset in range(self.cfg.max_steps):
             step = self.start_step + step_offset
             progress = float(step) / float(self.cfg.max_steps) if self.cfg.max_steps else 0.0
+            if os.path.exists(_STOP_FILE):
+                print(f"\n🛑 Graceful stop requested (file {_STOP_FILE} present) at step {step}.")
+                log_event("stop_requested", step=step, reason="stop_file_present", profile=self.profile_name)
+                try:
+                    os.remove(_STOP_FILE)
+                except OSError:
+                    pass
+                state.step = step
+                return state
 
             new_chunk_size = current_chunk_size
             if progress < 0.15:
@@ -671,7 +697,7 @@ class buselPretrainStage:
             return state
 
         os.makedirs("checkpoints", exist_ok=True)
-        final_path = f"checkpoints/busel_{self.profile_name}_FINAL.pt"
+        final_path = self._checkpoint_out or f"checkpoints/busel_{self.profile_name}_FINAL.pt"
         ckpt = {
             "model_state_dict": self.model.state_dict(),
             "patcher_state_dict": self.patcher.state_dict(),

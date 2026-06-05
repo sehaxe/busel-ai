@@ -182,6 +182,8 @@ def pipeline(
         return candidate if os.path.exists(candidate) else None
 
     state = StageState()
+    if not isinstance(start_stage, str):
+        start_stage = None
     skipping = bool(start_stage)
     running_resume: str | None = None
 
@@ -200,6 +202,8 @@ def pipeline(
         stage = stage_cls()
 
         merged_params = {**pipeline_cfg.global_params, **stage_spec.params}
+        if stage_spec.checkpoint_out and "checkpoint_out" not in merged_params:
+            merged_params["checkpoint_out"] = stage_spec.checkpoint_out
         profile_name = merged_params.pop("profile_name", stage_spec.data_preset or "shpak")
         profile_dict = _default_profiles.get(profile_name)
         if profile_dict is None:
@@ -237,8 +241,138 @@ def pipeline(
             log_event("stage_failed", stage=stage_spec.name, phase="finalize", error=str(e))
             raise typer.Exit(code=1)
 
-        if state.last_checkpoint_path:
-            running_resume = state.last_checkpoint_path
+    if state.last_checkpoint_path:
+        running_resume = state.last_checkpoint_path
 
     log_event("pipeline_complete", pipeline=pipeline_cfg.name, total_stages=len(pipeline_cfg.stages))
     typer.echo(typer.style(f"\n🎉 Pipeline {pipeline_cfg.name} complete! {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
+
+
+PROFILE_LADDER = ["chyzh", "shpak", "zubr"]
+PROFILE_PARAMS = {"chyzh": 10_000_000, "shpak": 55_000_000, "zubr": 120_000_000}
+SAFE_BATCH = {"chyzh": 128, "shpak": 16, "zubr": 4}
+ESTIMATED_STEP_MS = {"chyzh": 250, "shpak": 380, "zubr": 800}
+CHINCHILLA = {p: 80 * n for p, n in PROFILE_PARAMS.items()}
+
+
+def _load_profile_block(profile: str) -> dict:
+    import yaml as _yaml
+    with open("configs/default.yaml", "r", encoding="utf-8") as f:
+        full = _yaml.safe_load(f)
+    return full["profiles"][profile]
+
+
+def plan_escalation(target: str, max_steps: int | None = None, vram_gb: float = 16.0, chin_cap: float = 1.5) -> dict:
+    """🪜 Smart escalation planner: derive ladder + per-stage config from target.
+
+    Default semantics: "as long as possible" = Chinchilla-optimal max_steps.
+    Optional: pass --max-steps N to cap total training across all stages.
+
+    Scaling laws applied:
+      - Chinchilla: D_pretrain = 80 × N_params bytes
+      - Time per step ∝ batch × ctx × params (linear in tokens × model size)
+      - max_steps capped at chin_cap × Chinchilla steps to avoid overtraining small models
+      - batch_size and chunk_size read from actual profile (not hardcoded)
+    """
+    if target not in PROFILE_LADDER:
+        raise ValueError(f"target must be one of {PROFILE_LADDER}, got {target!r}")
+
+    ladder = [target]
+    n = len(ladder)
+
+    per_stage_cap = None
+    if max_steps is not None:
+        per_stage_cap = max(100, max_steps // n)
+
+    stages = []
+    for profile in ladder:
+        prof = _load_profile_block(profile)
+        chunk_size = int(prof["data"]["chunk_size"])
+        batch_size = int(SAFE_BATCH.get(profile) or prof["data"]["batch_size"])
+        step_ms = ESTIMATED_STEP_MS[profile]
+        tokens_per_step = batch_size * (chunk_size // 4)
+        chin_tokens = CHINCHILLA[profile]
+        chin_steps = int(chin_tokens / tokens_per_step)
+        cap_steps = int(chin_cap * chin_steps)
+        candidates = [cap_steps]
+        if per_stage_cap is not None:
+            candidates.append(per_stage_cap)
+        max_steps_actual = min(candidates)
+        chin_pct = 100.0 * (max_steps_actual * tokens_per_step) / chin_tokens
+        est_h = max_steps_actual * step_ms / 1000 / 3600
+        stages.append(
+            {
+                "profile": profile,
+                "batch_size": batch_size,
+                "chunk_size": chunk_size,
+                "max_steps": max_steps_actual,
+                "est_h": est_h,
+                "step_ms": step_ms,
+                "chinchilla_pct": chin_pct,
+            }
+        )
+
+    return {"target": target, "ladder": ladder, "stages": stages, "vram_gb": vram_gb, "max_steps": max_steps}
+
+
+def _write_escalation_yaml(plan: dict, path: str) -> None:
+    import yaml as _yaml
+
+    stages_yaml = []
+    for s in plan["stages"]:
+        stages_yaml.append(
+            {
+                "name": "pretrain",
+                "data_preset": s["profile"],
+                "checkpoint_out": f"checkpoints/busel_escalate_{s['profile']}_FINAL.pt",
+                "params": {
+                    "profile_name": s["profile"],
+                    "max_steps": s["max_steps"],
+                    "warmup_steps": max(50, int(0.05 * s["max_steps"])),
+                    "batch_size": s["batch_size"],
+                    "chunk_size": s["chunk_size"],
+                },
+            }
+        )
+    cap_note = f"max_steps={plan['max_steps']}" if plan.get("max_steps") else "as long as possible (Chinchilla)"
+    pipeline_dict = {
+        "name": f"escalate-{plan['target']}",
+        "description": f"Smart escalation: {' → '.join(plan['ladder'])} | {cap_note}",
+        "stages": stages_yaml,
+        "global_params": {},
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        _yaml.dump(pipeline_dict, f, sort_keys=False, allow_unicode=True)
+
+
+def _print_escalation_plan(plan: dict) -> None:
+    typer.echo(typer.style("\n🪜 SMART ESCALATION PLAN", fg=typer.colors.CYAN, bold=True))
+    cap_text = f"max_steps={plan['max_steps']}" if plan.get("max_steps") else "as long as possible (Chinchilla)"
+    typer.echo(typer.style(f"   target: {plan['target']} | ladder: {' → '.join(plan['ladder'])} | VRAM={plan['vram_gb']:.0f} GB | {cap_text}", fg=typer.colors.CYAN))
+    typer.echo("")
+    typer.echo(f"   {'profile':>8} {'est_h':>7} {'max_steps':>11} {'batch':>6} {'chunk':>6} {'chin_%':>7}")
+    for s in plan["stages"]:
+        typer.echo(
+            f"   {s['profile']:>8} {s['est_h']:>7.2f} {s['max_steps']:>11,} {s['batch_size']:>6} {s['chunk_size']:>6} {s['chinchilla_pct']:>6.1f}%"
+        )
+    typer.echo("")
+
+
+def escalate(
+    target: str = typer.Option("shpak", "--target", "-t", help="Target profile: chyzh | shpak | zubr"),
+    max_steps: int | None = typer.Option(None, "--max-steps", help="Cap total training across all stages (default: train to Chinchilla)"),
+    vram_gb: float = typer.Option(16.0, "--vram", help="Available VRAM in GB (clamps batch_size)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print plan only, do not execute"),
+):
+    print_tui_header()
+    plan = plan_escalation(target, max_steps=max_steps, vram_gb=vram_gb)
+    _print_escalation_plan(plan)
+    if dry_run:
+        typer.echo(typer.style("🏁 Dry-run complete. No execution.", fg=typer.colors.YELLOW))
+        return
+    yaml_name = f".escalate-{target}-{max_steps}" if max_steps else f".escalate-{target}-chinchilla"
+    yaml_path = f"configs/pipelines/{yaml_name}.yaml"
+    _write_escalation_yaml(plan, yaml_path)
+    typer.echo(typer.style(f"📝 Plan persisted to {yaml_path}", fg=typer.colors.GREEN))
+    typer.echo(typer.style("🚀 Handing off to pipeline()...\n", fg=typer.colors.GREEN, bold=True))
+    pipeline(name=yaml_name, config_dir="configs/pipelines")
