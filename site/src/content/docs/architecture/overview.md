@@ -173,24 +173,10 @@ final 10 %).
 
 ## v5.8 opt-in research features
 
-Three v5.8 features are **opt-in** (default OFF) — measure before
-flipping the switch.
-
-### Sparse-BitNet 6:8 (model)
-
-A 2/8 weight sparsity mask computed in `no_grad` from
-`w.abs().topk(6, dim=-1)` over groups of 8, applied via a custom
-`DualMaskSTE` autograd function. Forward: 2 of every 8 weights are
-zeroed → 25 % of multiplications skipped. Backward: **full** gradient
-through the master weight (Dual STE — the mask can adapt if the
-gradient demands it).
-
-**Validation on shpak 52.8M:** +1 % step time, +2 % peak VRAM. No win
-on CUDA (no N:M-aware GEMM kernels). The paper's main claim is **quality preservation** —
-1.58-bit is more sparsity-friendly than full-precision
-(BF16 +1.20 PPL vs Sparse-BitNet +0.32 PPL on 0.5B).
-Useful for CPU/inference with Rust `ternary_matmul_cpu`. See [1-bit weights](/busel-ai/architecture/one-bit-weights/#sparse-bitnet-68-v58-opt-in) for the
-implementation.
+One v5.8 feature remains as an opt-in (default OFF) — measure before
+flipping the switch. **LCSB** is now default ON in shpak/zubr/chyzh
+since v6.0. **Sparse-BitNet 6:8** was removed in the v6.2 cleanup
+(no CUDA speedup, unproven at busel scale).
 
 ### LCSB selective per-layer backward (model)
 
@@ -240,18 +226,11 @@ model:
 
 **🆕 v5.8**
 
-### Pair-interaction overhead (added on top of LCSB alone)
+### Validated config: LCSB alone
 
-A focused study on shpak 52.8M (10 steps) — what's the cost of
-adding each of the other two features to LCSB?
-
-| Pair added to LCSB | Step overhead | Memory overhead | Verdict |
-|---|---:|---:|---|
-| + Sparse-BitNet 6:8 | +6.4 % | +273 MB | Mask computation overhead on CUDA. Win on CPU/inference only. |
-
-**LCSB alone remains the optimal config** — 1704 ms / 5456 MB /
-~38k tok/s. Don't combine with Sparse unless you have
-a specific reason. See `tests/v58_profile.py`.
+The 10-step shpak 52.8M profile is 1704 ms / 5456 MB / ~38k tok/s
+with LCSB alone (`selective_backward=True, backward_ratio=0.5`).
+This is the production default for shpak/zubr/chyzh since v6.0.
 
 ## What it doesn't get you
 

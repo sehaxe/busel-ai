@@ -274,15 +274,14 @@ def effective_max_steps(self) -> int:
 
 ## v5.8 opt-in research flags
 
-Four new flags landed in v5.8. All default OFF — **profile before flipping**. The 5-run shpak comparison script is `uv run python tests/shpak_profile_5runs.py`.
+Two new flags landed in v5.8. Both relate to **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh since v6.0). The Sparse-BitNet 6:8 flag was removed in the v6.2 cleanup (no CUDA speedup, unproven at busel scale). The 2-mode v6.x comparison script is `uv run python tests/v58_profile.py`.
 
 | Flag | Section | Default | Effect on shpak 52.8M (batch=16 ctx=4096, 10 steps) |
 |---|---|---|---|
-| `sparse_6_8` | `model:` | `False` | +1 % step, +2 % mem. **No CUDA speed win** (no N:M-aware GEMM kernels); paper's main claim is **quality preservation** (1.58-bit is more sparsity-friendly than full-precision). Win on CPU/inference. |
 | `selective_backward` | `model:` | `False` | When ON, activates LCSB (see `backward_ratio`). |
 | `backward_ratio` | `model:` | `1.0` | Used when `selective_backward=True`. Practical: 0.3-0.7. **−44 % step, −25 % mem, +80 % tok/s at 0.5.** |
 
-To flip LCSB (the recommended default after extended validation):
+To flip LCSB (default ON in shpak/zubr/chyzh since v6.0):
 
 ```yaml
 # configs/default.yaml — shpak profile
@@ -290,16 +289,6 @@ model:
   selective_backward: true
   backward_ratio: 0.5
 ```
-
-Don't combine `sparse_6_8: true` with `backward_ratio: 0.5` expecting a multiplicative speedup — shpak shows Sparse mask-computation overhead partially cancels LCSB's win. **🆕 v5.8**
-
-### Pair-interaction overhead on top of LCSB alone (shpak 52.8M, 10 steps)
-
-| Pair | Step overhead | Memory overhead |
-|---|---:|---:|
-| + Sparse-BitNet 6:8 | +6.4 % | +273 MB |
-
-**LCSB alone is the recommended config** (1666 ms / 4102 MB / 39,322 tok/s on shpak). Don't add Sparse to LCSB without a specific reason (+6% step, +273 MB). Validate with `tests/v58_profile.py --mode shpak-pairs`. **🆕 v5.8, default ON in v6.0**
 
 ## How to add a new profile
 

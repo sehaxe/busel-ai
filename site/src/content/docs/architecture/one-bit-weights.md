@@ -143,66 +143,6 @@ projected back via `H_BitLinear(h, d)`. The "clamp" is there
 to bound the gate's range so the ternary quantiser doesn't have
 to handle extreme outliers.
 
-## Sparse-BitNet 6:8 (v5.8, opt-in)
-
-A further compression pass on top of ternary: **2 of every 8 weights
-are zeroed** via a 6:8 N:M semi-structured mask. The mask is computed
-in `no_grad` mode from `w.abs().topk(6, dim=-1)` over groups of 8
-in the master weight. A custom `autograd.Function` (`DualMaskSTE`)
-applies the mask in the forward pass and **passes the full gradient
-through in the backward pass** — Dual STE — so the mask can adapt
-when the gradient demands it.
-
-```python
-class DualMaskSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, mask):
-        ctx.save_for_backward(mask)
-        return x * mask                          # sparse
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None                 # full grad for x
-
-def _n_m_6_8_mask(w):
-    w_flat = w.view(-1, 8)
-    _, topk_idx = w_flat.abs().topk(6, dim=-1)
-    return torch.zeros_like(w_flat).scatter_(-1, topk_idx, 1.0).view(w.shape)
-
-class BitLinear_a4_8(nn.Linear):
-    def __init__(self, in_features, out_features, is_intermediate=False,
-                 topk_ratio=0.5, is_sparse_6_8=False):
-        super().__init__(in_features, out_features, bias=False)
-        self.is_sparse_6_8 = is_sparse_6_8
-        # ...
-```
-
-**Why opt-in (`is_sparse_6_8=False` by default):** on CUDA there are
-no N:M-aware GEMM kernels, so the mask adds overhead without a
-training-time speedup. On CPU/inference (Rust ternary matmul) the
-2/8 sparsity translates to a 2/8 compute-skip. Future win.
-
-**Validation on shpak 52.8M (batch=16, ctx=4096):**
-
-| Configuration | Step (ms) | Peak VRAM | tok/s | Loss@10 |
-|---|---:|---:|---:|---:|
-| Baseline | 2763.5 | 5475 MB | 23,715 | 5.892 |
-| + `is_sparse_6_8=True` | 2797.8 | 5569 MB | 23,424 | 5.908 |
-
-+1 % step time, +2 % memory — no win on CUDA hardware. **Don't enable
-on training unless you have N:M-aware kernels.** Use case: CPU
-inference with Rust `ternary_matmul_cpu`.
-
-To enable for the whole model at construction time:
-
-```python
-model = buselModel(cfg)               # sparse_6_8 lives in cfg
-# buselModel.__init__ walks all submodules and sets
-# is_sparse_6_8=True on every BitLinear_a4_8 it finds
-```
-
-The mask is **orthogonal to activation TopK sparsity** (which is on
-FFN intermediate layers via `topk_ratio`).
-
 ## Why this is autocast-safe
 
 The quantisation math (`mean`, `abs`, `sign`, `round`) is
@@ -231,8 +171,6 @@ forward pass.
 | `BitLinear_a4_8`         | `model/layers.py`     | ~30            |
 | `H_BitLinear`            | `model/layers.py`     | ~15            |
 | `RoundSTE`               | `model/layers.py`     | ~12            |
-| `DualMaskSTE` 🆕         | `model/layers.py`     | ~10            |
-| `_n_m_6_8_mask` 🆕       | `model/layers.py`     | ~5             |
 | `LearnableClampSTE`      | `model/layers.py`     | ~12            |
 | `RMSNorm`                | `model/layers.py`     | ~8             |
 | `SwishGLUClamped`        | `model/layers.py`     | ~25            |
