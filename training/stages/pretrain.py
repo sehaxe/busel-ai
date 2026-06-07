@@ -704,8 +704,8 @@ class buselPretrainStage:
                         json.dumps(
                             {
                                 "step": step,
-                                "loss": accumulated_loss,
-                                "aux_loss": accumulated_loss / max(1, self.cfg.grad_accum_steps),
+                                "loss": accumulated_loss / max(1, self.cfg.grad_accum_steps),
+                                "aux_loss": accumulated_aux_loss / max(1, self.cfg.grad_accum_steps),
                                 "lr": current_lr,
                                 "speed": speed,
                                 "vram": vram_mb,
@@ -717,7 +717,7 @@ class buselPretrainStage:
                 log_event(
                     "step_complete",
                     step=step,
-                    loss=round(accumulated_loss, 4),
+                    loss=round(accumulated_loss / max(1, self.cfg.grad_accum_steps), 4),
                     aux_loss=round(accumulated_aux_loss / max(1, self.cfg.grad_accum_steps), 4),
                     lr=round(current_lr, 7),
                     tokens_per_s=round(speed, 1),
