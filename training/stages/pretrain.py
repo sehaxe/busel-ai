@@ -588,7 +588,7 @@ class buselPretrainStage:
             load_state_dict_safely(self.model, checkpoint["model_state_dict"])
             load_state_dict_safely(self.patcher, checkpoint["patcher_state_dict"])
             if self.ema is not None and "ema_state_dict" in checkpoint:
-                self.ema.load_state_dict(checkpoint["ema_state_dict"])
+                self.ema.load_state_dict(checkpoint["ema_state_dict"], model=self.model)
             if checkpoint.get("step") != "emergency_backup":
                 self.start_step = checkpoint["step"]
                 self.start_file_idx = checkpoint.get("file_idx", 0)

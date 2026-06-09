@@ -849,8 +849,15 @@ class EMA:
     def state_dict(self) -> dict:
         return self.shadow
 
-    def load_state_dict(self, sd: dict):
+    def load_state_dict(self, sd: dict, model=None):
         self.shadow = {
             k: (v.float() if v.dtype.is_floating_point else v.clone())
             for k, v in sd.items()
         }
+        if model is not None:
+            model_keys = set(model.state_dict().keys())
+            shadow_keys = set(self.shadow.keys())
+            if shadow_keys != model_keys:
+                stripped = {k.removeprefix("_orig_mod."): v for k, v in self.shadow.items()}
+                if set(stripped.keys()) == model_keys:
+                    self.shadow = stripped
