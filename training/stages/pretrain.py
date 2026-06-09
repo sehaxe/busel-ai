@@ -292,7 +292,7 @@ class buselPretrainStage:
     def _vram_total_mb(self) -> float:
         """Total GPU VRAM in MB (0 on CPU)."""
         if self.device == "cuda" and torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_mem / 1024**2
+            return torch.cuda.get_device_properties(0).total_memory / 1024**2
         return 0.0
 
     def _rebuild_dataloader(self, new_batch_size: int) -> None:
