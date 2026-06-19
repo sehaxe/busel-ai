@@ -31,34 +31,33 @@ class MoDSequenceRouter(nn.Module):
 
 
 class BulbaTernaryTitanExpertFFN(nn.Module):
-    """
-    FFN-блок одного MoE-эксперта со слиянием проекций Gate-Up.
+    """FFN-блок одного MoE-эксперта со слиянием проекций Gate-Up.
     Нативно использует класс SwishGLUClamped из BitNet v2.
+    При sct_rank > 0 переключается на Spectral Compact Training (arXiv:2604.00733).
     """
-    def __init__(self, d_model, d_ffn):
+    def __init__(self, d_model, d_ffn, sct_rank=0):
         super().__init__()
-        self.ffn = SwishGLUClamped(d_model, d_ffn)
+        self.ffn = SwishGLUClamped(d_model, d_ffn, sct_rank=sct_rank)
 
     def forward(self, x):
         return self.ffn(x)
 
 
 class BulbaTernaryTitanMoE(nn.Module):
-    def __init__(self, d_model, d_ffn, num_experts=64, top_k=2):
+    def __init__(self, d_model, d_ffn, num_experts=64, top_k=2, sct_rank=0):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.d_model = d_model
-        
-        # Shared Experts
+        self.sct_rank = sct_rank
+
         self.shared_experts = nn.ModuleList([
-            BulbaTernaryTitanExpertFFN(d_model, d_ffn) 
+            BulbaTernaryTitanExpertFFN(d_model, d_ffn, sct_rank=sct_rank)
             for _ in range(2)
         ])
-        
-        # Routed Experts
+
         self.routed_experts = nn.ModuleList([
-            BulbaTernaryTitanExpertFFN(d_model, d_ffn) 
+            BulbaTernaryTitanExpertFFN(d_model, d_ffn, sct_rank=sct_rank)
             for _ in range(num_experts)
         ])
         

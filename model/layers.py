@@ -171,16 +171,63 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight.to(x.dtype)
 
 class SwishGLUClamped(nn.Module):
-    def __init__(self, d_model, d_ffn):
+    def __init__(self, d_model, d_ffn, sct_rank=0):
         super().__init__()
-        self.w_gate_up = BitLinear_a4_8(d_model, 2 * d_ffn)
-        self.w_down = H_BitLinear(d_ffn, d_model, is_intermediate=True)
+        if sct_rank > 0:
+            self.w_gate_up = SpectralLinear(d_model, 2 * d_ffn, rank=sct_rank)
+            self.w_down = SpectralLinear(d_ffn, d_model, rank=sct_rank, hadamard=True)
+        else:
+            self.w_gate_up = BitLinear_a4_8(d_model, 2 * d_ffn)
+            self.w_down = H_BitLinear(d_ffn, d_model, is_intermediate=True)
         self.clipping_bounds = nn.Parameter(torch.ones(d_ffn) * 10.0)
-        self.down_norm = RMSNorm(d_ffn) # 🎯 ИСПРАВЛЕНИЕ: RMSNorm перед H-BitLinear
+        self.down_norm = RMSNorm(d_ffn)
 
     def forward(self, x):
         gate_up = self.w_gate_up(x)
         gate_raw, up = gate_up.chunk(2, dim=-1)
         gate_swish = gate_raw * torch.sigmoid(gate_raw)
         gate = LearnableClampSTE.apply(gate_swish, self.clipping_bounds)
-        return self.w_down(self.down_norm(gate * up)) # 🎯 ИСПРАВЛЕНИЕ
+        return self.w_down(self.down_norm(gate * up))
+
+
+class SpectralLinear(nn.Module):
+    """Spectral Compact Training linear layer (arXiv:2604.00733).
+
+    Replaces dense W (d_in, d_out) with low-rank factors U·diag(s)·V^T:
+      U: (d_in, rank)   — ternary via STE, fp32 master
+      s: (rank,)        — fp32 singular-value scaling
+      V: (d_out, rank)  — ternary via STE, fp32 master
+
+    Forward: ((x @ U_q) * s) @ V_q.T — two small matmuls instead of one large.
+    At rank=32, (384, 768) → (384, 32) + (32,) + (768, 32) = 8× fewer params.
+    Maintains 1.58-bit ternary guarantee via STE on U and V factors.
+
+    Set hadamard=True for o_proj-equivalent (applies Walsh-Hadamard rotation
+    to input before the factorized matmul, matching H_BitLinear semantics).
+    """
+
+    def __init__(self, d_in, d_out, rank=32, hadamard=False):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+        self.rank = rank
+        self.hadamard = hadamard
+        self.U = nn.Parameter(torch.randn(d_in, rank) * (1.0 / math.sqrt(d_in)))
+        self.s = nn.Parameter(torch.ones(rank) * (1.0 / math.sqrt(rank)))
+        self.V = nn.Parameter(torch.randn(d_out, rank) * (1.0 / math.sqrt(d_out)))
+
+    def forward(self, x):
+        if self.hadamard:
+            x = fast_walsh_hadamard_transform(x)
+        dtype = x.dtype
+        U = self.U.to(dtype)
+        s = self.s.to(dtype)
+        V = self.V.to(dtype)
+        alpha_u = U.abs().mean().detach() + 1e-5
+        alpha_v = V.abs().mean().detach() + 1e-5
+        u_scaled = torch.clamp(U / alpha_u, -1, 1)
+        v_scaled = torch.clamp(V / alpha_v, -1, 1)
+        u_q = u_scaled + (RoundSTE.apply(u_scaled) - u_scaled)
+        v_q = v_scaled + (RoundSTE.apply(v_scaled) - v_scaled)
+        h = (x @ u_q) * s
+        return (h @ v_q.T) * (alpha_u * alpha_v)

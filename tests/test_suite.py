@@ -3001,6 +3001,38 @@ class TestbuselPlotter(unittest.TestCase):
         self.assertTrue(is_registered("optimizer", "muonq"))
         print("   ✅ 'muonq' registered as optimizer")
 
+    def test_sct_spectral_linear(self):
+        """🔮 [SCT-1] SpectralLinear: low-rank factorization with ternary STE."""
+        print("🧪 [SCT-1] SpectralLinear forward/backward + param reduction...")
+        from model.layers import SpectralLinear
+        lin = SpectralLinear(384, 768, rank=32)
+        n_params = sum(p.numel() for p in lin.parameters())
+        self.assertEqual(n_params, 384 * 32 + 32 + 768 * 32)
+        self.assertLess(n_params, 384 * 768 / 7)
+        x = torch.randn(2, 16, 384, dtype=torch.bfloat16)
+        out = lin(x)
+        self.assertEqual(out.shape, (2, 16, 768))
+        out.sum().backward()
+        self.assertIsNotNone(lin.U.grad)
+        self.assertIsNotNone(lin.s.grad)
+        self.assertIsNotNone(lin.V.grad)
+        print(f"   ✅ rank=32: {n_params:,} params (8x < dense {384*768:,}), fwd+bwd OK")
+
+    def test_sct_swishglu_integration(self):
+        """🔮 [SCT-2] SwishGLUClamped with sct_rank: SCT toggle works."""
+        print("🧪 [SCT-2] SwishGLUClamped sct_rank toggle...")
+        from model.layers import SwishGLUClamped
+        glu_sct = SwishGLUClamped(384, 768, sct_rank=32)
+        glu_dense = SwishGLUClamped(384, 768, sct_rank=0)
+        n_sct = sum(p.numel() for p in glu_sct.parameters())
+        n_dense = sum(p.numel() for p in glu_dense.parameters())
+        self.assertLess(n_sct, n_dense / 7)
+        x = torch.randn(2, 16, 384, dtype=torch.bfloat16)
+        out = glu_sct(x)
+        self.assertEqual(out.shape, (2, 16, 384))
+        out.sum().backward()
+        print(f"   ✅ SCT={n_sct:,} vs dense={n_dense:,} ({n_dense/n_sct:.1f}x), fwd+bwd OK")
+
 
 if __name__ == "__main__":
     unittest.main()
