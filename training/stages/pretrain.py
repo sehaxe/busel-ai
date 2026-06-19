@@ -17,6 +17,7 @@ import math
 import json
 import glob
 import re
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -144,6 +145,14 @@ class buselPretrainConfig:
     dynamic_compile: bool = True
     keep_last_n: int = 5
 
+    optimization_mode: str = "manual"
+    manual_overrides: Any = None
+    sct_rank: int = 0
+    sct_scope: str = "mlp"
+    use_flex_attention: bool = False
+    use_cla: bool = False
+    cla_share_every: int = 2
+
     @classmethod
     def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
         cfg = cls()
@@ -202,6 +211,13 @@ class buselPretrainConfig:
         cfg.inductor_cache_max_gb = float(p.get("inductor_cache_max_gb", cfg.inductor_cache_max_gb))
         cfg.dynamic_compile = bool(p.get("dynamic_compile", cfg.dynamic_compile))
         cfg.keep_last_n = int(p.get("keep_last_n", cfg.keep_last_n))
+        cfg.optimization_mode = str(t.get("optimization_mode", cfg.optimization_mode))
+        cfg.manual_overrides = t.get("manual_overrides", None)
+        cfg.sct_rank = int(t.get("sct_rank", cfg.sct_rank))
+        cfg.sct_scope = str(t.get("sct_scope", cfg.sct_scope))
+        cfg.use_flex_attention = bool(t.get("use_flex_attention", cfg.use_flex_attention))
+        cfg.use_cla = bool(m.get("use_cla", cfg.use_cla))
+        cfg.cla_share_every = int(m.get("cla_share_every", cfg.cla_share_every))
         if cfg.d_model % cfg.n_hyper != 0:
             raise ValueError(
                 f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
@@ -282,6 +298,7 @@ class buselPretrainStage:
         self.compile_mode: str = "default"
         self._oom_reductions: int = 0
         self._max_oom_reductions: int = 6
+        self._last_chunk_block_step: int = -1000
 
     def _vram_used_mb(self) -> float:
         """Current GPU VRAM usage in MB (0 on CPU)."""
@@ -295,13 +312,177 @@ class buselPretrainStage:
             return torch.cuda.get_device_properties(0).total_memory / 1024**2
         return 0.0
 
-    def _rebuild_dataloader(self, new_batch_size: int) -> None:
+    def _ram_used_mb(self) -> float:
+        """Current process RSS in MB (Linux, 0 on other platforms)."""
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024
+        except Exception:
+            pass
+        return 0.0
+
+    def _ram_total_mb(self) -> float:
+        """Total system RAM in MB (Linux, 0 on other platforms)."""
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) / 1024  # KB→MB
+        except Exception:
+            pass
+        return 0.0
+
+    def _ram_available_mb(self) -> float:
+        """Available system RAM in MB (Linux, 0 on other platforms)."""
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1024  # KB→MB
+        except Exception:
+            pass
+        return 0.0
+
+    def _compute_auto_preset(self, total_params: int) -> dict:
+        """v8.5 AUTO-MODE decision matrix.
+
+        Picks a preset of optimization flags based on param count and device.
+        Hierarchical: this preset is applied first, then `manual_overrides`
+        from the YAML profile can override any of these on top.
+
+        Buckets (tuned for RTX 5060 Ti 16GB / 2x 3090):
+          <50M       — small sandbox (chyzh/scale_*); keep it simple
+          50M-120M   — kruk/shpak/zubr; free wins only (Cautious, CLA, FlexAttn)
+          120M-1B    — production; add SF + SCT rank=64 + Hestia + QuEST
+          1B-7B      — target for 5060 Ti 16GB; MuonQ + SCT rank=32 + full stack
+          >7B        — 2x 3090 territory; same as 1-7B but more aggressive LCSB
+        """
+        has_gpu = self.device in ("cuda", "mps")
+
+        if total_params < 50_000_000:
+            return {
+                "optimizer_type": "lotus_muon",
+                "use_cautious": True,
+                "use_schedule_free": False,
+                "sct_rank": 0,
+                "use_flex_attention": False,
+                "use_cla": False,
+                "use_hestia": False,
+                "use_quest": False,
+            }
+        if total_params < 120_000_000:
+            return {
+                "optimizer_type": "lotus_muon",
+                "use_cautious": True,
+                "use_schedule_free": False,
+                "sct_rank": 0,
+                "use_flex_attention": has_gpu,
+                "use_cla": True,
+                "use_hestia": False,
+                "use_quest": False,
+            }
+        if total_params < 1_000_000_000:
+            return {
+                "optimizer_type": "lotus_muon",
+                "use_cautious": True,
+                "use_schedule_free": True,
+                "min_lr_ratio": 1.0,
+                "sct_rank": 64,
+                "use_flex_attention": has_gpu,
+                "use_cla": True,
+                "use_hestia": True,
+                "use_quest": True,
+            }
+        if total_params < 7_000_000_000:
+            return {
+                "optimizer_type": "muonq",
+                "use_cautious": True,
+                "use_schedule_free": True,
+                "min_lr_ratio": 1.0,
+                "sct_rank": 32,
+                "use_flex_attention": has_gpu,
+                "use_cla": True,
+                "use_hestia": True,
+                "use_quest": True,
+            }
+        return {
+            "optimizer_type": "muonq",
+            "use_cautious": True,
+            "use_schedule_free": True,
+            "min_lr_ratio": 1.0,
+            "sct_rank": 32,
+            "use_flex_attention": has_gpu,
+            "use_cla": True,
+            "use_hestia": True,
+            "use_quest": True,
+            "backward_ratio": 0.4,
+        }
+
+    def _apply_auto_mode(self) -> bool:
+        """Apply auto-mode preset + manual overrides.
+
+        Must be called AFTER `self.model` is built (we need total_params) but
+        BEFORE the scale gate. If any architectural field (sct_rank, use_cla,
+        use_flex_attention) changed, the model is rebuilt with the new cfg.
+
+        Returns True if the model was rebuilt.
+        """
+        if self.cfg.optimization_mode != "auto" or self.model is None:
+            return False
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        preset = self._compute_auto_preset(total_params)
+
+        applied: list[tuple] = []
+        for k, v in preset.items():
+            if not hasattr(self.cfg, k):
+                continue
+            if getattr(self.cfg, k) != v:
+                setattr(self.cfg, k, v)
+                applied.append((k, v, "preset"))
+
+        if self.cfg.manual_overrides:
+            for k, v in self.cfg.manual_overrides.items():
+                if not hasattr(self.cfg, k):
+                    print(f"⚠️  [AUTO-OVERRIDE]: cfg has no field {k!r}, skipping")
+                    continue
+                if getattr(self.cfg, k) != v:
+                    setattr(self.cfg, k, v)
+                    applied.append((k, v, "override"))
+
+        arch_fields = {"sct_rank", "use_cla", "use_flex_attention"}
+        arch_changed = any(k in arch_fields for k, _, _ in applied)
+        rebuilt = False
+        if arch_changed:
+            del self.model
+            del self.patcher
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            from model.patching import StridedFastBLTPatcher as _Patcher
+            from model.backbone import buselModel as _Model
+            self.patcher = _Patcher(d_model=self.cfg.d_model).to(self.device)
+            self.model = _Model(self.cfg).to(self.device)
+            rebuilt = True
+
+        if applied:
+            new_params = sum(p.numel() for p in self.model.parameters())
+            print(f"🤖 [AUTO-MODE]: preset applied for {new_params:,} params "
+                  f"(device={self.device})")
+            for k, v, src in applied:
+                tag = "🎛️  OVERRIDE" if src == "override" else "   preset "
+                print(f"  {tag}: {k}={v}")
+        return rebuilt
+
+    def _rebuild_dataloader(self, new_batch_size: int, chunk_size: int | None = None) -> None:
         """Recreate dataloader with a smaller batch size (OOM recovery)."""
         from data.pipeline import get_busel_dataloader
-        current_chunk_size = self.cfg.chunk_size // 4
+        if chunk_size is None:
+            chunk_size = self.cfg.chunk_size // 4
         self.dataloader = get_busel_dataloader(
             self.cfg.data_path,
-            chunk_size=current_chunk_size,
+            chunk_size=chunk_size,
             batch_size=new_batch_size,
             start_file_idx=self.global_current_file_idx,
             start_byte_offset=self.global_current_byte_offset,
@@ -472,7 +653,19 @@ class buselPretrainStage:
 
         self.patcher = StridedFastBLTPatcher(d_model=self.cfg.d_model).to(self.device)
         self.model = buselModel(self.cfg).to(self.device)
-        total_params = sum(p.numel() for p in self.model.parameters())
+
+        if self._apply_auto_mode():
+            total_params = sum(p.numel() for p in self.model.parameters())
+        else:
+            total_params = sum(p.numel() for p in self.model.parameters())
+
+        if self.cfg.use_hestia and hestia_temp is None:
+            hestia_temp = torch.tensor(self.cfg.hestia_init_temp, device=self.device, dtype=torch.float32)
+        configure_bitlinear(
+            use_tequila=self.cfg.use_tequila,
+            tequila_lambda=self.cfg.tequila_lambda,
+            hestia_temperature=hestia_temp if self.cfg.use_hestia else None,
+        )
 
         _SCALE_THRESHOLD = 50_000_000
         if total_params < _SCALE_THRESHOLD:
@@ -709,19 +902,32 @@ class buselPretrainStage:
 
             if new_chunk_size != current_chunk_size:
                 new_batch_size = max(
-                    1, (self.cfg.batch_size * (self.cfg.chunk_size // 4)) // new_chunk_size
+                    1, (current_batch_size * current_chunk_size) // new_chunk_size
                 )
 
                 chunk_grows = new_chunk_size > current_chunk_size
                 if chunk_grows and self.device == "cuda":
                     vram_now = self._vram_used_mb()
                     vram_total = self._vram_total_mb()
-                    if vram_total > 0 and vram_now / vram_total > 0.80:
-                        print(
-                            f"⏸️  Chunk {current_chunk_size}→{new_chunk_size} blocked: "
-                            f"VRAM {vram_now:.0f}/{vram_total:.0f}MB ({vram_now/vram_total*100:.0f}%) "
-                            f"too high for growth. Staying at chunk={current_chunk_size}"
-                        )
+                    ram_now = self._ram_used_mb()
+                    ram_total = self._ram_total_mb()
+                    vram_high = vram_total > 0 and vram_now / vram_total > 0.80
+                    ram_high = ram_total > 0 and ram_now / ram_total > 0.70
+                    if vram_high or ram_high:
+                        if step - self._last_chunk_block_step >= 100:
+                            reason = []
+                            if vram_high:
+                                reason.append(f"VRAM {vram_now:.0f}/{vram_total:.0f}MB")
+                            if ram_high:
+                                reason.append(f"RAM {ram_now:.0f}/{ram_total:.0f}MB")
+                            print(
+                                f"⏸️  Chunk {current_chunk_size}→{new_chunk_size} blocked: "
+                                f"{', '.join(reason)} too high for growth"
+                            )
+                            self._last_chunk_block_step = step
+                        log_event("chunk_growth_blocked", step=step, chunk=current_chunk_size,
+                                  vram_mb=round(vram_now, 1), vram_total_mb=round(vram_total, 1),
+                                  ram_mb=round(ram_now, 1), ram_total_mb=round(ram_total, 1))
                         log_event("chunk_growth_blocked", step=step, chunk=current_chunk_size,
                                   vram_mb=round(vram_now, 1), vram_total_mb=round(vram_total, 1))
                         new_chunk_size = current_chunk_size
@@ -845,9 +1051,9 @@ class buselPretrainStage:
                     torch.cuda.empty_cache()
                     self._oom_reductions += 1
                     old_bs = current_batch_size
-                    current_batch_size = max(1, current_batch_size // 2)
+                    current_batch_size = max(1, current_batch_size - 2)
                     self.cfg.batch_size = current_batch_size
-                    self._rebuild_dataloader(current_batch_size)
+                    self._rebuild_dataloader(current_batch_size, current_chunk_size)
                     print(
                         f"⚠️  OOM at step {step}! batch {old_bs}→{current_batch_size} "
                         f"(attempt {self._oom_reductions}/{self._max_oom_reductions})"
@@ -876,16 +1082,43 @@ class buselPretrainStage:
             if self.ema is not None:
                 self.ema.update(self.model)
 
-            if self.device == "cuda" and current_batch_size > 1 and self._oom_reductions < self._max_oom_reductions:
+            if self._oom_reductions < self._max_oom_reductions:
                 vram_now = self._vram_used_mb()
                 vram_total = self._vram_total_mb()
-                if vram_total > 0 and vram_now / vram_total > 0.88:
-                    old_bs = current_batch_size
-                    current_batch_size = max(1, current_batch_size - 1)
-                    self.cfg.batch_size = current_batch_size
-                    self._rebuild_dataloader(current_batch_size)
-                    print(f"📉 VRAM {vram_now:.0f}/{vram_total:.0f}MB ({vram_now/vram_total*100:.0f}%) → batch {old_bs}→{current_batch_size}")
-                    log_event("vram_auto_reduce", step=step, old_batch=old_bs, new_batch=current_batch_size, vram_mb=round(vram_now, 1))
+                ram_now = self._ram_used_mb()
+                ram_total = self._ram_total_mb()
+
+                reduce_reason = None
+                if vram_total > 0:
+                    vram_pct = vram_now / vram_total
+                    if vram_pct > 0.93 and current_batch_size > 1:
+                        reduce_reason = f"VRAM {vram_now:.0f}/{vram_total:.0f}MB ({vram_pct*100:.0f}%)"
+                if ram_total > 0:
+                    ram_pct = ram_now / ram_total
+                    if ram_pct > 0.82 and current_batch_size > 1:
+                        reason = f"RAM {ram_now:.0f}/{ram_total:.0f}MB ({ram_pct*100:.0f}%)"
+                        reduce_reason = f"{reduce_reason} + {reason}" if reduce_reason else reason
+
+                if reduce_reason:
+                    new_bs = max(1, current_batch_size - 2)
+                    self.cfg.batch_size = new_bs
+                    current_batch_size = new_bs
+                    self._rebuild_dataloader(new_bs, current_chunk_size)
+                    gc.collect()
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    print(f"📉 {reduce_reason} → batch↓{new_bs}")
+                    log_event("memory_auto_reduce", step=step, new_batch=new_bs,
+                              vram_mb=round(vram_now, 1), ram_mb=round(ram_now, 1))
+                elif vram_total > 0 and vram_now / vram_total < 0.75 and ram_total > 0 and ram_now / ram_total < 0.60:
+                    if current_batch_size < self.cfg.batch_size + 8:
+                        new_bs = current_batch_size + 1
+                        self.cfg.batch_size = new_bs
+                        current_batch_size = new_bs
+                        self._rebuild_dataloader(new_bs, current_chunk_size)
+                        print(f"📈 VRAM {vram_now:.0f}MB + RAM {ram_now:.0f}MB → batch↑{new_bs}")
+                        log_event("memory_probe_up", step=step, new_batch=new_bs,
+                                  vram_mb=round(vram_now, 1), ram_mb=round(ram_now, 1))
 
             if self._emergency_save_requested["value"]:
                 os.makedirs("checkpoints", exist_ok=True)
