@@ -1,6 +1,6 @@
 """
-🧪 busel PROFILE SUITE — v6.0 cumulative + v6.1 dispersion profiler.
-Two modes: shpak-v60 / shpak-disp (see --help).
+🧪 busel PROFILE SUITE — v6.0 cumulative + v6.1 dispersion + v8.5 kruk profiler.
+Three modes: shpak-v60 / shpak-disp / kruk-v85 (see --help).
 """
 import argparse
 import json
@@ -30,6 +30,13 @@ N_WARMUP_5RUN = 2
 N_MEASURE_5RUN = 10
 BATCH_FALLBACK_FOR_ZUBR = 4
 
+_MODEL_FLAGS = frozenset((
+    "selective_backward", "backward_ratio", "use_differential_attention",
+    "use_qknorm_l2", "use_hestia", "use_cla", "cla_share_every",
+    "sct_rank", "use_flex_attention", "n_hyper", "top_k", "num_experts",
+    "d_model", "n_layers", "n_heads", "expert_hidden",
+))
+
 
 def _load_profile(name: str) -> dict:
     with open("configs/default.yaml", "r", encoding="utf-8") as f:
@@ -37,22 +44,22 @@ def _load_profile(name: str) -> dict:
     return full["profiles"][name]
 
 
-def _build(profile_name, batch_size, selective_backward, backward_ratio,
-            use_schedule_free, use_cautious, use_differential_attention,
-            use_dispersion_loss, device):
+def _build(profile_name, batch_size, device, **flags):
     cfg_profile = _load_profile(profile_name)
     profile = dict(cfg_profile)
     profile["model"] = dict(profile["model"])
-    profile["model"]["selective_backward"] = selective_backward
-    profile["model"]["backward_ratio"] = backward_ratio
-    profile["model"]["use_differential_attention"] = use_differential_attention
     profile["data"] = dict(profile["data"])
     profile["data"]["batch_size"] = batch_size
     profile["data"]["chunk_size"] = CHUNK_SIZE_FORCED
     profile["training"] = dict(profile["training"])
-    profile["training"]["use_schedule_free"] = use_schedule_free
-    profile["training"]["use_cautious"] = use_cautious
-    profile["training"]["use_dispersion_loss"] = use_dispersion_loss
+
+    for k, v in flags.items():
+        if v is None:
+            continue
+        if k in _MODEL_FLAGS:
+            profile["model"][k] = v
+        else:
+            profile["training"][k] = v
 
     class Cfg:
         pass
@@ -61,6 +68,43 @@ def _build(profile_name, batch_size, selective_backward, backward_ratio,
     cfg.optimizer_type = "lotus_muon"
     cfg.lotus_rank = 8
     cfg.lotus_lr_scale = 0.5
+    cfg.lr_multipliers = None
+    cfg.n_hyper = 2
+    cfg.use_ema = True
+    cfg.ema_decay = 0.999
+    cfg.use_schedule_free = False
+    cfg.sf_beta = 0.9
+    cfg.sf_gamma_factor = 2.0
+    cfg.use_cautious = False
+    cfg.use_adafactor = False
+    cfg.use_quest = False
+    cfg.quest_bits = 1.58
+    cfg.use_tequila = False
+    cfg.tequila_lambda = 1e-3
+    cfg.use_hestia = False
+    cfg.hestia_init_temp = 6.0
+    cfg.hestia_end_temp = 0.0
+    cfg.use_differential_attention = False
+    cfg.use_qknorm_l2 = False
+    cfg.use_cla = False
+    cfg.cla_share_every = 2
+    cfg.sct_rank = 0
+    cfg.sct_scope = "mlp"
+    cfg.use_flex_attention = False
+    cfg.use_dispersion_loss = False
+    cfg.dispersion_weight = 0.1
+    cfg.dispersion_temperature = 2.0
+    cfg.lr_schedule = "cosine"
+    cfg.wsd_decay_fraction = 0.2
+    cfg.wsd_s_enabled = False
+    cfg.wsd_s_interval = 1000
+    cfg.wsd_s_decay_steps = 200
+    cfg.optimization_mode = "manual"
+    cfg.use_salt = False
+    cfg.salt_teacher_profile = "chyzh"
+    cfg.salt_kd_temperature = 2.0
+    cfg.salt_kd_alpha = 0.5
+    cfg.salt_kd_steps = 0
     for src in (profile["model"], profile["data"], profile["training"]):
         for k, v in src.items():
             setattr(cfg, k, v)
@@ -83,6 +127,8 @@ def _build(profile_name, batch_size, selective_backward, backward_ratio,
         lotus_lr_scale=cfg.lotus_lr_scale,
         use_schedule_free=cfg.use_schedule_free,
         use_cautious=cfg.use_cautious,
+        use_quest=getattr(cfg, "use_quest", False),
+        quest_bits=getattr(cfg, "quest_bits", 1.58),
     )
     autopilot = buselAutoPilot(opt, max_lr_muon=cfg.learning_rate_muon,
                                  max_lr_adamw=cfg.learning_rate_adamw, target_wd=cfg.weight_decay)
@@ -90,14 +136,10 @@ def _build(profile_name, batch_size, selective_backward, backward_ratio,
     return model, patcher, opt, autopilot, loss_engine, cfg
 
 
-def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
-             selective_backward=False, backward_ratio=1.0,
-             scale_stats=False, use_schedule_free=False, use_cautious=False,
-             use_differential_attention=False, use_dispersion_loss=False):
-    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags=lcsb={selective_backward}({backward_ratio}) sf={use_schedule_free} cau={use_cautious} diff_attn={use_differential_attention} disp={use_dispersion_loss}\n{'=' * 80}")
-    model, patcher, opt, ap, loss_engine, cfg = _build(
-        profile_name, batch_size, selective_backward, backward_ratio, use_schedule_free, use_cautious, use_differential_attention, use_dispersion_loss, device,
-    )
+def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure, **flags):
+    flag_str = " ".join(f"{k}={v}" for k, v in flags.items() if v is not None) or "(defaults)"
+    print(f"\n{'=' * 80}\n🔬 RUN: {name}\n   profile={profile_name} batch={batch_size} flags={flag_str}\n{'=' * 80}")
+    model, patcher, opt, ap, loss_engine, cfg = _build(profile_name, batch_size, device, **flags)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"   params: {n_params:,} ({n_params * 2 / 1024**2:.2f} MB FP16)")
 
@@ -156,10 +198,7 @@ def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
         peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
         tokens_per_step = cfg.batch_size * cfg.chunk_size
         tps = tokens_per_step / mean_step
-        if scale_stats:
-            print(f"   ✅ step={mean_step * 1000:.1f}±{std_step * 1000:.1f}ms  |  peak={peak_mb:.0f} MB  |  tps={tps:.0f}  |  loss@end={np.mean(losses[-3:]):.3f}")
-        else:
-            print(f"   ✅ step={mean_step * 1000:.1f}ms  |  peak={peak_mb:.0f} MB  |  tps={tps:.0f}  |  loss@end={np.mean(losses[-3:]):.3f}")
+        print(f"   ✅ step={mean_step * 1000:.1f}±{std_step * 1000:.1f}ms  |  peak={peak_mb:.0f} MB  |  tps={tps:.0f}  |  loss@end={np.mean(losses[-3:]):.3f}")
         return {
             "name": name,
             "profile": profile_name,
@@ -176,12 +215,7 @@ def _run_one(name, profile_name, batch_size, device, n_warmup, n_measure,
             print(f"   ⚠️  OOM at batch={batch_size}; falling back to batch={BATCH_FALLBACK_FOR_ZUBR}")
             del model, patcher, opt, ap, loss_engine
             torch.cuda.empty_cache()
-            return _run_one(name, profile_name, BATCH_FALLBACK_FOR_ZUBR, device, n_warmup, n_measure,
-                            selective_backward=selective_backward,
-                            backward_ratio=backward_ratio, scale_stats=scale_stats,
-                            use_schedule_free=use_schedule_free, use_cautious=use_cautious,
-                            use_differential_attention=use_differential_attention,
-                            use_dispersion_loss=use_dispersion_loss)
+            return _run_one(name, profile_name, BATCH_FALLBACK_FOR_ZUBR, device, n_warmup, n_measure, **flags)
         raise
     finally:
         if created_dir:
@@ -262,10 +296,41 @@ def mode_shpak_disp(device):
     return results
 
 
+def mode_kruk_v85(device):
+    """v8.5 Singularity profiler on kruk (~104M, 12 layers, 6 experts)."""
+    print("🔮 busel KRUK v8.5 SINGULARITY PROFILER — SCT + CLA + FlexAttention + auto-mode")
+    print("   Profile: kruk ~104M params (12 layers, 6 experts), batch=16 ctx=4096")
+    print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
+    print("   Tests v8.5 technologies: SCT, CLA, FlexAttention, Cautious, SF, QuEST, Hestia.\n")
+    runs = [
+        ("1. baseline (kruk defaults)",            {}),
+        ("2. + Cautious",                          {"use_cautious": True}),
+        ("3. + Cautious + CLA",                    {"use_cautious": True, "use_cla": True, "cla_share_every": 2}),
+        ("4. + Cautious + CLA + FlexAttn",         {"use_cautious": True, "use_cla": True, "cla_share_every": 2, "use_flex_attention": True}),
+        ("5. + Cautious + CLA + SCT r=32",         {"use_cautious": True, "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("6. + Cautious + CLA + SCT r=64",         {"use_cautious": True, "use_cla": True, "cla_share_every": 2, "sct_rank": 64}),
+        ("7. + Cautious + SF + CLA + SCT r=32",    {"use_cautious": True, "use_schedule_free": True, "min_lr_ratio": 1.0, "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("8. + Cautious + QuEST + CLA + SCT r=32", {"use_cautious": True, "use_quest": True, "quest_bits": 1.58, "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("9. + Cautious + Hestia + CLA + SCT r=32",{"use_cautious": True, "use_hestia": True, "hestia_init_temp": 6.0, "hestia_end_temp": 0.0, "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("10. + DA + Cautious + CLA + SCT r=32",   {"use_differential_attention": True, "use_cautious": True, "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("11. SOAP + CLA + SCT r=32",              {"optimizer_type": "soap", "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+        ("12. MuonQ + CLA + SCT r=32",             {"optimizer_type": "muonq", "use_cla": True, "cla_share_every": 2, "sct_rank": 32}),
+    ]
+    results = []
+    for name, flags in runs:
+        try:
+            results.append(_run_one(name, "kruk", BATCH, n_warmup=N_WARMUP_5RUN, n_measure=N_MEASURE_5RUN, **flags, device=device))
+        except Exception as e:
+            print(f"   ❌ FAILED: {type(e).__name__}: {e}")
+            results.append({"name": name, "error": str(e)})
+    _print_table("KRUK v8.5 SINGULARITY COMPARISON (~104M, batch=16 ctx=4096, 10 steps)", results)
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="busel v6.x profile suite (v6.0 cumulative + v6.1 dispersion)")
-    parser.add_argument("--mode", choices=["shpak-v60", "shpak-disp"],
-                        default="shpak-v60", help="Which comparison to run (default: shpak-v60)")
+    parser = argparse.ArgumentParser(description="busel profile suite (v6.0 + v6.1 + v8.5)")
+    parser.add_argument("--mode", choices=["shpak-v60", "shpak-disp", "kruk-v85"],
+                        default="kruk-v85", help="Which comparison to run (default: kruk-v85)")
     parser.add_argument("--out", default="checkpoints/v58_profile.json",
                         help="Output JSON path (default: checkpoints/v58_profile.json)")
     args = parser.parse_args()
@@ -273,8 +338,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     if args.mode == "shpak-v60":
         results = mode_shpak_v60(device)
-    else:
+    elif args.mode == "shpak-disp":
         results = mode_shpak_disp(device)
+    else:
+        results = mode_kruk_v85(device)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
