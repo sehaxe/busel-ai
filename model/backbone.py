@@ -109,11 +109,11 @@ class ManifoldConstrainedAttnRes(nn.Module):
 
 
 class buselDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, use_qknorm_l2=False, sct_rank=0):
+    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, use_qknorm_l2=False, sct_rank=0, use_flex_attention=False):
         super().__init__()
         self.mod_router = MoDSequenceRouter(d_model, capacity_factor=capacity_factor)
         if is_global:
-            self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential, use_qknorm_l2=use_qknorm_l2)
+            self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential, use_qknorm_l2=use_qknorm_l2, use_flex_attention=use_flex_attention)
         else:
             self.attn = BulbaGDN2SeRoPEBlock(d_model, n_heads)
         self.moe = BulbaTernaryTitanMoE(d_model, expert_hidden, num_experts=num_experts, top_k=top_k, sct_rank=sct_rank)
@@ -181,6 +181,7 @@ class buselModel(nn.Module):
 
         capacity = 1.0
         sct_rank = int(getattr(config, "sct_rank", 0))
+        use_flex_attention = bool(getattr(config, "use_flex_attention", False))
         self.layers = nn.ModuleList()
         for l in range(config.n_layers):
             is_global = (l + 1) % 4 == 0
@@ -191,12 +192,26 @@ class buselModel(nn.Module):
                 use_differential=bool(getattr(config, "use_differential_attention", False)),
                 use_qknorm_l2=bool(getattr(config, "use_qknorm_l2", False)),
                 sct_rank=sct_rank,
+                use_flex_attention=use_flex_attention,
             ))
 
         self.m_residuals = nn.ModuleList([
             ManifoldConstrainedAttnRes(config.d_model, n_hyper=self.n_hyper)
             for _ in range(config.n_layers)
         ])
+
+        use_cla = bool(getattr(config, "use_cla", False))
+        cla_share_every = max(1, int(getattr(config, "cla_share_every", 2)))
+        if use_cla:
+            mla_indices = [i for i in range(config.n_layers) if (i + 1) % 4 == 0]
+            for group_start in range(0, len(mla_indices), cla_share_every):
+                group = mla_indices[group_start:group_start + cla_share_every]
+                if len(group) <= 1:
+                    continue
+                first_attn = self.layers[group[0]].attn
+                for idx in group[1:]:
+                    self.layers[idx].attn.kv_compress = first_attn.kv_compress
+                    self.layers[idx].attn.kv_norm = first_attn.kv_norm
 
         self.final_norm = RMSNorm(config.d_model)
         self.mtp_pipeline = buselMTP4Pipeline(config)

@@ -10,12 +10,44 @@ import torch.nn.functional as F
 from model.layers import BitLinear_a4_8, H_BitLinear, RMSNorm, nvtx_range_push, nvtx_range_pop
 from busel_registry import register
 
-# 🎯 Нативный импорт официального ядра GDN-2 из flash-linear-attention
 try:
     from fla.ops.gdn2 import chunk_gdn2
     HAS_FLA_GDN2 = True
 except ImportError:
     HAS_FLA_GDN2 = False
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
+    _HAS_FLEX = True
+except ImportError:
+    _HAS_FLEX = False
+
+_flex_causal_mask_cache: dict = {}
+
+def _get_flex_causal_mask(seq_len: int, device: str, dtype: torch.dtype):
+    """Pre-compiled causal block mask for FlexAttention (cached per seq_len)."""
+    if not _HAS_FLEX:
+        return None
+    key = (seq_len, str(device), str(dtype))
+    if key not in _flex_causal_mask_cache:
+        def causal_mask(b, h, q_idx, kv_idx):
+            return torch.where(q_idx >= kv_idx, 0.0, -float('inf'))
+        _flex_causal_mask_cache[key] = _create_block_mask(causal_mask, B=None, H=None, Q=seq_len, KV=seq_len, device=device)
+    return _flex_causal_mask_cache[key]
+
+def _sdpa_or_flex(q, k, v, use_flex: bool = False, is_causal: bool = False):
+    """SDPA with optional FlexAttention. Falls back to SDPA on any error."""
+    if use_flex and _HAS_FLEX and q.is_cuda:
+        try:
+            if is_causal:
+                mask = _get_flex_causal_mask(q.shape[-2], str(q.device), q.dtype)
+                if mask is not None:
+                    return _flex_attention(q, k, v, block_mask=mask)
+            else:
+                return _flex_attention(q, k, v)
+        except Exception:
+            pass
+    return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
 
 @torch.jit.script
@@ -176,7 +208,7 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
 
 @register("attention", "mla")
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, d_model=1536, n_heads=12, d_c=128, use_differential=False, use_qknorm_l2=False):
+    def __init__(self, d_model=1536, n_heads=12, d_c=128, use_differential=False, use_qknorm_l2=False, use_flex_attention=False):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -184,6 +216,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.d_v = d_model // n_heads
         self.use_differential = use_differential
         self.use_qknorm_l2 = use_qknorm_l2
+        self.use_flex_attention = use_flex_attention
 
         self.kv_compress = BitLinear_a4_8(d_model, d_c)
         self.kv_norm = RMSNorm(d_c)
@@ -218,14 +251,14 @@ class MultiHeadLatentAttention(nn.Module):
             q = F.normalize(q, p=2, dim=-1)
             k = F.normalize(k, p=2, dim=-1)
 
-        attn1 = F.scaled_dot_product_attention(q, k, v)
+        attn1 = _sdpa_or_flex(q, k, v, use_flex=self.use_flex_attention)
         if self.use_differential:
             q2 = self.q2_decompress(self.q_norm(self.q2_compress(x))).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
             k2 = self.k2_decompress(kv_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
             if self.use_qknorm_l2:
                 q2 = F.normalize(q2, p=2, dim=-1)
                 k2 = F.normalize(k2, p=2, dim=-1)
-            attn2 = F.scaled_dot_product_attention(q2, k2, v)
+            attn2 = _sdpa_or_flex(q2, k2, v, use_flex=self.use_flex_attention)
             context = (attn1 - attn2) * self.diff_lambda
         else:
             context = attn1
