@@ -1,5 +1,5 @@
 """
-📚 busel LOGGING v1.0 — Structured JSON Event Stream
+📚 busel — Structured JSON Event Stream
 Emits one JSON object per line to checkpoints/busel.log.jsonl for downstream
 consumers (Telegram bot, web dashboard, analytics). Every training step,
 checkpoint save, curriculum change, and error is recorded as a discrete event

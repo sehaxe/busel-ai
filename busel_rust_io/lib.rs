@@ -121,6 +121,35 @@ fn init_thread_pool(num_threads: usize) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn fwht(data: Vec<f32>) -> Vec<f32> {
+    let n = data.len();
+    if n <= 1 { return data; }
+    let mut next_pow2: usize = 1;
+    while next_pow2 < n { next_pow2 *= 2; }
+    let mut x = if next_pow2 != n {
+        let mut padded = vec![0.0f32; next_pow2];
+        padded[..n].copy_from_slice(&data);
+        padded
+    } else { data };
+    let mut h: usize = 1;
+    let two = 2.0f32;
+    while h < next_pow2 {
+        for i in (0..next_pow2).step_by(2 * h) {
+            for j in i..(i + h) {
+                let a = x[j];
+                let b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let scale = (next_pow2 as f32).sqrt();
+    for v in x.iter_mut() { *v /= scale; }
+    x
+}
+
+#[pyfunction]
 fn get_cpu_count() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
@@ -134,5 +163,6 @@ fn busel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_cpu_count, m)?)?;
     m.add_function(wrap_pyfunction!(ternary_matmul_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(append_to_binary_file, m)?)?;
+    m.add_function(wrap_pyfunction!(fwht, m)?)?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 """
-🛸 busel REGISTRY v1.0 — Plug-in Extension Points
+🛸 busel — Plug-in Extension Points
 Sovereign type-based registry for swappable components (attention, optimizer,
 activation, patcher). When a new paper drops a new attention mechanism or
 optimizer, register it with a single decorator and it becomes available
