@@ -13,25 +13,44 @@ profiles:
       expert_hidden: 256
       num_experts: 2
       top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      selective_backward: false  # 🆕 LCSB selective per-layer backward
-      backward_ratio: 1.0    # 🆕 fraction of layers backprop'd (1.0 = all, 0.5 = half)
+      vocab_size: 326
+      selective_backward: true
+      backward_ratio: 0.5
+      use_differential_attention: true
     data:
       data_path: "data_train"
       chunk_size: 256
-      batch_size: 256
+      batch_size: 8192
     training:
-      max_steps: 200
-      warmup_steps: 10
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.003
+      max_steps: 500
+      warmup_steps: 5
+      min_lr_ratio: 1.0
+      learning_rate_muon: 0.0030
       learning_rate_adamw: 0.0003
       weight_decay: 0.1
-      grad_accum_steps: 1
-      checkpoint_interval: 200
-      use_dispersion_loss: false  # 🆕 Dispersion Loss (Wang 2026) on token embeddings
+      grad_accum_steps: 2
+      optimization_mode: manual
+      use_dispersion_loss: true
       dispersion_weight: 0.1
       dispersion_temperature: 2.0
+      use_schedule_free: true
+      use_cautious: false
+      use_tequila: true
+      use_quest: false
+      use_rho_loss: true
+      rho_keep_ratio: 0.5
+      use_dropbp: true
+      dropbp_prob: 0.3
+      lr_schedule: "cosine"
+      grad_accum_steps: 1
+      use_chunk_curriculum: false
+      use_routing_free: true
+    perf:
+      inductor_cache_dir: "~/.cache/busel/inductor"
+      inductor_cache_clean: false
+      inductor_cache_max_gb: 0.0
+      keep_last_n: 3
+      dynamic_compile: false
 
   micro_test:
     model:
@@ -161,35 +180,42 @@ profiles:
       expert_hidden: 768
       num_experts: 4
       top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
+      vocab_size: 326
       selective_backward: true
       backward_ratio: 0.5
+      use_differential_attention: true
+      use_hestia: false
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 48
+      batch_size: 64
     training:
       max_steps: 89518
       warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0010
-      learning_rate_adamw: 0.0001
+      min_lr_ratio: 1.0
+      learning_rate_muon: 0.0005
+      learning_rate_adamw: 0.00005
       weight_decay: 0.1
-      grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
-      use_dispersion_loss: false
+      grad_accum_steps: 1
+      use_dispersion_loss: true
       dispersion_weight: 0.1
       dispersion_temperature: 2.0
+      use_schedule_free: true
+      use_cautious: false
+      use_tequila: true
+      use_quest: false
+      use_dropbp: true
+      dropbp_prob: 0.3
+      use_rho_loss: true
+      rho_keep_ratio: 0.5
+      lr_schedule: "cosine"
     perf:
       inductor_cache_dir: "~/.cache/busel/inductor"
       inductor_cache_clean: false
       inductor_cache_max_gb: 0.0
       keep_last_n: 5
-      dynamic_compile: true
+      dynamic_compile: false
 
-  # ═══════════════════════════════════════════════════════════════
-  # noc — 18-hour overnight profile (~75M params)
-  # Optimized for RTX 5060 Ti 16 GB, trains to optimal in ~16h
-  # ═══════════════════════════════════════════════════════════════
   noc:
     model:
       d_model: 448           # ~75M params (448/384)^2 * 52.8M ≈ 72M
@@ -243,22 +269,34 @@ profiles:
       vocab_size: 326
       selective_backward: true
       backward_ratio: 0.5
+      use_differential_attention: true
+      use_hestia: true
+      use_cla: false
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 32
+      batch_size: 64
     training:
       max_steps: "auto"
       warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0010
-      learning_rate_adamw: 0.0001
+      min_lr_ratio: 1.0
+      learning_rate_muon: 0.005
+      learning_rate_adamw: 0.0005
       weight_decay: 0.1
-      grad_accum_steps: 1
-      optimization_mode: auto   # 🆕 v8.5 — auto preset + manual overrides
-      use_dispersion_loss: false
+      grad_accum_steps: 2
+      optimization_mode: manual
+      use_dispersion_loss: true
       dispersion_weight: 0.1
       dispersion_temperature: 2.0
+      use_schedule_free: true
+      use_cautious: false
+      lr_schedule: "cosine"
+      use_tequila: true
+      use_quest: true
+      use_dropbp: true
+      dropbp_prob: 0.3
+      use_rho_loss: true
+      rho_keep_ratio: 0.5
     perf:
       inductor_cache_dir: "~/.cache/busel/inductor"
       inductor_cache_clean: false
@@ -266,78 +304,41 @@ profiles:
       keep_last_n: 5
       dynamic_compile: true
 
-  zubr:
+  byvol:
     model:
-      d_model: 384
-      n_layers: 12
-      n_heads: 6
-      expert_hidden: 1024
+      d_model: 2048
+      n_layers: 24
+      n_heads: 16
+      expert_hidden: 4096
       num_experts: 8
-      top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      n_hyper: 4
-      selective_backward: true
-      backward_ratio: 0.5
-    data:
-      data_path: "data_train"
-      chunk_size: 16384
-      batch_size: 32
-    training:
-      max_steps: "auto"
-      warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0006
-      learning_rate_adamw: 0.00006
-      weight_decay: 0.1
-      grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-    perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
-      keep_last_n: 5
-      dynamic_compile: true
-
-  # ═══════════════════════════════════════════════════════════════
-  # SALT RECIPE — Knowledge Distillation from small model
-  # Uses chyzh as teacher for shpak student (arXiv:2507.07101)
-  # ═══════════════════════════════════════════════════════════════
-  salt:
-    model:
-      d_model: 384
-      n_layers: 8
-      n_heads: 6
-      expert_hidden: 768
-      num_experts: 4
       top_k: 1
       vocab_size: 326
       selective_backward: true
       backward_ratio: 0.5
+      use_differential_attention: true
     data:
       data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 128
+      chunk_size: 8192
+      batch_size: 8
     training:
       max_steps: "auto"
       warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0006
-      learning_rate_adamw: 0.00006
+      min_lr_ratio: 1.0
+      learning_rate_muon: 0.0002
+      learning_rate_adamw: 0.00002
       weight_decay: 0.1
-      grad_accum_steps: 1
-      use_salt: true
-      salt_teacher_profile: "chyzh"
-      salt_kd_temperature: 2.0
-      salt_kd_alpha: 0.5
-      salt_kd_steps: 5000
-      use_dispersion_loss: false
+      grad_accum_steps: 4
+      use_dispersion_loss: true
       dispersion_weight: 0.1
       dispersion_temperature: 2.0
+      use_schedule_free: true
+      use_cautious: false
+      use_tequila: true
+      use_8bit: true
+      lr_schedule: "cosine"
     perf:
       inductor_cache_dir: "~/.cache/busel/inductor"
       inductor_cache_clean: false
       inductor_cache_max_gb: 0.0
-      keep_last_n: 5
+      keep_last_n: 3
       dynamic_compile: true
