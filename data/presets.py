@@ -1,5 +1,5 @@
 """
-📚 busel DATA PRESETS v1.0 — Named data catalog for SFT/DPO/eval stages
+📚 busel — Named data catalog for SFT/DPO/eval stages
 
 A static catalog of HF datasets and custom generators indexed by preset name.
 This is NOT a plug-in extension point (no @register) — it's a simple dict

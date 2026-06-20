@@ -1,5 +1,5 @@
 """
-📚 busel PIPELINE v5.1 - Parallel Stream Interleaving Loader
+📚 busel - Parallel Stream Interleaving Loader
 Поддерживает динамическую сборку и параллельное перемешивание данных на лету в памяти.
 """
 import torch
@@ -42,27 +42,6 @@ except ImportError:
     HAS_SPECIAL_TOKENS = False
     MOD_IMAGE = 256
     MEDIA_END = 257
-
-class PythonByteStreamer:
-    def __init__(self, file_path, chunk_size, start_offset=0):
-        with open(file_path, "rb") as f:
-            self.data = f.read()
-        self.position = start_offset
-        self.chunk_size = chunk_size
-
-    def next_chunk(self):
-        if self.position >= len(self.data):
-            return None
-        start = self.position
-        end = min(self.position + self.chunk_size, len(self.data))
-        chunk = list(self.data[start:end])
-        self.position = end
-        if len(chunk) < self.chunk_size:
-            chunk = chunk + [0] * (self.chunk_size - len(chunk))
-        return chunk
-
-    def get_position(self):
-        return self.position
 
 class buselOmnivoreTextExtractor:
     _MULTIMODAL_EXTS = (
@@ -272,6 +251,8 @@ def get_busel_dataloader(data_path, chunk_size, batch_size, start_file_idx=0, st
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=use_pin,
-        collate_fn=collate_busel_batch
+        pin_memory=False,
+        collate_fn=collate_busel_batch,
+        persistent_workers=False,
+        prefetch_factor=(2 if num_workers > 0 else None),
     )

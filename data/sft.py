@@ -1,5 +1,5 @@
 """
-🤖 busel SFT DATA v1.0 — Chat-format converter + IterableDataset for SFT
+🤖 busel — Chat-format converter + IterableDataset for SFT
 Converts OpenAI-style `{"messages": [...]}` records into byte-level token
 streams with **assistant-only loss masks** using the multimodal special
 tokens (BOS, EOS, ROLE_*). The SFT stage consumes (bytes, mask) batches

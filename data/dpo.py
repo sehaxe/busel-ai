@@ -1,5 +1,5 @@
 """
-🤖 busel DPO DATA v1.0 — IterableDataset for DPO preference pairs
+🤖 busel — IterableDataset for DPO preference pairs
 Reads JSONL with rows of the form `{"prompt": str, "chosen": str, "rejected": str}`
 (format used by HuggingFaceH4/ultrafeedback_binarized and produced by
 `tools.data_manager._download_preset` for the `dpo-shpak` preset).
