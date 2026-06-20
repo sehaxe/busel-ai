@@ -1,10 +1,5 @@
 """
-✨ busel ANIMATION v2.0 — Teto Live Context Manager (emoticon edition)
-Wraps rich.live.Live to display a tiny cycling Teto emoticon alongside
-arbitrary right-side content (status panel, progress bar). Teto changes
-colour per state (green idle → cyan think → yellow training → gold done).
-Auto-falls back to plain print() if rich is unavailable or stdout is not a
-TTY (so CI logs stay clean).
+✨ busel — Teto Emoticon + Live Animation
 """
 from __future__ import annotations
 
@@ -14,6 +9,65 @@ import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+# ── Teto emoticon data ───────────────────────────────────────────────────────
+
+_IDLE_FRAMES: tuple[str, ...] = (
+    "ξ(｡•̀ᴗ-)✧ξ",
+    "ξ(｡•̀ᴗ•́｡)ξ",
+    "ξ(≧◡≦)ξ",
+    "ξ(^ω^)ξ",
+    "ξ(￣▽￣)ξ",
+    "ξ(≧ω≦)ξ",
+    "▼ᗜˬᗜ▼",
+    "ξ(ᗒᗣᗕ)ξ",
+    "ξ(◕‿◕)ξ",
+    "ξ(•ω•)ξ",
+    "ξ(｡◕‿◕｡)ξ",
+    "ξ(ᗒᴥᗕ)ξ",
+)
+
+_THINK_FRAME: str = "(ᗜˬᗜ)…"
+_WAVE_FRAME: str = "ξ(ᗜ‿ᗜ)ξ"
+
+_TRAINING_FRAMES: tuple[str, ...] = (
+    "(ᗜˬᗜ)▶",
+    "(ᗜˬᗜ)▶▶",
+    "(ᗜˬᗜ)▶▶▶",
+)
+
+_DONE_FRAME: str = "★(ᗜ‿ᗜ)★"
+
+_FRAME_MAP: dict[str, str | tuple[str, ...]] = {
+    "idle": _IDLE_FRAMES,
+    "blink": "(-ˬ- )",
+    "smile": "(ᗜ‿ᗜ)",
+    "think": _THINK_FRAME,
+    "wave": _WAVE_FRAME,
+    "training": _TRAINING_FRAMES,
+    "done": _DONE_FRAME,
+}
+
+
+def teto_frames() -> list[str]:
+    """Return the 12 idle animation frames (kawaii emoticon cycle)."""
+    return list(_IDLE_FRAMES)
+
+
+def teto_frame(state: str = "idle", tick: int = 0) -> str:
+    """Return a single frame for the given state at the given tick."""
+    entry = _FRAME_MAP.get(state, "")
+    if isinstance(entry, tuple):
+        return entry[tick % len(entry)]
+    return entry
+
+
+def teto_states() -> list[str]:
+    """Return the list of all available state names."""
+    return list(_FRAME_MAP.keys())
+
+
+# ── Animation ─────────────────────────────────────────────────────────────────
+
 try:
     from rich.console import Console as _RichConsole
     from rich.live import Live
@@ -22,8 +76,6 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
-
-from ui.teto import frame as _teto_frame
 
 _DEFAULT_FPS = 4.0
 _DEFAULT_STATE = "idle"
@@ -63,7 +115,7 @@ class _Animator:
         self.state = name
 
     def render(self, right_panel_renderer=None) -> "Text | Panel":
-        teto = _teto_frame(self.state, self.tick)
+        teto = teto_frame(self.state, self.tick)
         style = _style_for(self.state)
         left = Text(teto, style=style)
         if right_panel_renderer is None:

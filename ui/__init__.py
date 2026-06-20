@@ -1,5 +1,5 @@
 """
-🎯 busel UI v2.0 — Teto Emoticon Avatar & Max-Beauty Rich Terminal Helpers
+🎯 busel — Teto Emoticon Avatar & Max-Beauty Rich Terminal Helpers
 Teto Kasane (重音テト) is a green twin-tail Vocaloid — the busel mascot.
 Rendered as a single-line emoticon (12-frame kawaii cycle including
 ξ(｡•̀ᴗ-)✧ξ, ξ(≧◡≦)ξ, ▼ᗜˬᗜ▼ and more) that animates beside rich panels,
@@ -26,9 +26,6 @@ Public API:
 from __future__ import annotations
 
 __all__ = [
-    "teto",
     "animation",
     "cli",
 ]
-
-__version__ = "1.0.0"

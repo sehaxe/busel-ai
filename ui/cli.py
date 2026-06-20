@@ -1,5 +1,5 @@
 """
-💡 busel CLI v2.0 — Max-Beauty Rich Terminal Helpers
+💡 busel — Max-Beauty Rich Terminal Helpers
 Drop-in helpers for training/inference. Auto-falls back to plain print()
 when rich is not installed (no hard dep on rich for tests or CI).
 
@@ -182,7 +182,7 @@ def project_tree() -> None:
     m.add("backbone.py  — mAR + buselModel")
     tr = root.add("⚙️ [cyan]training/[/cyan]")
     tr.add("optimizer.py — Muon + AdamW hybrid  [italic](registered)[/italic]")
-    tr.add("autopilot.py — v6.0 dampening + AGC")
+    tr.add("autopilot.py — predictive dampening + AGC")
     tr.add("recipe.py    — MTP-4 weighted loss")
     d = root.add("📚 [cyan]data/[/cyan]")
     d.add("pipeline.py — byte-streamer loader")
