@@ -1,5 +1,5 @@
 """
-⚙️ busel LOSS ENGINE v4.0 (MTP-4 STABILIZED + SALT KD)
+⚙️ busel (MTP-4 STABILIZED + SALT KD)
 Вычисляет многоголовый причинный лосс MTP-4 с затухающим взвешиванием,
 а также Knowledge Distillation loss для SALT (Small model Aided Large model Training).
 """
@@ -192,6 +192,36 @@ class buselLossEngine:
         z = F.normalize(e[idx], dim=-1)
         sq_dists = torch.cdist(z, z, p=2).pow(2)
         return weight * torch.log(torch.exp(-temperature * sq_dists).mean() + 1e-8)
+
+    @staticmethod
+    def compute_rho_loss(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        keep_ratio: float = 0.5,
+    ) -> torch.Tensor:
+        """RHO-Loss: gradients only flow through the hardest tokens.
+        
+        Uses prediction confidence as difficulty proxy:
+        - High max(softmax) = easy token → gradient zeroed
+        - Low max(softmax) = hard token → gradient kept
+        
+        Top keep_ratio fraction of hard tokens contribute to loss.
+        Reduces effective tokens by (1-keep_ratio), speeding convergence.
+        """
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=-1)
+            difficulty = 1.0 - probs.max(dim=-1).values
+            k = max(1, int(difficulty.numel() * keep_ratio))
+            _, idx = torch.topk(difficulty.flatten(), k)
+            mask = torch.zeros(difficulty.numel(), device=logits.device)
+            mask[idx] = 1.0
+            mask = mask.reshape(difficulty.shape)
+        ce = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1).long(),
+            reduction='none',
+        ).reshape(targets.shape)
+        return (ce * mask).sum() / mask.sum()
 
     def compute_kd_loss(
         self,
