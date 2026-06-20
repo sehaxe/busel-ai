@@ -3,7 +3,7 @@
 > *Pronounced **[ˈbusɛl]** — from Belarusian **бусел** (stork).*
 >
 > A token-free, 1.58-bit, hybrid linear-attention LLM with **mAR** residuals,
-> **LOTUS+Muon** optimizer, **Top-1 MoE**, byte-level patching, **selective
+> **SF-NorLotusMuon + FP8 AdamW** optimizer, **Top-1 MoE**, byte-level patching, **selective
 > activation checkpointing**, **decoupled per-layer LR**, **EMA of weights**,
 > and MTP-4. **Any-to-text**: trains on images, video, audio, PDF, docx in
 > the same byte stream as text. Runs on consumer hardware (RTX 5060 Ti 16 GB
@@ -39,15 +39,17 @@ in whether the *scaling-laws ceiling* can be pushed down by:
 4. **3:1 GDN-2 / MLA attention** — 75 % of layers are linear (GDN-2,
    O(1) cache); 25 % are MLA (latent KV, `d_c=128`). A 128 K-token context
    uses ~98 MB of MLA cache.
-5. **LOTUS+Muon hybrid optimizer (default)** — 2D weight tensors go through
-   **LOTUS** (rank-8 factorised Muon, ~85× less optimizer state than
-   full Muon) and everything else (norms, biases, embeddings, router) goes
-   through AdamW. Params are subdivided by layer type (attn, ffn, mtp,
+5. **SF-NorLotusMuon + FP8 AdamW hybrid optimizer (default)** — 2D weight
+   tensors go through **SF-NorLotusMuon** (Schedule-Free + NorMuon +
+   LOTUS rank-8, ~85× less optimizer state than full Muon) and everything
+   else (norms, biases, embeddings, router) goes through **FP8 AdamW**
+   (torchao, ~75% memory reduction vs fp32 AdamW). Both optimizers are
+   always wrapped in **Schedule-Free** (Defazio et al. 2024, MLCommons
+   AlgoPerf winner). Params are subdivided by layer type (attn, ffn, mtp,
    norm, embed, router) for **decoupled per-layer LR multipliers**.
-   `buselAutoPilot` v6.3 — predictive 3σ dampening, adaptive gradient
-   clipping, dynamic weight decay, **WSD-S** checkpoint reuse, **wd33**
-   QAT schedule. **MoE Top-1** routing (1 of N experts per token) cuts
-   routed FFN FLOPs by ~35 %.
+   `buselAutoPilot` v6.0 — predictive 3σ dampening, adaptive gradient
+   clipping, dynamic weight decay. **MoE Top-1** routing (1 of N experts
+   per token) cuts routed FFN FLOPs by ~35 %.
 6. **Curriculum + Busel auto-planner** — context grows 64 → 128 → 256
    patches, batch adapts inversely to hold VRAM constant, and the exact step
    count is derived from the Chinchilla byte-law
@@ -59,59 +61,35 @@ in whether the *scaling-laws ceiling* can be pushed down by:
    smoother loss + lower variance, **selective activation checkpointing**
    (`every=2` — half the layers are recomputed during backward, halving
    activation memory).
- 9. **v6.0 production defaults** (LCSB flipped to default ON, GradLite removed):
+ 9. **Production defaults:**
     - **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) —
       50% of layers run under `no_grad` per forward; mAR identity still
       carries grad. **−44% step, −25% peak VRAM, +80% tok/s** on shpak, no
-      convergence regression. The clear v5.8 winner, flipped to default in
-      v6.0. Off in test/calibration profiles (validation, micro_test,
-      quick_test) for deterministic forward.
-    - **GradLite error feedback** — **REMOVED in v6.0.** LOTUS+bf16 round-trip
-      is numerically exact → no error to feedback → +1 GB VRAM for 0% benefit.
-    - **Sparse-BitNet 6:8** (Dual STE) — **REMOVED in v6.2 cleanup.** +1% step
-      time, +2% peak VRAM (mask overhead), no CUDA speedup (no N:M-aware GEMM
-      kernels). Quality benefit (paper: +0.32 PPL on 0.5B) unproven at busel
-      scale. Code, tests, and config lines deleted.
-    - See `tests/v58_profile.py` for the 2-mode profile comparison (v6.0 cumulative + v6.1 dispersion).
+      convergence regression. Off in test/calibration profiles (validation,
+      micro_test, quick_test) for deterministic forward.
+    - **SF-NorLotusMuon** always ON — Schedule-Free + NorMuon + LOTUS rank-8
+      for all 2D params (excl. router/embed). Single clean path, no dead
+      branches. Gram NS (`gram_newton_schulz` package) for orthogonalization.
+    - **FP8 AdamW always ON** — `torchao.optim.AdamWFp8` for all non-Muon
+      params (norms, biases, router, embed). ~75% memory reduction vs fp32.
+    - **v8.5 optimizer cleanup** — removed Muon, NorMuon, SOAP, MuonQ,
+      Adafactor, Cautious, QuEST, FlashMuon. The optimizer is now 213 lines
+      with a single `_MuonBase → LotusMuon → NorLotusMuon` hierarchy.
+      See `tests/v63_profile.py --mode kruk-v85` for the 12-experiment A/B
+      validation on kruk 65M params.
 
-10. **v6.2–v6.3 research features** (2024–2026 papers, opt-in via YAML profiles):
-    - **SOAP** (Vyas et al. 2025, ICLR 2025) — Shampoo eigenspace + Adam.
-      Maintains factored second-moment estimates L, R per 2D param;
-      periodically eigendecomposes and applies Adam-like update in
-      eigenspace. **−40 % iterations vs AdamW.** Overhead from
-      eigendecomposition every N steps. Profile: `soap`.
-    - **QuEST** (Panferov et al. 2025, ICML 2025) — trust gradient
-      estimator for ternary training. Hadamard rotation whitens weight
-      distribution, MSE-optimal ternary grid fitting, trust gradient
-      correction reduces bias vs naive STE. **~5 % step-time overhead.**
-      Profile: `quest`.
-    - **WSD-S** (ICLR 2025) — Warmup-Stable-Decay with checkpoint reuse.
-      Reuses decay-phase checkpoints for the next cycle. **Outperforms WSD
-      and Cyclic-Cosine.** Profile: `wsds`.
-    - **wd33** (Mapping Schedule × Bit-Width, 2026) — cosine + warmdown
-      to 33 % of peak LR in last 33 % of training. **Optimal at all
-      bit-widths for sub-100 M models.** Tune LR once at FP16. Profile:
-      `wd33`.
+10. **Opt-in research features** (defaults OFF, profile before flipping):
+    - **Dispersion Loss** (Wang et al. 2026) — Uniformity loss on L2-normalised
+      token embeddings. Counters embedding condensation in small LMs.
+      +1.17 % avg on 10 benchmarks per paper.
     - **Tequila** (Huang et al. 2025, ICLR 2026) — deadzone trapping fix.
-      Reactivates weights trapped at quantization boundary (|w| < Δ) as
-      dynamic biases, providing direct gradients. **>4 % accuracy gain
-      on ARC.** Zero inference overhead. Profile: `tequila`.
-    - **Hestia** (Wang et al. 2026) — Hessian-guided QAT. Temperature-
-      controlled softmax relaxation replaces STE. Hessian trace drives
-      per-layer temperature annealing. **5.39 % avg zero-shot improvement
-      on Llama-3.2-1B.** Profile: `hestia`.
-    - **MuonQ** (Su et al. 2025) — 4-bit Muon optimizer. Pre-quantization
-      normalization, power-iteration structural decomposition, μ-law
-      companding. **7.3× memory reduction** vs full-precision Muon.
-      Profile: `muonq`.
-    - **50 M+ scale gate** — automatically disables heavy optimizations
-      (SOAP, Adafactor, QuEST, QK-Norm L2, NorMuon, MuonQ, Hestia)
-      when model params < 50 M. Falls back to lotus_muon. These
-      optimizations have overhead that outweighs benefits at small scale.
-    - **IMU-1 measurement** (2 M params, validation profile): −1.7 %
-      speed, +0.3 % loss — overhead from NorMuon normalization,
-      Adafactor factored moments, QK-Norm L2 outweighs benefits at
-      small scale. Benefits only appear at 50 M+.
+    - **Hestia** (Wang et al. 2026) — Hessian-guided QAT.
+    - **SOAP** (Vyas et al. 2025, ICLR 2025) — Shampoo eigenspace + Adam.
+    - **QuEST** (Panferov et al. 2025, ICML 2025) — trust gradient estimator.
+    - **MuonQ** (Su et al. 2025) — 4-bit Muon optimizer.
+    - **50 M+ scale gate** — auto-disables heavy optimizations when model
+      params < 50 M (overhead outweighs benefits at small scale).
+    - See `configs/default.yaml` for all available profiles and their fields.
 
 The codebase is intentionally small — the entire model + training + data
 pipeline is ~3,000 lines of Python and ~140 lines of Rust, so you can read
@@ -152,8 +130,8 @@ uv run python cli.py download-data
 #    b) Run the full multi-stage pipeline (pretrain → SFT → DPO → eval):
 uv run python cli.py train-all
 
-# 5. Or train a single profile the legacy way:
-uv run train.py --profile shpak
+# 5. Or train a single profile:
+uv run python cli.py pipeline --name pretrain-only --profile shpak
 
 # 6. (Optional) Drop multimodal files (image/video/audio/docx) for any-to-text:
 uv run python cli.py download-multimodal --limit 8
@@ -223,18 +201,17 @@ Read the deep dive in the docs:
 ```
 busel-ai/
 ├── model/              # BitNet v2 architecture (BitLinear, mAR, attention mix) + checkpoint I/O
-├── training/           # LOTUS+Muon+AdamW hybrid optimizer, EMA, AutoPilot v6.0, MTP-4 loss
+├── training/           # SF-NorLotusMuon + FP8 AdamW, EMA, AutoPilot, MTP-4 loss
 ├── data/               # Stream-interleaving token loader (list[int], Rust mmap or Python)
 ├── multimodal/         # 🛰️ Any-to-token encoders (image/video/audio/PDF/docx) — cv2 fast path
 ├── ui/                 # Teto Vocaloid emoticon + rich terminal helpers
 ├── tools/              # CLI (typer), data_manager, orchestrator, plotter, inference
-├── tests/              # unittest suite (171 tests) + ultra-stable profiler v2.1 + 2-mode v58_profile.py (v6.0 + v6.1)
+├── tests/              # unittest suite (175 tests) + profiler v2.1 + 3 profile scripts
 ├── busel_rust_io/      # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, packer
-├── configs/            # default.yaml — Shpak / Zubr / Chyzh / micro_test / quick_test
+├── configs/            # default.yaml — 12 profiles
 ├── site/               # Astro+Starlight docs site (this wiki)
 ├── busel_registry.py   # Plug-in extension-point registry
 ├── busel_logging.py    # Structured JSONL event stream → checkpoints/busel.log.jsonl
-├── train.py            # Cybernetic training orchestrator
 ├── cli.py              # Typer entrypoint (one CLI to rule them all)
 ├── pyproject.toml      # uv-managed, maturin build backend
 └── AGENTS.md           # Machine-readable knowledge base (for LLMs and humans)
@@ -249,22 +226,20 @@ material.
 
 ## Profiles (configs/default.yaml)
 
-| Profile    | d_model | n_layers | Experts | Total params | Active | Bit-size | Context |
-|------------|--------:|---------:|--------:|-------------:|-------:|---------:|--------:|
-| micro_test | 128     | 3        | 2       | ~2 M         | ~1 M   | —        | 256 B   |
-| quick_test | 128     | 4        | 2       | ~3 M         | ~1.5 M | —        | 256 B   |
-| validation | 128     | 3        | 2       | ~2 M         | ~1 M   | —        | 256 B   |
-| chyzh      | 192     | 6        | 4       | ~10 M        | ~5 M   | —        | 512 B   |
-| **shpak**  | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| zubr       | 384     | 12       | 8       | **120 M**    | 35 M   | **30 MB** | 16384 B |
-| **imu1**   | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **soap**   | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **quest**  | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **wsds**   | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **wd33**   | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **tequila**| 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **hestia** | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
-| **muonq**  | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
+| Profile      | d_model | n_layers | Experts | Total params | Active | Bit-size | Context |
+|--------------|--------:|---------:|--------:|-------------:|-------:|---------:|--------:|
+| validation   | 128     | 3        | 2       | ~2 M         | ~1 M   | —        | 256 B   |
+| micro_test   | 128     | 3        | 2       | ~2 M         | ~1 M   | —        | 256 B   |
+| quick_test   | 128     | 4        | 2       | ~3 M         | ~1.5 M | —        | 256 B   |
+| chyzh        | 192     | 6        | 4       | ~10 M        | ~5 M   | —        | 512 B   |
+| scale_m      | 256     | 6        | 4       | ~8 M         | ~4 M   | —        | 512 B   |
+| **shpak**    | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
+| imu1         | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
+| noc          | 512     | 8        | 4       | **62 M**     | 30 M   | **13 MB** | 8192 B  |
+| **kruk**     | 512     | 12       | 4       | **65 M**     | 32 M   | **14 MB** | 8192 B  |
+| byvol        | 512     | 16       | 8       | **120 M**    | 35 M   | **30 MB** | 16384 B |
+| soap         | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
+| quest        | 384     | 8        | 4       | **52.8 M**   | 25 M   | **11 MB** | 4096 B  |
 
 `max_steps` and `warmup_steps` can be `"auto"` — Busel computes them from
 the Busel byte-law `D ≈ 37 × N` (small models) or `D ≈ 80 × N` (large models ≥3B)
@@ -432,24 +407,30 @@ uv run python tests/scaling_laws.py --plot-only     # re-plot from saved CSV
 ## CLI surface
 
 ```bash
-uv run train.py --profile shpak            # train
-uv run train.py --profile shpak --resume checkpoints/shpak_step_10000.pt
-uv run train.py --profile shpak --no-compile --no-checkpointing
-uv run train.py --profile shpak --compile-mode reduce-overhead
+uv run python cli.py pipeline --name pretrain-only --profile shpak              # train
+uv run python cli.py pipeline --name pretrain-only --profile shpak --resume checkpoints/shpak_step_10000.pt
+uv run python cli.py pipeline --name pretrain-only --profile shpak --no-compile
 
-uv run python tools/inference.py --checkpoint checkpoints/shpak_FINAL.pt
-uv run python tools/inference.py --repl   # interactive chat
+uv run python cli.py chat --checkpoint checkpoints/shpak_FINAL.pt               # interactive chat
+uv run python cli.py autopilot --profile shpak                                   # one-click: data + profiler + train
+uv run python cli.py train-all                                                   # full pipeline: pretrain→SFT→DPO→eval
+uv run python cli.py escalate --target shpak                                     # auto-escalating train
+uv run python cli.py profile                                                     # hardware profiler
+uv run python cli.py stop                                                        # graceful stop signal
 
-# Profiler (v2.1 — accepts new optimizer / MoE / ckpt flags)
-uv run python tests/profiler_run.py                                      # defaults: LOTUS, top_k=1, ckpt every=2
-uv run python tests/profiler_run.py --optimizer-type muon --top-k 2      # ablation: pre-LOTUS, pre-Top-1
+# Profiler (v2.1 — accepts MoE / ckpt flags)
+uv run python tests/profiler_run.py                                              # defaults: LOTUS, top_k=1, ckpt every=2
+uv run python tests/profiler_run.py --top-k 2                                    # ablation: pre-Top-1
 uv run python tests/profiler_run.py --backend torch --trace checkpoints/profiler.json   # CUDA kernel-level
-uv run python tests/profiler_run.py --steps 50 --no-grad-ckpt            # 50 steps, no checkpointing
+uv run python tests/profiler_run.py --steps 50 --no-grad-ckpt                    # 50 steps, no checkpointing
 
 # Quick IMU-1 vs baseline profiler (2M params, ~5 min)
-uv run python tests/quick_imu1_profile.py                               # baseline vs imu1 comparison
+uv run python tests/quick_imu1_profile.py                                        # baseline vs imu1 comparison
 
-uv run python tools/plotter.py            # plot loss / lr / grad norm
+# v8.5 kruk A/B profiler (12 experiments, ~65M params)
+uv run python tests/v63_profile.py --mode kruk-v85                                # kruk 65M: 12 A/B experiments
+
+uv run python tools/plotter.py         # plot loss / lr / grad norm
 uv run python tools/orchestrator.py download --preset shpak
 
 # Multimodal
@@ -457,7 +438,7 @@ uv run python cli.py download-multimodal --limit 8   # synth img/video/audio/doc
 # Drop real images / videos / audio / PDFs / docx into data_train/multimodal/ and train as usual.
 ```
 
-Every flag is documented inline; `uv run train.py --help` is the canonical
+Every flag is documented inline; `uv run python cli.py --help` is the canonical
 reference.
 
 ---
@@ -548,16 +529,18 @@ class MyNewAttention(nn.Module):
 It will be discoverable via `get("attention", "my_new_attention")` and
 listed in the registry dump. No central switch statement to edit.
 
-Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (171 tests,
+Tests live in [`tests/test_suite.py`](./tests/test_suite.py) (175 tests,
 verbose mode by default, no pytest, no torch.profiler on MPS).
 Add new tests there — never spawn a second test file.
 
-For v6.0/v6.1 research validation, run
+For profiling research features, run:
 `uv run python tests/v58_profile.py --mode shpak-v60` to sweep the cumulative
 v6.0 stack on shpak 52.8M (baseline → +DA → +DA+Cautious → +DA+Cautious+LCSB
-→ +DA+Cautious+SF+LCSB), and
-`uv run python tests/v58_profile.py --mode shpak-disp` to validate the v6.1
-Dispersion Loss on the v6.0 winner.
+→ +DA+Cautious+SF+LCSB),
+`uv run python tests/v58_profile.py --mode shpak-disp` to validate Dispersion
+Loss on the v6.0 winner, or
+`uv run python tests/v63_profile.py --mode kruk-v85` for the 12-experiment
+kruk 65M A/B comparison (NS, Muon+, SF, cautious_wd).
 
 The **multimodal** module follows the same pattern: encoders are registered
 via `@register("encoder", name)`. To add a new modality, write a class that
@@ -569,7 +552,7 @@ rationale, anti-patterns, and performance characteristics.
 the single source of truth for `_orig_mod.` prefix handling. Use
 `load_state_dict_safely(model, sd)` instead of `model.load_state_dict(sd)`
 anywhere the model might be wrapped by `torch.compile` (it always is, by
-default in `train.py`).
+default in `cli.py pipeline`).
 
 ---
 
@@ -586,13 +569,10 @@ Busel stands on the shoulders of:
 - **Muon** (Keller Jordan, 2024) — Newton-Schulz orthogonaliser for 2D
   weights
 - **LOTUS** (arXiv:2602.01233) — rank-r factorised Muon momentum
-- **SOAP** (Vyas et al., 2025, ICLR 2025) — Shampoo eigenspace + Adam
-- **QuEST** (Panferov et al., 2025, ICML 2025) — trust gradient for ternary training
-- **WSD-S** (ICLR 2025) — Warmup-Stable-Decay with checkpoint reuse
-- **wd33** (Mapping Schedule × Bit-Width, 2026) — warmdown-to-33 % QAT schedule
-- **Tequila** (Huang et al., 2025, ICLR 2026) — deadzone trapping fix
-- **Hestia** (Wang et al., 2026) — Hessian-guided QAT with softmax relaxation
-- **MuonQ** (Su et al., 2025) — 4-bit Muon via directional fidelity optimization
+- **Schedule-Free** (Defazio et al., 2024, MLCommons AlgoPerf winner) —
+  implicit schedule via Polyak averaging
+- **FP8 AdamW** (torchao) — 8-bit AdamW by meta
+- **Gram Newton-Schulz** (`gram_newton_schulz` package) — CUDA-accelerated NS
 - **Multi-Token Prediction** (DeepSeek, 2024) — t+1..t+4 heads with
   decaying loss
 - **Chinchilla scaling** (Hoffmann et al., 2022) — the byte-law

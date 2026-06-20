@@ -1,6 +1,6 @@
 # model/ — BitNet v2 Architecture
 
-**Scope:** 1.58-bit ternary LLM architecture. `buselModel` orchestrator + 5 module families. **v6.0 — LCSB selective per-layer backward (default ON in shpak/zubr/chyzh).**
+**Scope:** 1.58-bit ternary LLM architecture. `buselModel` orchestrator + 5 module families. LCSB selective per-layer backward (default ON in shpak/zubr/chyzh). ByteFlow patching with adaptive pooling + boundary detection.
 
 ## STRUCTURE
 ```
@@ -24,13 +24,13 @@ model/
 |---|---|---|
 | Change byte→patch | `patching.py` | vocab=326 (auto), d_byte=128, conv kernel=5, stride=4 |
 | Add linear layer | `layers.py` → use `BitLinear_a4_8` | NEVER raw `nn.Linear` |
-| Modify attention | `attention.py` | GDN-2 uses Triton `fla.ops.gdn2` if available, else JIT fallback |
+| Modify attention | `attention.py` | GDN-2 uses `fla.ops.gdn2.fused_recurrent_gdn2` if available, else JIT fallback |
 | Change MoE routing | `routing.py` | Blackboard memory before router (gate_signal + read_signal) |
 | Tune layer ratio | `backbone.py` → `buselModel.__init__` | 3:1 GDN-2:MLA via `is_global = (l+1) % 4 == 0` |
 | Modify residuals | `backbone.py` → `ManifoldConstrainedAttnRes` | Sinkhorn-Knopp on layer-mix logits |
 | Add MTP head | `backbone.py` → `buselMTP4Pipeline` | Currently 4 heads; projections ×3 |
-| **Load a checkpoint** (any source) | `checkpoint.py` → `load_state_dict_safely` | Handles `_orig_mod.` prefix + `OptimizedModule` wrapper transparently. **🆕 v5.7.1** |
-| **Add LCSB selective backward** | `backbone.py` → `buselModel` | `config.selective_backward=True, config.backward_ratio=0.5` → 50% of layers run under `no_grad` per forward. **🆕 v5.8, default ON in v6.0** |
+| **Load a checkpoint** (any source) | `checkpoint.py` → `load_state_dict_safely` | Handles `_orig_mod.` prefix + `OptimizedModule` wrapper transparently. |
+| **Add LCSB selective backward** | `backbone.py` → `buselModel` | `config.selective_backward=True, config.backward_ratio=0.5` → 50% of layers run under `no_grad` per forward. Default ON in shpak/zubr/chyzh. |
 
 ## KEY CLASSES
 | Symbol | Type | Location | Role |
@@ -48,9 +48,9 @@ model/
 | `ManifoldConstrainedAttnRes` | nn.Module | backbone.py | mAR: n_hyper parallel streams, multi-query attn (q from current_x, k from each stream), Sinkhorn-Knopp ×n onto Birkhoff polytope |
 | `buselDecoderLayer` | nn.Module | backbone.py | Attn + MoE block; `is_global` swaps GDN-2↔MLA |
 | `buselMTP4Pipeline` | nn.Module | backbone.py | 4 parallel heads (t+1..t+4) sharing embed_weight for projection |
-| `buselModel` | nn.Module | backbone.py | Top-level: `n_layers` decoder layers + mAR residuals + MTP-4; sanity-checks vocab_size; supports **LCSB selective per-layer backward** via `selective_backward` + `backward_ratio` (**🆕 v5.8, default ON in v6.0**) |
-| `strip_compile_prefix` | function | checkpoint.py | Remove `_orig_mod.` / `compiled_model.` / `_dynamo.` prefixes from a state_dict. Returns a NEW dict; input is not mutated. **🆕 v5.7.1** |
-| `load_state_dict_safely` | function | checkpoint.py | Load `sd` into `obj` (nn.Module or OptimizedModule wrapper) handling all 4 cross-config cases. When `strict=False`, returns `_IncompatibleKeys` for diagnostics. **🆕 v5.7.1** |
+| `buselModel` | nn.Module | backbone.py | Top-level: `n_layers` decoder layers + mAR residuals + MTP-4; sanity-checks vocab_size; supports **LCSB selective per-layer backward** via `selective_backward` + `backward_ratio`. |
+| `strip_compile_prefix` | function | checkpoint.py | Remove `_orig_mod.` / `compiled_model.` / `_dynamo.` prefixes from a state_dict. Returns a NEW dict; input is not mutated. |
+| `load_state_dict_safely` | function | checkpoint.py | Load `sd` into `obj` (nn.Module or OptimizedModule wrapper) handling all 4 cross-config cases. When `strict=False`, returns `_IncompatibleKeys` for diagnostics. |
 
 ## CONVENTIONS
 - **NVTX wrappers:** All `forward()` methods use `nvtx_range_push/pop` (CUDA only; no-op on MPS)
@@ -73,20 +73,21 @@ model/
 - **NEVER** set `config.vocab_size` to a value SMALLER than `multimodal.special_tokens.vocab_size()` — `buselModel.__init__` rejects it with a helpful error
 - **NEVER** shrink `config.vocab_size` to remove disabled special tokens — the registry keeps the ID slot reserved; the inference mask only covers enabled IDs
 - **NEVER** use sigmoid in mAR — not used. The H matrix is projected to doubly-stochastic via Sinkhorn-Knopp
-- **NEVER** call `model.load_state_dict(sd)` directly — always go through `load_state_dict_safely(model, sd)`. Direct loads fail with key-mismatch errors when the checkpoint was saved with `--compile` (default in `train.py`). **🆕 v5.7.1**
-- **NEVER** duplicate the `_strip_compile_prefix` logic in a new file — `model.checkpoint.strip_compile_prefix` is the only implementation. If a new compile-prefix variant appears, add it to `_COMPILE_PREFIXES` in `model/checkpoint.py`. **🆕 v5.7.1**
-- **NEVER** reach into `model._orig_mod` manually — let `load_state_dict_safely` do the unwrapping. **🆕 v5.7.1**
+- **NEVER** call `model.load_state_dict(sd)` directly — always go through `load_state_dict_safely(model, sd)`. Direct loads fail with key-mismatch errors when the checkpoint was saved with `--compile` (the default in `cli.py pipeline`).
+- **NEVER** duplicate the `_strip_compile_prefix` logic in a new file — `model.checkpoint.strip_compile_prefix` is the only implementation. If a new compile-prefix variant appears, add it to `_COMPILE_PREFIXES` in `model/checkpoint.py`.
+- **NEVER** reach into `model._orig_mod` manually — let `load_state_dict_safely` do the unwrapping.
 - **NEVER** set `backward_ratio=0.0` with `selective_backward=True` — the layer loop would select 0 layers (clamped to `max(1, ...)`). Gradient still flows through the mAR residual identity path even when all layer forwards run under `no_grad`.
+- **NEVER** use `return X * scale` in `_newton_schulz_core` — the NS bugfix (v8.5) proved that rescaling by the Frobenius norm after orthogonalization blows up singular values (SV max from ~1.2 to ~73.5). Return `X` directly.
 
 ## NOTES
 - **GDN-2 fallback:** If `fla.ops.gdn2` unavailable OR not CUDA, falls back to `stable_gdn2_recurrent_jit` (slow but correct)
 - **SeRoPE:** Real-imaginary pairing `[..., 0::2]` and `[..., 1::2]` for rotary embeddings
-- **mAR design:** n_hyper parallel residual streams (default 2, configurable). Each layer takes the current activation + last n_hyper layer outputs, computes input-dependent mixing weights via multi-query attention (q from current, k from each stream), then projects the mixing matrix onto the Birkhoff polytope via Sinkhorn-Knopp. Identity-initialized (H≈I at init via +5.0 diagonal bias) so mAR starts as a no-op and learns to mix. FIFO stream management in `buselModel.forward` drops the oldest stream after each layer.
+- **mAR design:** n_hyper parallel residual streams (default 2, configurable). Each layer takes the current activation + last n_hyper layer outputs, computes input-dependent mixing weights via multi-query attention (q from current, k from each stream), then projects the mixing matrix onto the Birkhoff polytope via Sinkhorn-Knopp with **DTopK** (differentiable top-k sparsification). Identity-initialized (H≈I at init via +5.0 diagonal bias) so mAR starts as a no-op and learns to mix. FIFO stream management in `buselModel.forward` drops the oldest stream after each layer.
 - **mAR cost:** O(L · n_hyper) memory per layer (FIFO of n_hyper streams, not all L). n_hyper=2–4 is the practical range.
 - **Logarithmic decay (GDN-2 Eq.12):** `g_t = -exp(alpha_a) * softplus(alpha_proj)`; alpha_a initialized to -3.0
 - **Blackboard Memory:** Two `BitLinear_a4_8` (gate/read) compute shared expert enrichment BEFORE routing
 - **Z-loss:** `z_loss = 0.001 * mean(logsumexp(router_logits)^2)` — prevents router collapse
 - **Aux-loss schedule:** `current_aux_weight` ramps 0.01 → 0.08 over training progress 0.1→0.55
-- **Checkpoint compatibility (v5.4.0):** Old 259-vocab checkpoints are NOT loadable. `embed_weight` shape is `(326, d_byte)` and a `(259, d_byte)` checkpoint will fail with strict-state-dict mismatch. Re-train from scratch.
-- **Checkpoint format (v5.7.1):** Checkpoint dict has 4 keys: `model_state_dict` (with `_orig_mod.` prefix when saved with `--compile`), `patcher_state_dict` (also prefixed), `optimizer_state_dict`, and `cfg` (the profile dict). Use `load_state_dict_safely(model, ckpt["model_state_dict"])` to load. Saves from non-compiled (CPU inference) checkpoints load into compiled models and vice-versa.
-- **LCSB selective per-layer backward (v5.8, default ON in v6.0):** Each forward, randomly selects `n_select = max(1, int(n_layers × backward_ratio))` layers to run with grad; non-selected layers run under `torch.no_grad()`. The mAR residual identity path (`x = mixed + layer_out`) still carries gradient even when the layer is skipped. **Validation on shpak 52.8M, backward_ratio=0.5: −44% step time, −25% peak VRAM, +80% tok/s, no convergence regression over 10 steps.** Loss at step 10: 5.874 (LCSB) vs 5.892 (baseline). Default ON in shpak/zubr/chyzh; OFF in validation/micro_test/quick_test for deterministic forward.
+- **Checkpoint compatibility (259→326 vocab):** Old 259-vocab checkpoints are NOT loadable. `embed_weight` shape is `(326, d_byte)` and a `(259, d_byte)` checkpoint will fail with strict-state-dict mismatch. Re-train from scratch.
+- **Checkpoint format:** Checkpoint dict has 4 keys: `model_state_dict` (with `_orig_mod.` prefix when saved with `--compile`), `patcher_state_dict` (also prefixed), `optimizer_state_dict`, and `cfg` (the profile dict). Use `load_state_dict_safely(model, ckpt["model_state_dict"])` to load. Saves from non-compiled (CPU inference) checkpoints load into compiled models and vice-versa.
+- **LCSB selective per-layer backward:** Each forward, randomly selects `n_select = max(1, int(n_layers × backward_ratio))` layers to run with grad; non-selected layers run under `torch.no_grad()`. The mAR residual identity path (`x = mixed + layer_out`) still carries gradient even when the layer is skipped. **Validation on shpak 52.8M, backward_ratio=0.5: −44% step time, −25% peak VRAM, +80% tok/s, no convergence regression over 10 steps.** Loss at step 10: 5.874 (LCSB) vs 5.892 (baseline). Default ON in shpak/zubr/chyzh; OFF in validation/micro_test/quick_test for deterministic forward.
