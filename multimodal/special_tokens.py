@@ -1,58 +1,12 @@
 """
-🛰️ busel SPECIAL TOKENS v5.4 — Plug-in Vocabulary Expansion (67 tokens, 12 layers)
+🛰️ busel — Plug-in Vocabulary Expansion (67 tokens, 12 layers)
 
-Sovereign byte-level vocabulary with 67 plug-in special tokens organised into
-12 functional layers, plus 3 legacy reserved tokens (256-258).
+Sovereign byte-level vocabulary (vocab_size=326): 256 raw bytes + 3 legacy
+reserved tokens (256-258) + 67 plug-in special tokens across 12 layers.
+Tokens are computed dynamically — no hardcoded IDs outside this module.
 
-**Design philosophy: no hardcode.** The vocabulary is computed dynamically
-from the registry at runtime. Adding a new token = one decorator call.
-Disabling a token = one function call. Removing it = one line edit. No
-constants are scattered across the model, the encoders, or the inference
-mask — everything reads from this module.
-
-Token ID layout (computed at import time):
-    0      - 255  : 256 raw UTF-8 bytes (BYTE_COUNT)
-    256    - 258  : Legacy reserved (media_start, media_end, doc_sep) — immutable
-    259+          : Plug-in special tokens (67 across 12 layers, see below)
-
-Layer inventory (v5.4.0, full variant — 67 tokens):
-    Layer  | # | Description
-    -------|----+---------------------------------------------------
-    1 seq  |  4 | BOS / EOS / PAD / UNK
-    2 mod  |  6 | MOD_{IMAGE, VIDEO, AUDIO, PDF, DOCX, TEXT}
-    3 mms  |  3 | FRAME_SEP, AUDIO_CHUNK_SEP, CHANNEL_SEP
-    4 role |  4 | ROLE_{SYSTEM, USER, ASSISTANT, TOOL}
-    5 reas |  4 | THINK_{START, END}, PLAN_{START, END}
-    6 code |  4 | CODE_BLOCK_{START, END}, DIFF_{START, END}
-    7 xml  | 12 | TOOL_CALLS_*, TOOL_INVOKE_*, TOOL_PARAM_*,
-              |    TOOL_RESULTS_*, TOOL_RESULT_*, TOOL_ERROR_* (Anthropic XML)
-    8 tool | 12 | TOOL_{BASH, READ, WRITE, EDIT, GREP, GLOB, FETCH,
-              |    SEARCH, TASK, TODO, LSP, ASK}  (opencode 17-tool set)
-    9 task |  4 | TODO_{START, END}, TASK_{DONE, PENDING}
-   10 ref  |  6 | FILE_PATH_*, URL_*, CITE_*  (open/close)
-   11 sub  |  4 | SUBAGENT_*, SUBAGENT_RESULT_*  (opencode delegate_task)
-   12 stt  |  4 | STATUS_{SUCCESS, ERROR, TIMEOUT, CANCELLED}
-    -------+----+---------------------------------------------------
-    TOTAL  | 67 | (256 raw bytes + 67 specials = vocab_size() = 326)
-
-Usage:
-    from multimodal.special_tokens import (
-        vocab_size, get_special_token, list_special_tokens,
-        disable_special_token, enable_special_token,
-        register_special_token,  # for adding new tokens
-    )
-
-    # Add a new token at runtime:
-    MY_TOKEN = register_special_token("my_marker", "custom", "my description")
-    assert vocab_size() == 327  # vocab grew by 1
-
-    # Disable a token (vocab shrinks, ID preserved):
-    disable_special_token("think_start")
-    assert vocab_size() == 325
-
-    # Re-enable:
-    enable_special_token("think_start")
-    assert vocab_size() == 326
+See `multimodal/AGENTS.md` for the full layer inventory.
+See `list_special_tokens()` and `layer_summary()` for the live registry.
 """
 from __future__ import annotations
 
@@ -105,13 +59,7 @@ class SpecialToken:
 
     def __eq__(self, other) -> bool:
         if isinstance(other, SpecialToken):
-            return (
-                self.id == other.id
-                and self.name == other.name
-                and self.layer == other.layer
-                and self.description == other.description
-                and self.enabled == other.enabled
-            )
+            return self.id == other.id
         if isinstance(other, int):
             return self.id == other
         return NotImplemented
@@ -211,47 +159,24 @@ def register_special_token(
         return tok
 
 
-def disable_special_token(name: str) -> SpecialToken:
-    """Mark a token as disabled. Encoder won't emit it; model won't generate it.
-
-    The token's ID is preserved (its row in the embedding table is not
-    removed), so disabling+re-enabling is a no-op for checkpoint shape.
-
-    Raises:
-        KeyError: If `name` is unknown.
-    """
+def _set_enabled(name: str, enabled: bool) -> SpecialToken:
     with _ID_LOCK:
         if name not in _SPECIAL_TOKENS:
             raise KeyError(f"unknown special token: {name!r}")
         tok = _SPECIAL_TOKENS[name]
-        if not tok.enabled:
-            return tok  # already disabled, no-op
-        new_tok = SpecialToken(
-            name=tok.name, id=tok.id, layer=tok.layer,
-            description=tok.description, enabled=False,
-        )
+        if tok.enabled == enabled:
+            return tok
+        new_tok = SpecialToken(tok.name, tok.id, tok.layer, tok.description, enabled)
         _SPECIAL_TOKENS[name] = new_tok
         return new_tok
+
+
+def disable_special_token(name: str) -> SpecialToken:
+    return _set_enabled(name, False)
 
 
 def enable_special_token(name: str) -> SpecialToken:
-    """Re-enable a previously disabled special token.
-
-    Raises:
-        KeyError: If `name` is unknown.
-    """
-    with _ID_LOCK:
-        if name not in _SPECIAL_TOKENS:
-            raise KeyError(f"unknown special token: {name!r}")
-        tok = _SPECIAL_TOKENS[name]
-        if tok.enabled:
-            return tok  # already enabled, no-op
-        new_tok = SpecialToken(
-            name=tok.name, id=tok.id, layer=tok.layer,
-            description=tok.description, enabled=True,
-        )
-        _SPECIAL_TOKENS[name] = new_tok
-        return new_tok
+    return _set_enabled(name, True)
 
 
 def get_special_token(name: str) -> SpecialToken:
@@ -338,7 +263,7 @@ def layer_summary() -> dict[str, int]:
         return out
 
 
-# === Auto-define the 70 plug-in tokens (v5.4.0) ===
+# === Auto-define the 70 plug-in tokens ===
 # To ADD a new token: append one line below. Vocab grows by 1.
 # To REMOVE a token: delete the line. Vocab shrinks by 1.
 # To DISABLE temporarily: call disable_special_token("name") at runtime.
@@ -460,7 +385,7 @@ DOC_SEP     = LEGACY_TOKENS["doc_sep"]
 
 # === Self-test (only when run directly) ===
 if __name__ == "__main__":
-    print(f"🛰️  busel SPECIAL TOKENS v5.4 — vocabulary expansion report")
+    print(f"🛰️  busel special tokens — vocabulary expansion report")
     print(f"   Byte range         : [0, {BYTE_COUNT})")
     print(f"   Legacy reserved    : {sorted(LEGACY_TOKENS.values())} ({len(LEGACY_TOKENS)} tokens)")
     print(f"   Plug-in registered : {len(_SPECIAL_TOKENS)} (across {len(_LAYER_TOKENS)} layers)")
@@ -475,14 +400,10 @@ if __name__ == "__main__":
             mark = "✓" if t.enabled else "✗"
             print(f"         {mark} {t.id:>3} = {t.name:<24} ({t.description})")
     print()
-    print(f"   Quick toggle test:")
     pre = vocab_size()
     disable_special_token("think_start")
     mid = vocab_size()
     enable_special_token("think_start")
     post = vocab_size()
-    print(f"     vocab before disable = {pre}")
-    print(f"     vocab after  disable = {mid}  (Δ = {mid - pre})")
-    print(f"     vocab after  enable  = {post} (Δ = {post - mid})")
-    assert pre == mid + 1 == post, "vocab toggle invariant violated"
-    print(f"     ✓ Toggle invariant holds.")
+    assert pre == mid + 1 == post, f"vocab toggle invariant: {pre} -> {mid} -> {post}"
+    print(f"     ✓ Toggle invariant: {pre} → {mid} → {post}")

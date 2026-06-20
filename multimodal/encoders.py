@@ -1,5 +1,5 @@
 """
-🛰️ busel MULTIMODAL v5.4 — Any-to-Token Encoders (vocab=326)
+🛰️ busel — Any-to-Token Encoders (vocab=326)
 
 Sovereign byte-level encoders for images, video, audio, PDF, and docx.
 
@@ -127,7 +127,7 @@ class ImageEncoder:
     ~3× faster than PIL on realistic 1024² images. PIL is a fallback when cv2
     is unavailable.
 
-    Layout (v5.4): [MOD_IMAGE] [3072 raw RGB bytes] [MEDIA_END]
+    Layout: [MOD_IMAGE] [3072 raw RGB bytes] [MEDIA_END]
     """
 
     name = "image"
@@ -204,7 +204,7 @@ class VideoEncoder:
     metadata call) + cap.grab() for seek-skipping. imageio fallback
     iterates the video twice (frame count + frames) and is ~5-10× slower.
 
-    Layout (v5.4): [MOD_VIDEO] [4-byte frame_count LE] (frame_0 ... frame_N) [MEDIA_END]
+    Layout: [MOD_VIDEO] [4-byte frame_count LE] (frame_0 ... frame_N) [MEDIA_END]
     """
 
     name = "video"
@@ -300,7 +300,7 @@ class VideoEncoder:
 class AudioEncoder:
     """Encode WAV / FLAC / OGG audio as 16-bit PCM token stream.
 
-    Layout (v5.4): [MOD_AUDIO] [4-byte sr] [4-byte n] [2-byte sw] [int16 PCM LE] [MEDIA_END]
+    Layout: [MOD_AUDIO] [4-byte sr] [4-byte n] [2-byte sw] [int16 PCM LE] [MEDIA_END]
     """
 
     name = "audio"
@@ -349,7 +349,7 @@ class AudioEncoder:
 class PDFEncoder:
     """Encode PDF documents as UTF-8 text via Docling.
 
-    Layout (v5.4): [MOD_PDF] [Docling markdown UTF-8] [MEDIA_END]
+    Layout: [MOD_PDF] [Docling markdown UTF-8] [MEDIA_END]
     """
 
     name = "pdf"
@@ -376,7 +376,7 @@ class PDFEncoder:
 class DocxEncoder:
     """Encode .docx files as UTF-8 plain text.
 
-    Layout (v5.4): [MOD_DOCX] [python-docx plain text UTF-8] [MEDIA_END]
+    Layout: [MOD_DOCX] [python-docx plain text UTF-8] [MEDIA_END]
     """
 
     name = "docx"
@@ -403,7 +403,7 @@ class DocxEncoder:
 class TextEncoder:
     """Trivial text encoder (UTF-8). Used as the default for unknown formats.
 
-    Layout (v5.4): [MOD_TEXT] [raw UTF-8 bytes]   (no MEDIA_END — unbounded)
+    Layout: [MOD_TEXT] [raw UTF-8 bytes]   (no MEDIA_END — unbounded)
     """
 
     name = "text"
