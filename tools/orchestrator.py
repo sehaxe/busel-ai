@@ -1,11 +1,10 @@
 """
-⚙️ busel ORCHESTRATOR v6.1 — Multi-Stage Pipeline
+busel — Multi-Stage Pipeline
 Содержит команды запуска обучения, автопилота, профайлера, и pipeline.
 """
 
 import os
-import sys
-import subprocess
+
 import typer
 
 DATA_DIR = "data_train"
@@ -13,7 +12,7 @@ DATA_DIR = "data_train"
 
 def load_env(filepath=".env"):
     if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -22,16 +21,30 @@ def load_env(filepath=".env"):
 
 
 def print_tui_header():
-    from ui.teto import frame as _teto_frame
-    typer.echo(typer.style("╔═══════════════════════════════════════════════════════════════════════════╗", fg=typer.colors.MAGENTA, bold=True))
-    typer.echo(typer.style(f"║  {_teto_frame('wave')}  busel OMNI-LLM v6.1                                            ║", fg=typer.colors.CYAN, bold=True))
-    typer.echo(typer.style("║                 Sovereign 1-bit Any-to-Text AI Framework                  ║", fg=typer.colors.CYAN, bold=True))
-    typer.echo(typer.style("╚═══════════════════════════════════════════════════════════════════════════╝", fg=typer.colors.MAGENTA, bold=True))
+    from ui.animation import teto_frame as _teto_frame
+    typer.echo("")
+    typer.echo(typer.style(f"  {_teto_frame('wave')}  busel  —  Sovereign 1-bit Any-to-Text LLM", fg=typer.colors.CYAN, bold=True))
+    typer.echo(typer.style("─" * 74, fg=typer.colors.CYAN, bold=True))
+
+
+class _DefaultProfilerArgs:
+    """Default profiler args used by profile() and autopilot()."""
+    backend = "auto"
+    trace = "checkpoints/busel_profiler_trace.json"
+    optimizer_type = "lotus_muon"
+    lotus_rank = 8
+    lotus_lr_scale = 0.5
+    top_k = 1
+    no_grad_ckpt = False
+    selective_backward = False
+    backward_ratio = 0.5
+    steps = 10
 
 
 def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps) -> str:
     """Build a temp pipeline YAML (pretrain-only + overrides); return the temp dir path."""
     import tempfile
+
     import yaml as _yaml
     src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "pipelines", "pretrain-only.yaml")
     with open(src) as f:
@@ -91,7 +104,7 @@ def autopilot(
 
     if not os.path.exists(DATA_DIR) or len(os.listdir(DATA_DIR)) == 0:
         typer.echo(typer.style("📁 Directory 'data_train' is empty. Starting automatic download...", fg=typer.colors.YELLOW, bold=True))
-        from tools.data_manager import _download_text, _download_sft, _download_vision
+        from tools.data_manager import _download_sft, _download_text, _download_vision
         _download_text(80000, "smollm")
         _download_sft(5000, "smoltalk")
         _download_vision(500, "HuggingFaceM4/COCO")
@@ -99,9 +112,11 @@ def autopilot(
         typer.echo(typer.style("📁 Training data found. Skipping download.", fg=typer.colors.GREEN))
 
     typer.echo(typer.style("\n📊 Launching hardware express-profiler for MPS/CUDA testing...", fg=typer.colors.CYAN, bold=True))
-    result = subprocess.run([sys.executable, "tests/profiler_run.py"])
-    if result.returncode != 0:
-        typer.echo(typer.style("❌ Hardware test failed! Please check your GPU/accelerator.", fg=typer.colors.RED, bold=True))
+    try:
+        from tests.profiler_run import run_profiler as _run_profiler
+        _run_profiler(_DefaultProfilerArgs)
+    except Exception as _prof_err:
+        typer.echo(typer.style(f"❌ Hardware test failed: {type(_prof_err).__name__}: {_prof_err}", fg=typer.colors.RED, bold=True))
         raise typer.Exit(code=1)
 
     typer.echo("=" * 80)
@@ -133,7 +148,8 @@ def train_all(
 
 
 def profile():
-    subprocess.run([sys.executable, "tests/profiler_run.py"])
+    from tests.profiler_run import run_profiler as _run_profiler
+    _run_profiler(_DefaultProfilerArgs)
 
 
 def pipeline(
@@ -147,8 +163,8 @@ def pipeline(
     stage via training/stages, and runs setup → run → finalize in order.
     Per-stage checkpoints are saved automatically.
     """
-    from training.stages import load_pipeline_yaml, get_stage
-    from busel_logging import setup_logging, log_event
+    from busel_logging import log_event, setup_logging
+    from training.stages import get_stage, load_pipeline_yaml
     from training.stages.base import StageState
 
     print_tui_header()
@@ -173,7 +189,7 @@ def pipeline(
         typer.echo(typer.style(f"   {i}. {s.name}  data={s.data_preset or '-'}  resume={s.resume or '-'}", fg=typer.colors.CYAN))
 
     import yaml as _yaml
-    with open("configs/default.yaml", "r", encoding="utf-8") as f:
+    with open("configs/default.yaml", encoding="utf-8") as f:
         _default_profiles = _yaml.safe_load(f).get("profiles", {})
 
     def _resolve_resume(stage_name: str, default_resume: str | None) -> str | None:
@@ -246,7 +262,7 @@ def pipeline(
         running_resume = state.last_checkpoint_path
 
     log_event("pipeline_complete", pipeline=pipeline_cfg.name, total_stages=len(pipeline_cfg.stages))
-    typer.echo(typer.style(f"\n🎉 Pipeline {pipeline_cfg.name} complete! {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
+    typer.echo(typer.style(f"\nPipeline {pipeline_cfg.name} complete — {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
 
 
 PROFILE_LADDER = ["chyzh", "shpak", "zubr"]
@@ -261,7 +277,7 @@ BUSEL_SCALING = {
 
 def _load_profile_block(profile: str) -> dict:
     import yaml as _yaml
-    with open("configs/default.yaml", "r", encoding="utf-8") as f:
+    with open("configs/default.yaml", encoding="utf-8") as f:
         full = _yaml.safe_load(f)
     return full["profiles"][profile]
 

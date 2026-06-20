@@ -1,5 +1,5 @@
 """
-🛰️ busel EVALUATOR v1.0 — Perplexity + format compliance + SFT loss metrics
+🛰️ busel — Perplexity + format compliance + SFT loss metrics
 Computes a small set of headline metrics on a model checkpoint, used by
 the `eval` stage of the pipeline. Designed to be cheap (sub-minute per
 metric) and dependency-free beyond PyTorch + the local SFT data format.

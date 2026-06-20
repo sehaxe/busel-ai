@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║                            BUSEL OMNI-LLM v5.5                            ║
+║                            BUSEL OMNI-LLM                                  ║
 ║                 Sovereign 1-bit Any-to-Text AI Framework                  ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
@@ -20,7 +20,7 @@ app = typer.Typer(
 @app.callback()
 def _default_callback(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
-        from ui.teto import frame as _teto_frame
+        from ui.animation import teto_frame as _teto_frame
         typer.echo(typer.style(f"  {_teto_frame('think')}  busel is thinking…", fg=typer.colors.GREEN, bold=True))
         typer.echo(typer.style("🪜 No subcommand → defaulting to `escalate --target shpak`", fg=typer.colors.CYAN, bold=True))
         typer.echo(typer.style("   (batch/chunk/LR come from configs/default.yaml — edit there, not in code)\n", fg=typer.colors.CYAN))
@@ -60,7 +60,7 @@ def stop_cmd():
     pathlib.Path(path).touch()
     typer.echo(typer.style(f"✅ Stop signal sent: {path}", fg=typer.colors.GREEN, bold=True))
     typer.echo("   Training will save FINAL checkpoint and exit at the next step boundary.")
-app.command(name="profile", help="📊 Run the ultra-stable step-by-step performance profiler (v2.0) on Mac/CUDA.")(profile)
+app.command(name="profile", help="📊 Run the ultra-stable step-by-step performance profiler on Mac/CUDA.")(profile)
 
 # 💬 НОВАЯ КОМАНДА: Локальный интерактивный чат
 @app.command(name="chat", help="💬 Start interactive console chat with a trained model (auto-detects architecture).")

@@ -1,5 +1,5 @@
 """
-🦩 BUSEL LOCAL CHAT v1.8 - FULL PROMPT INFERENCE
+🦩 BUSEL LOCAL CHAT — FULL PROMPT INFERENCE
 КРИТИЧЕСКИЙ ФИКС: Используем ВЕСЬ промпт без обрезки до кратного stride.
 Патчер может работать с любой длиной входа благодаря левому паддингу.
 """
@@ -262,7 +262,7 @@ def print_banner(profile, device, loaded):
     status = "💾 trained weights" if loaded else "🎲 random weights"
     print()
     print("╔" + "═" * 66 + "╗")
-    print("║" + "🦩  BUSEL LOCAL CHAT v1.9 (TOOL EXECUTOR)".center(66) + "║")
+    print("║" + "🦩  BUSEL LOCAL CHAT".center(66) + "║")
     print("║" + f"Profile: {profile}  |  Device: {device.upper()}  |  {status}".center(66) + "║")
     print("╠" + "═" * 66 + "╣")
     print("║" + "  /exit /reset /raw  /tools  /auto on|off".ljust(66) + "║")

@@ -1,5 +1,5 @@
 """
-🔧 busel TOOL EXECUTOR v1.1 — Phase 7 + REPL integration (v5.7.0)
+🔧 busel — Phase 7 + REPL integration
 
 Parses `<function_calls>...<invoke>...<parameter>...<result>` envelopes
 emitted by the SFT/DPO model, executes the named tool, and re-injects the
@@ -187,7 +187,7 @@ def format_tool_results(results: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# v5.7.0 — REPL integration: confirmation prompt + ANSI stripper
+# — REPL integration: confirmation prompt + ANSI stripper
 # ---------------------------------------------------------------------------
 
 # ANSI escape code pattern: covers CSI sequences, OSC sequences, and lone ESC.
@@ -248,7 +248,7 @@ def interactive_confirm(call: dict[str, Any], auto_approve: bool = False) -> boo
 
 
 # ---------------------------------------------------------------------------
-# v5.7.0 — Denial result (synthetic "<function_results>" block)
+# — Denial result (synthetic "<function_results>" block)
 # ---------------------------------------------------------------------------
 
 DENIED_RESULT_OUTPUT: str = "ERROR: tool execution denied by user"
