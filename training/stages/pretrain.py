@@ -1,5 +1,5 @@
 """
-🤖 busel PRETRAIN STAGE v1.0 — Base pretraining (next-byte CE on raw bytes)
+🤖 busel — Base pretraining (next-byte CE on raw bytes)
 The first stage of the pipeline. Trains a buselModel from scratch (or
 resumes from a checkpoint) on byte-level data via MTP-4 + MoE + AutoPilot.
 
@@ -9,25 +9,28 @@ CLI mode. Behavior is preserved 1:1 with train.py.
 """
 from __future__ import annotations
 
+import gc
+import glob
+import json
+import math
 import os
+import signal
 import sys
 import time
-import signal
-import math
-import json
-import glob
-import re
-import gc
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
+import torch.nn.functional as F
 import yaml
 
-from training.stages.base import BaseStage, StageState, register_stage, _apply_model_profile
-from busel_logging import setup_logging, log_event
-from ui.teto import frame as _teto_frame
+from busel_logging import log_event, setup_logging
+from training.stages.base import (
+    StageState,
+    _apply_model_profile,
+    register_stage,
+)
+
 
 _STOP_FILE = os.environ.get("BUSEL_STOP_FILE", "/tmp/busel_stop")
 
@@ -76,157 +79,8 @@ def _setup_inductor_cache(cache_dir: str, clean: bool, max_gb: float = 0.0) -> s
     return path
 
 
-@dataclass
-class buselPretrainConfig:
-    """Subset of configs/default.yaml profile keys used by the pretrain stage.
+from .pretrain_config import buselPretrainConfig  # noqa: E402
 
-    Mirrors the buselConfig class that used to live inside train.py. Each
-    field corresponds to a key in the YAML profile; see configs/default.yaml
-    for the canonical schema.
-    """
-
-    profile_name: str = "shpak"
-    d_model: int = 128
-    n_layers: int = 3
-    n_heads: int = 4
-    expert_hidden: int = 256
-    num_experts: int = 2
-    top_k: int = 1
-    vocab_size: int = 326
-    n_hyper: int = 2
-    data_path: str = "data_train"
-    chunk_size: int = 256
-    batch_size: int = 256
-    weight_decay: float = 0.1
-    max_steps: Any = "auto"
-    warmup_steps: Any = "auto"
-    min_lr_ratio: float = 0.1
-    grad_accum_steps: int = 1
-    learning_rate_muon: float = 0.0006
-    learning_rate_adamw: float = 0.00006
-    use_ema: bool = True
-    ema_decay: float = 0.999
-    optimizer_type: str = "lotus_muon"
-    lotus_rank: int = 8
-    lotus_lr_scale: float = 0.5
-    lr_multipliers: Any = None
-    selective_backward: bool = False
-    backward_ratio: float = 1.0
-    use_schedule_free: bool = False
-    sf_beta: float = 0.9
-    sf_gamma_factor: float = 2.0
-    use_cautious: bool = False
-    use_adafactor: bool = False
-    use_differential_attention: bool = False
-    use_qknorm_l2: bool = False
-    use_dispersion_loss: bool = False
-    dispersion_weight: float = 0.1
-    dispersion_temperature: float = 2.0
-    use_salt: bool = False
-    salt_teacher_profile: str = "chyzh"
-    salt_kd_temperature: float = 2.0
-    salt_kd_alpha: float = 0.5
-    salt_kd_steps: int = 0
-    lr_schedule: str = "cosine"
-    wsd_decay_fraction: float = 0.2
-    use_quest: bool = False
-    quest_bits: float = 1.58
-    wsd_s_enabled: bool = False
-    wsd_s_interval: int = 1000
-    wsd_s_decay_steps: int = 200
-    use_tequila: bool = False
-    tequila_lambda: float = 1e-3
-    use_hestia: bool = False
-    hestia_init_temp: float = 6.0
-    hestia_end_temp: float = 0.0
-    inductor_cache_dir: str = "~/.cache/busel/inductor"
-    inductor_cache_clean: bool = False
-    inductor_cache_max_gb: float = 0.0
-    dynamic_compile: bool = True
-    keep_last_n: int = 5
-
-    optimization_mode: str = "manual"
-    manual_overrides: Any = None
-    sct_rank: int = 0
-    sct_scope: str = "mlp"
-    use_flex_attention: bool = False
-    use_cla: bool = False
-    cla_share_every: int = 2
-
-    @classmethod
-    def from_profile(cls, profile_dict: dict) -> "buselPretrainConfig":
-        cfg = cls()
-        m = profile_dict.get("model", {})
-        d = profile_dict.get("data", {})
-        t = profile_dict.get("training", {})
-        p = profile_dict.get("perf", {})
-        _apply_model_profile(cfg, m)
-        cfg.data_path = d.get("data_path", cfg.data_path)
-        cfg.chunk_size = int(d.get("chunk_size", cfg.chunk_size))
-        cfg.batch_size = int(d.get("batch_size", cfg.batch_size))
-        cfg.weight_decay = float(t.get("weight_decay", cfg.weight_decay))
-        cfg.max_steps = t.get("max_steps", cfg.max_steps)
-        cfg.warmup_steps = t.get("warmup_steps", cfg.warmup_steps)
-        cfg.min_lr_ratio = float(t.get("min_lr_ratio", cfg.min_lr_ratio))
-        cfg.grad_accum_steps = int(t.get("grad_accum_steps", cfg.grad_accum_steps))
-        cfg.learning_rate_muon = float(t.get("learning_rate_muon", cfg.learning_rate_muon))
-        cfg.learning_rate_adamw = float(t.get("learning_rate_adamw", cfg.learning_rate_adamw))
-        cfg.use_ema = bool(t.get("use_ema", cfg.use_ema))
-        cfg.ema_decay = float(t.get("ema_decay", cfg.ema_decay))
-        cfg.optimizer_type = str(t.get("optimizer_type", cfg.optimizer_type))
-        cfg.lotus_rank = int(t.get("lotus_rank", cfg.lotus_rank))
-        cfg.lotus_lr_scale = float(t.get("lotus_lr_scale", cfg.lotus_lr_scale))
-        cfg.lr_multipliers = t.get("lr_multipliers", None)
-        cfg.selective_backward = bool(m.get("selective_backward", cfg.selective_backward))
-        cfg.backward_ratio = float(m.get("backward_ratio", cfg.backward_ratio))
-        cfg.use_differential_attention = bool(m.get("use_differential_attention", cfg.use_differential_attention))
-        cfg.use_qknorm_l2 = bool(m.get("use_qknorm_l2", cfg.use_qknorm_l2))
-        cfg.use_schedule_free = bool(t.get("use_schedule_free", cfg.use_schedule_free))
-        cfg.sf_beta = float(t.get("sf_beta", cfg.sf_beta))
-        cfg.sf_gamma_factor = float(t.get("sf_gamma_factor", cfg.sf_gamma_factor))
-        cfg.use_cautious = bool(t.get("use_cautious", cfg.use_cautious))
-        cfg.use_adafactor = bool(t.get("use_adafactor", cfg.use_adafactor))
-        cfg.use_dispersion_loss = bool(t.get("use_dispersion_loss", cfg.use_dispersion_loss))
-        cfg.dispersion_weight = float(t.get("dispersion_weight", cfg.dispersion_weight))
-        cfg.dispersion_temperature = float(t.get("dispersion_temperature", cfg.dispersion_temperature))
-        cfg.use_salt = bool(t.get("use_salt", cfg.use_salt))
-        cfg.salt_teacher_profile = str(t.get("salt_teacher_profile", cfg.salt_teacher_profile))
-        cfg.salt_kd_temperature = float(t.get("salt_kd_temperature", cfg.salt_kd_temperature))
-        cfg.salt_kd_alpha = float(t.get("salt_kd_alpha", cfg.salt_kd_alpha))
-        cfg.salt_kd_steps = int(t.get("salt_kd_steps", cfg.salt_kd_steps))
-        cfg.lr_schedule = str(t.get("lr_schedule", cfg.lr_schedule))
-        cfg.wsd_decay_fraction = float(t.get("wsd_decay_fraction", cfg.wsd_decay_fraction))
-        cfg.use_quest = bool(t.get("use_quest", cfg.use_quest))
-        cfg.quest_bits = float(t.get("quest_bits", cfg.quest_bits))
-        cfg.wsd_s_enabled = bool(t.get("wsd_s_enabled", cfg.wsd_s_enabled))
-        cfg.wsd_s_interval = int(t.get("wsd_s_interval", cfg.wsd_s_interval))
-        cfg.wsd_s_decay_steps = int(t.get("wsd_s_decay_steps", cfg.wsd_s_decay_steps))
-        cfg.use_tequila = bool(t.get("use_tequila", cfg.use_tequila))
-        cfg.tequila_lambda = float(t.get("tequila_lambda", cfg.tequila_lambda))
-        cfg.use_hestia = bool(m.get("use_hestia", cfg.use_hestia))
-        cfg.hestia_init_temp = float(t.get("hestia_init_temp", cfg.hestia_init_temp))
-        cfg.hestia_end_temp = float(t.get("hestia_end_temp", cfg.hestia_end_temp))
-        cfg.inductor_cache_dir = str(p.get("inductor_cache_dir", cfg.inductor_cache_dir))
-        cfg.inductor_cache_clean = bool(p.get("inductor_cache_clean", cfg.inductor_cache_clean))
-        cfg.inductor_cache_max_gb = float(p.get("inductor_cache_max_gb", cfg.inductor_cache_max_gb))
-        cfg.dynamic_compile = bool(p.get("dynamic_compile", cfg.dynamic_compile))
-        cfg.keep_last_n = int(p.get("keep_last_n", cfg.keep_last_n))
-        cfg.optimization_mode = str(t.get("optimization_mode", cfg.optimization_mode))
-        cfg.manual_overrides = t.get("manual_overrides", None)
-        cfg.sct_rank = int(t.get("sct_rank", cfg.sct_rank))
-        cfg.sct_scope = str(t.get("sct_scope", cfg.sct_scope))
-        cfg.use_flex_attention = bool(t.get("use_flex_attention", cfg.use_flex_attention))
-        cfg.use_cla = bool(m.get("use_cla", cfg.use_cla))
-        cfg.cla_share_every = int(m.get("cla_share_every", cfg.cla_share_every))
-        if cfg.d_model % cfg.n_hyper != 0:
-            raise ValueError(
-                f"d_model ({cfg.d_model}) must be divisible by n_hyper ({cfg.n_hyper})!"
-            )
-        if cfg.d_model % cfg.n_heads != 0:
-            raise ValueError(
-                f"d_model ({cfg.d_model}) must be divisible by n_heads ({cfg.n_heads})!"
-            )
-        return cfg
 
 
 def _enforce_stability(seed: int = 42) -> None:
@@ -241,11 +95,8 @@ def _enforce_stability(seed: int = 42) -> None:
 
 
 def _detect_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    assert torch.cuda.is_available(), "busel v9: CUDA required"
+    return "cuda"
 
 
 def _build_targets(byte_batch: torch.Tensor, input_length: int, stride: int = 4):
@@ -301,16 +152,38 @@ class buselPretrainStage:
         self._last_chunk_block_step: int = -1000
 
     def _vram_used_mb(self) -> float:
-        """Current GPU VRAM usage in MB (0 on CPU)."""
+        """Peak GPU VRAM in MB (0 on CPU). Uses max_memory_allocated for accurate peak."""
         if self.device == "cuda" and torch.cuda.is_available():
-            return torch.cuda.memory_allocated() / 1024**2
+            return torch.cuda.max_memory_allocated() / 1024**2
         return 0.0
 
     def _vram_total_mb(self) -> float:
-        """Total GPU VRAM in MB (0 on CPU)."""
+        """Total GPU VRAM in MB (0 on CPU). Cached after first call."""
+        if not hasattr(self, "_vram_total_mb_cache"):
+            if self.device == "cuda" and torch.cuda.is_available():
+                self._vram_total_mb_cache = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+            else:
+                self._vram_total_mb_cache = 0.0
+        return self._vram_total_mb_cache
+
+    def _vram_used_mb(self) -> float:
+        """Peak GPU VRAM in MB (0 on CPU). Uses max_memory_allocated for accurate peak."""
         if self.device == "cuda" and torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_memory / 1024**2
+            return torch.cuda.max_memory_allocated() / 1024**2
         return 0.0
+
+    def _ram_total_mb(self) -> float:
+        """Total system RAM in MB (Linux, 0 on other platforms). Cached after first call."""
+        if not hasattr(self, "_ram_total_mb_cache"):
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            self._ram_total_mb_cache = int(line.split()[1]) / 1024  # KB→MB
+                            break
+            except Exception:
+                self._ram_total_mb_cache = 0.0
+        return self._ram_total_mb_cache
 
     def _ram_used_mb(self) -> float:
         """Current process RSS in MB (Linux, 0 on other platforms)."""
@@ -359,11 +232,10 @@ class buselPretrainStage:
           1B-7B      — target for 5060 Ti 16GB; MuonQ + SCT rank=32 + full stack
           >7B        — 2x 3090 territory; same as 1-7B but more aggressive LCSB
         """
-        has_gpu = self.device in ("cuda", "mps")
+        has_gpu = True
 
         if total_params < 50_000_000:
             return {
-                "optimizer_type": "lotus_muon",
                 "use_cautious": True,
                 "use_schedule_free": False,
                 "sct_rank": 0,
@@ -374,47 +246,45 @@ class buselPretrainStage:
             }
         if total_params < 120_000_000:
             return {
-                "optimizer_type": "lotus_muon",
                 "use_cautious": True,
                 "use_schedule_free": False,
                 "sct_rank": 0,
-                "use_flex_attention": has_gpu,
-                "use_cla": True,
+                "use_flex_attention": False,
+                "use_cla": False,
                 "use_hestia": False,
                 "use_quest": False,
+                "use_dispersion_loss": False,
+                "use_tequila": False,
             }
         if total_params < 1_000_000_000:
             return {
-                "optimizer_type": "lotus_muon",
                 "use_cautious": True,
                 "use_schedule_free": True,
                 "min_lr_ratio": 1.0,
                 "sct_rank": 64,
                 "use_flex_attention": has_gpu,
-                "use_cla": True,
+                "use_cla": False,
                 "use_hestia": True,
                 "use_quest": True,
             }
         if total_params < 7_000_000_000:
             return {
-                "optimizer_type": "muonq",
                 "use_cautious": True,
                 "use_schedule_free": True,
                 "min_lr_ratio": 1.0,
                 "sct_rank": 32,
                 "use_flex_attention": has_gpu,
-                "use_cla": True,
+                "use_cla": False,
                 "use_hestia": True,
                 "use_quest": True,
             }
         return {
-            "optimizer_type": "muonq",
             "use_cautious": True,
             "use_schedule_free": True,
             "min_lr_ratio": 1.0,
             "sct_rank": 32,
             "use_flex_attention": has_gpu,
-            "use_cla": True,
+            "use_cla": False,
             "use_hestia": True,
             "use_quest": True,
             "backward_ratio": 0.4,
@@ -460,8 +330,8 @@ class buselPretrainStage:
             del self.patcher
             if self.device == "cuda":
                 torch.cuda.empty_cache()
-            from model.patching import StridedFastBLTPatcher as _Patcher
             from model.backbone import buselModel as _Model
+            from model.patching import StridedFastBLTPatcher as _Patcher
             self.patcher = _Patcher(d_model=self.cfg.d_model).to(self.device)
             self.model = _Model(self.cfg).to(self.device)
             rebuilt = True
@@ -476,45 +346,50 @@ class buselPretrainStage:
         return rebuilt
 
     def _rebuild_dataloader(self, new_batch_size: int, chunk_size: int | None = None) -> None:
-        """Recreate dataloader with a smaller batch size (OOM recovery)."""
+        """Recreate dataloader with a new batch size (OOM recovery or auto-batcher)."""
         from data.pipeline import get_busel_dataloader
         if chunk_size is None:
             chunk_size = self.cfg.chunk_size // 4
+        current_workers = 0
+        if hasattr(self, 'dataloader') and self.dataloader is not None:
+            current_workers = getattr(self.dataloader, 'num_workers', 0) or 0
+            try:
+                del self.dataloader
+            except Exception:
+                pass
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
         self.dataloader = get_busel_dataloader(
             self.cfg.data_path,
             chunk_size=chunk_size,
             batch_size=new_batch_size,
             start_file_idx=self.global_current_file_idx,
             start_byte_offset=self.global_current_byte_offset,
-            num_workers=0,
+            num_workers=current_workers,
         )
         self.dataloader_iter = iter(self.dataloader)
-        self.no_checkpointing: bool = False
-        self.ema: Any = None
-        self._logger: Any = None
-        self.teacher_model: Any = None
-        self.teacher_patcher: Any = None
 
     def _load_teacher_model(self) -> None:
         """Load teacher model for SALT Knowledge Distillation."""
         import yaml as _yaml
-        with open("configs/default.yaml", "r", encoding="utf-8") as f:
+        with open("configs/default.yaml", encoding="utf-8") as f:
             full = _yaml.safe_load(f)
-        
+
         teacher_profile_name = self.cfg.salt_teacher_profile
         if teacher_profile_name not in full["profiles"]:
             print(f"⚠️ [SALT]: Teacher profile {teacher_profile_name!r} not found, skipping KD")
             return
-        
+
         teacher_profile_dict = full["profiles"][teacher_profile_name]
         teacher_cfg = buselPretrainConfig.from_profile(teacher_profile_dict)
-        
-        from model.patching import StridedFastBLTPatcher
+
         from model.backbone import buselModel
-        
+        from model.patching import StridedFastBLTPatcher
+
         self.teacher_patcher = StridedFastBLTPatcher(d_model=teacher_cfg.d_model).to(self.device)
         self.teacher_model = buselModel(teacher_cfg).to(self.device)
-        
+
         checkpoint_path = f"checkpoints/busel_{teacher_profile_name}_FINAL.pt"
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -524,7 +399,7 @@ class buselPretrainStage:
             print(f"🎓 [SALT]: Loaded teacher model from {checkpoint_path}")
         else:
             print(f"⚠️ [SALT]: Teacher checkpoint {checkpoint_path!r} not found, training from scratch")
-        
+
         self.teacher_model.eval()
         for param in self.teacher_model.parameters():
             param.requires_grad = False
@@ -540,9 +415,7 @@ class buselPretrainStage:
         no_checkpointing: bool = False,
         use_ema: bool | None = None,
         ema_decay: float | None = None,
-        optimizer_type: str | None = None,
         lotus_rank: int | None = None,
-        lotus_lr_scale: float | None = None,
         lr_multipliers: Any = None,
         **kwargs,
     ) -> None:
@@ -563,12 +436,8 @@ class buselPretrainStage:
             use_ema = stage_params.get("use_ema")
         if ema_decay is None:
             ema_decay = stage_params.get("ema_decay")
-        if optimizer_type is None:
-            optimizer_type = stage_params.get("optimizer_type")
         if lotus_rank is None:
             lotus_rank = stage_params.get("lotus_rank")
-        if lotus_lr_scale is None:
-            lotus_lr_scale = stage_params.get("lotus_lr_scale")
         if lr_multipliers is None:
             lr_multipliers = stage_params.get("lr_multipliers")
         override_batch_size = stage_params.get("batch_size")
@@ -581,7 +450,7 @@ class buselPretrainStage:
         if "inductor_cache_clean" in stage_params:
             self._override_cache_clean = bool(stage_params["inductor_cache_clean"])
         if isinstance(profile, str):
-            with open("configs/default.yaml", "r", encoding="utf-8") as f:
+            with open("configs/default.yaml", encoding="utf-8") as f:
                 full = yaml.safe_load(f)
             if profile not in full["profiles"]:
                 raise ValueError(f"Profile {profile!r} not in configs/default.yaml")
@@ -599,12 +468,8 @@ class buselPretrainStage:
             self.cfg.use_ema = bool(use_ema)
         if ema_decay is not None:
             self.cfg.ema_decay = float(ema_decay)
-        if optimizer_type is not None:
-            self.cfg.optimizer_type = str(optimizer_type)
         if lotus_rank is not None:
             self.cfg.lotus_rank = int(lotus_rank)
-        if lotus_lr_scale is not None:
-            self.cfg.lotus_lr_scale = float(lotus_lr_scale)
         if lr_multipliers is not None:
             self.cfg.lr_multipliers = dict(lr_multipliers)
         if override_batch_size is not None:
@@ -635,64 +500,53 @@ class buselPretrainStage:
         if not os.path.exists(self.cfg.data_path):
             raise FileNotFoundError(f"Path {self.cfg.data_path!r} does not exist")
 
-        from model.patching import StridedFastBLTPatcher
-        from model.layers import configure_bitlinear
         from model.backbone import buselModel
-        from training.optimizer import buselOptimizerEngine
+        from model.layers import configure_bitlinear
+        from model.patching import StridedFastBLTPatcher
         from training.autopilot import buselAutoPilot
+        from training.optimizer import buselOptimizerEngine
         from training.recipe import buselLossEngine, validate_training_schedule
 
-        hestia_temp = None
-        if self.cfg.use_hestia:
-            hestia_temp = torch.tensor(self.cfg.hestia_init_temp, device=self.device, dtype=torch.float32)
+        self._hestia_temp = None
+        if getattr(self.cfg, "use_hestia", False):
+            self._hestia_temp = torch.tensor(self.cfg.hestia_init_temp, device=self.device, dtype=torch.float32)
         configure_bitlinear(
             use_tequila=self.cfg.use_tequila,
             tequila_lambda=self.cfg.tequila_lambda,
-            hestia_temperature=hestia_temp,
+            hestia_temperature=self._hestia_temp,
         )
 
-        self.patcher = StridedFastBLTPatcher(d_model=self.cfg.d_model).to(self.device)
+        self.patcher = StridedFastBLTPatcher(
+            d_model=self.cfg.d_model,
+            use_byteflow=getattr(self.cfg, "use_byteflow", False),
+            byteflow_patches=getattr(self.cfg, "byteflow_patches", 0),
+        ).to(self.device)
         self.model = buselModel(self.cfg).to(self.device)
+
+        # FP8: always ON for Ampere+. Skip in test mode.
+        if self.device == "cuda" and not getattr(self.cfg, "_test_mode", False):
+            from torchao.float8 import convert_to_float8_training
+            self.model = convert_to_float8_training(self.model)
+            self.patcher = convert_to_float8_training(self.patcher)
+            print("⚡ [FP8]: Float8Linear enabled — 40% memory + 34% speedup")
+
+        # Per-layer gradient offload for >3B models
+        if getattr(self.cfg, "per_layer", False):
+            from training.per_layer import enable_per_layer_gradient_offload
+            self._per_layer_cleanup = enable_per_layer_gradient_offload(self.model, self.device)
 
         if self._apply_auto_mode():
             total_params = sum(p.numel() for p in self.model.parameters())
         else:
             total_params = sum(p.numel() for p in self.model.parameters())
 
-        if self.cfg.use_hestia and hestia_temp is None:
-            hestia_temp = torch.tensor(self.cfg.hestia_init_temp, device=self.device, dtype=torch.float32)
+        if self.cfg.use_hestia and self._hestia_temp is None:
+            self._hestia_temp = torch.tensor(self.cfg.hestia_init_temp, device=self.device, dtype=torch.float32)
         configure_bitlinear(
             use_tequila=self.cfg.use_tequila,
-            tequila_lambda=self.cfg.tequila_lambda,
-            hestia_temperature=hestia_temp if self.cfg.use_hestia else None,
+            tequila_lambda=1e-3,
+            hestia_temperature=None,
         )
-
-        _SCALE_THRESHOLD = 50_000_000
-        if total_params < _SCALE_THRESHOLD:
-            _scale_warnings = []
-            if self.cfg.optimizer_type in ("soap",):
-                self.cfg.optimizer_type = "lotus_muon"
-                _scale_warnings.append(f"SOAP disabled (<50M: {total_params:,}). Using lotus_muon.")
-            if self.cfg.optimizer_type == "muonq":
-                self.cfg.optimizer_type = "lotus_muon"
-                _scale_warnings.append(f"MuonQ disabled (<50M: {total_params:,}). Using lotus_muon.")
-            if self.cfg.use_adafactor:
-                self.cfg.use_adafactor = False
-                _scale_warnings.append("Adafactor disabled (<50M). Using AdamW.")
-            if self.cfg.use_quest:
-                self.cfg.use_quest = False
-                _scale_warnings.append("QuEST disabled (<50M).")
-            if self.cfg.use_hestia:
-                self.cfg.use_hestia = False
-                _scale_warnings.append("Hestia disabled (<50M).")
-            if self.cfg.use_qknorm_l2:
-                self.cfg.use_qknorm_l2 = False
-                _scale_warnings.append("QK-Norm L2 disabled (<50M).")
-            if self.cfg.optimizer_type in ("normuon", "norlotus_muon"):
-                self.cfg.optimizer_type = "lotus_muon"
-                _scale_warnings.append(f"NorMuon disabled (<50M: {total_params:,}). Using lotus_muon.")
-            for w in _scale_warnings:
-                print(f"⚠️  [SCALE-GATE]: {w}")
 
         log_event(
             "model_initialized",
@@ -732,51 +586,47 @@ class buselPretrainStage:
 
         if self.cfg.warmup_steps == "auto" or self.cfg.warmup_steps is None:
             self.cfg.warmup_steps = max(50, int(0.05 * self.cfg.max_steps))
-        else:
-            self.cfg.warmup_steps = int(self.cfg.warmup_steps)
 
         self.cfg.max_steps, self.cfg.warmup_steps = validate_training_schedule(
             self.cfg.max_steps, self.cfg.warmup_steps
         )
+        print(f"📊 Training: {self.cfg.max_steps} steps, warmup {self.cfg.warmup_steps}, batch {self.cfg.batch_size}×{self.cfg.grad_accum_steps}")
 
         if self.device == "cuda" and not self.no_checkpointing:
             self.model.enable_gradient_checkpointing(every=2)
 
         if self.device == "cuda" and not self.no_compile:
-            self._compile_in_progress["value"] = True
-            try:
-                self.model = torch.compile(
-                    self.model, fullgraph=False, dynamic=self.cfg.dynamic_compile, mode=self.compile_mode
-                )
-                self.patcher = torch.compile(
-                    self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile, mode=self.compile_mode
-                )
-            except Exception as e:
-                err_str = str(e)
-                if "CUDAGraphs" in err_str or "FakeTensor" in err_str or "overwritten" in err_str:
-                    try:
-                        self.model = torch.compile(self.model, fullgraph=False, dynamic=self.cfg.dynamic_compile)
-                        self.patcher = torch.compile(self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile)
-                    except Exception:
-                        pass
-            finally:
-                self._compile_in_progress["value"] = False
+            if total_params < 10_000_000:
+                print(f"⏭️  Skipping torch.compile: {total_params:,} params < 10M threshold")
+            else:
+                import torch._dynamo
+                torch._dynamo.config.force_parameter_static_shapes = False
+                torch._dynamo.config.capture_scalar_outputs = True
+                print(f"⚡ torch.compile enabled (dynamic): 2-3× speedup")
+                self._compile_in_progress["value"] = True
+                try:
+                    self.model = torch.compile(
+                        self.model, fullgraph=False, dynamic=True, mode=self.compile_mode
+                    )
+                    self.patcher = torch.compile(
+                        self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile, mode=self.compile_mode
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    if "CUDAGraphs" in err_str or "FakeTensor" in err_str or "overwritten" in err_str:
+                        try:
+                            self.model = torch.compile(self.model, fullgraph=False, dynamic=self.cfg.dynamic_compile)
+                            self.patcher = torch.compile(self.patcher, fullgraph=False, dynamic=self.cfg.dynamic_compile)
+                        except Exception:
+                            pass
+                finally:
+                    self._compile_in_progress["value"] = False
 
         self.opt_engine = buselOptimizerEngine(
             self.model, self.patcher,
             lr_muon=self.cfg.learning_rate_muon,
             lr_adamw=self.cfg.learning_rate_adamw,
-            optimizer_type=self.cfg.optimizer_type,
             lotus_rank=self.cfg.lotus_rank,
-            lotus_lr_scale=self.cfg.lotus_lr_scale,
-            lr_multipliers=self.cfg.lr_multipliers,
-            use_schedule_free=self.cfg.use_schedule_free,
-            sf_beta=self.cfg.sf_beta,
-            sf_gamma_factor=self.cfg.sf_gamma_factor,
-            use_cautious=self.cfg.use_cautious,
-            use_adafactor=self.cfg.use_adafactor,
-            use_quest=self.cfg.use_quest,
-            quest_bits=self.cfg.quest_bits,
         )
         self.autopilot = buselAutoPilot(
             self.opt_engine,
@@ -817,6 +667,16 @@ class buselPretrainStage:
 
         from data.pipeline import get_busel_dataloader
 
+        # ProTrain: auto-configure batch, accum, ckpt, defrag from VRAM profile
+        if getattr(self.cfg, "memory_mode", "") == "auto":
+            from training.auto_memory import ProTrainMemory
+            pt = ProTrainMemory(self.model, self.patcher, self.cfg, self.device)
+            config = pt.configure()
+            self.cfg.batch_size = config["batch_size"]
+            self.cfg.grad_accum_steps = config["grad_accum"]
+            self.cfg._protrain_ckpt_every = config["ckpt_every"]
+            self.cfg._protrain_defrag = config["defrag"]
+
         current_chunk_size = self.cfg.chunk_size // 4
         self.dataloader = get_busel_dataloader(
             self.cfg.data_path,
@@ -843,23 +703,266 @@ class buselPretrainStage:
         signal.signal(signal.SIGINT, _save_emergency_checkpoint)
         signal.signal(signal.SIGTERM, _save_emergency_checkpoint)
 
+    def _init_training_state(self):
+        """Initialise run-level state (autocast, prefetch stream, first batch, accumulators)."""
+        self._autocast_dtype = torch.bfloat16
+        self._autocast_enabled = True
+        self._use_cuda_stream = self.device == "cuda"
+        self._prefetch_stream = torch.cuda.Stream() if self._use_cuda_stream else None
+        self._spd_window: list[float] = []
+        self._stop_check_interval = 50   # check graceful-stop file every N steps (syscall avoidance)
+        self._watchdog_interval = 10     # check memory/ram every N steps
+
+    def _fetch_initial_batch(self, state: StageState):
+        """Return the first batch from the dataloader, or None if empty."""
+        try:
+            return next(self.dataloader_iter)
+        except StopIteration:
+            return None
+
+    def _check_early_stop(self, step: int, state: StageState) -> StageState | None:
+        """If stop file exists, log and return a completed state. Otherwise None.
+        Checks only every _stop_check_interval steps to avoid O(1) syscall per step.
+        """
+        if step % self._stop_check_interval != 0:
+            return None
+        if not os.path.exists(_STOP_FILE):
+            return None
+        print(f"\n🛑 Graceful stop requested (file {_STOP_FILE} present) at step {step}.")
+        log_event("stop_requested", step=step, reason="stop_file_present", profile=self.profile_name)
+        try:
+            os.remove(_STOP_FILE)
+        except OSError:
+            pass
+        state.step = step
+        return state
+
+    def _update_hestia_temp(self, progress: float):
+        """Decay hestia temperature from init_temp → end_temp via cosine."""
+        if self.cfg.use_hestia and self._hestia_temp is not None:
+            import math as _math
+            cosine_decay = 0.5 * (1.0 + _math.cos(_math.pi * progress))
+            hestia_val = self.cfg.hestia_end_temp + (
+                self.cfg.hestia_init_temp - self.cfg.hestia_end_temp
+            ) * cosine_decay
+            self._hestia_temp.fill_(hestia_val)
+
+    def _compute_chunk_target(self, progress: float) -> int | None:
+        """Return the target chunk_size for this progress point, or None for no change."""
+        if getattr(self.cfg, "optimization_mode", "manual") == "auto":
+            return None
+        if getattr(self.cfg, "use_chunk_curriculum", True) is False:
+            return None
+        if progress < 0.15:
+            return self.cfg.chunk_size // 4
+        elif progress < 0.35:
+            return self.cfg.chunk_size // 2
+        else:
+            return self.cfg.chunk_size
+
+    def _maybe_block_chunk_growth(
+        self, step: int, old_chunk: int, new_chunk: int, new_batch: int
+    ) -> tuple[int, int]:
+        """If VRAM/RAM is too tight, block chunk growth and return the old sizes."""
+        if not (new_chunk > old_chunk and self.device == "cuda"):
+            return new_chunk, new_batch
+        vram_now = self._vram_used_mb()
+        vram_total = self._vram_total_mb()
+        ram_now = self._ram_used_mb()
+        ram_total = self._ram_total_mb()
+        vram_high = vram_total > 0 and vram_now / vram_total > 0.85
+        ram_high = ram_total > 0 and ram_now / ram_total > 0.90
+        if not (vram_high or ram_high):
+            return new_chunk, new_batch
+
+        if step - self._last_chunk_block_step >= 100:
+            reason = []
+            if vram_high:
+                reason.append(f"VRAM {vram_now:.0f}/{vram_total:.0f}MB")
+            if ram_high:
+                reason.append(f"RAM {ram_now:.0f}/{ram_total:.0f}MB")
+            print(f"⏸️  Chunk {old_chunk}→{new_chunk} blocked: {', '.join(reason)} too high for growth")
+            self._last_chunk_block_step = step
+        log_event("chunk_growth_blocked", step=step, chunk=old_chunk,
+                  vram_mb=round(vram_now, 1), vram_total_mb=round(vram_total, 1),
+                  ram_mb=round(ram_now, 1), ram_total_mb=round(ram_total, 1))
+        return old_chunk, old_chunk  # chunk = batch inverse-proportional, so both stay
+
+    def _rebuild_dataloader_at_size(self, chunk_size: int, batch_size: int):
+        """Rebuild the dataloader with new chunk/batch sizes and return the first batch."""
+        from data.pipeline import get_busel_dataloader
+        self.dataloader = get_busel_dataloader(
+            self.cfg.data_path,
+            chunk_size=chunk_size,
+            batch_size=batch_size,
+            start_file_idx=self.global_current_file_idx,
+            start_byte_offset=self.global_current_byte_offset,
+            num_workers=0,
+        )
+        self.dataloader_iter = iter(self.dataloader)
+        try:
+            return next(self.dataloader_iter)
+        except StopIteration:
+            return None
+
+    def _handle_emergency_save(self, step: int):
+        """If SIGINT/SIGTERM was caught, save emergency checkpoint and exit."""
+        if not self._emergency_save_requested["value"]:
+            return
+        os.makedirs("checkpoints", exist_ok=True)
+        try:
+            from model.checkpoint import strip_compile_prefix
+            torch.save(
+                {
+                    "model_state_dict": strip_compile_prefix(self.model.state_dict()),
+                    "patcher_state_dict": strip_compile_prefix(self.patcher.state_dict()),
+                    "step": step,
+                    "file_idx": self.global_current_file_idx,
+                    "byte_offset": self.global_current_byte_offset,
+                },
+                "checkpoints/latest_crash_backup.pt",
+            )
+            log_event("emergency_checkpoint", step=step, path="checkpoints/latest_crash_backup.pt")
+        except Exception as save_err:
+            print(f"❌ Emergency save failed: {type(save_err).__name__}: {save_err}")
+        finally:
+            self._emergency_save_requested["value"] = False
+        sys.exit(0)
+
+    def _memory_watchdog(self, step: int, current_batch_size: int, current_chunk_size: int):
+        """If VRAM/RAM exceeds threshold, auto-reduce batch size.
+        Only performs the check every 10 steps to avoid per-step syscall overhead.
+        """
+        if self._oom_reductions >= self._max_oom_reductions:
+            return current_batch_size
+        if step % self._watchdog_interval != 0:
+            return current_batch_size
+        if self.device == "cuda":
+            vram_now = torch.cuda.max_memory_allocated() / 1024 ** 2
+            torch.cuda.reset_peak_memory_stats()
+        else:
+            vram_now = 0.0
+        vram_total = self._vram_total_mb()
+        ram_now = self._ram_used_mb()
+        ram_total = self._ram_total_mb()
+
+        reduce_reason = None
+        if vram_total > 0:
+            vram_pct = vram_now / vram_total
+            if vram_pct > 0.93 and current_batch_size > 1:
+                reduce_reason = f"VRAM {vram_now:.0f}/{vram_total:.0f}MB ({vram_pct * 100:.0f}%)"
+        if ram_total > 0:
+            ram_pct = ram_now / ram_total
+            if ram_pct > 0.95 and current_batch_size > 1:
+                reason = f"RAM {ram_now:.0f}/{ram_total:.0f}MB ({ram_pct * 100:.0f}%)"
+                reduce_reason = f"{reduce_reason} + {reason}" if reduce_reason else reason
+
+        if not reduce_reason:
+            return current_batch_size
+
+        new_bs = max(1, current_batch_size - 2)
+        self.cfg.batch_size = new_bs
+        self._rebuild_dataloader(new_bs, current_chunk_size)
+        gc.collect()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        print(f"📉 {reduce_reason} → batch↓{new_bs}")
+        log_event("memory_auto_reduce", step=step, new_batch=new_bs,
+                  vram_mb=round(vram_now, 1), ram_mb=round(ram_now, 1))
+        return new_bs
+
+    def _log_progress(
+        self, step: int, step_offset: int,
+        start_time: float, last_log_time: float, last_log_tokens: int,
+        cumulative_processed_tokens: int,
+        accumulated_loss: float, accumulated_aux_loss: float,
+        current_lr: float, dynamic_clip: float,
+        current_batch_size: int, current_chunk_size: int, tokens_this_step: int,
+    ) -> tuple[float, int, float]:
+        """Print progress line, write metrics.jsonl, emit log_event every 10 steps.
+
+        Returns (last_log_time, last_log_tokens, speed) for the next iteration.
+        """
+        speed = 0.0
+        if step % 10 != 0:
+            return last_log_time, last_log_tokens, speed
+
+        current_time = time.time()
+        if step_offset == 0:
+            elapsed_interval = current_time - start_time
+            tokens_interval = tokens_this_step * self.cfg.grad_accum_steps
+        else:
+            elapsed_interval = current_time - last_log_time
+            tokens_interval = cumulative_processed_tokens - last_log_tokens
+        speed = tokens_interval / elapsed_interval if elapsed_interval > 0 else 0.0
+        last_log_time = current_time
+        last_log_tokens = cumulative_processed_tokens
+
+        steps_per_s = 10.0 / elapsed_interval if elapsed_interval > 0 else 0.0
+        self._spd_window.append(steps_per_s)
+        if len(self._spd_window) > 30:
+            self._spd_window = self._spd_window[-30:]
+        avg_steps_per_s = sum(self._spd_window) / len(self._spd_window) if self._spd_window else steps_per_s
+        remaining = max(0, self.cfg.max_steps - step)
+        eta_s = remaining / avg_steps_per_s if avg_steps_per_s > 0 else 0.0
+
+        vram_mb = 0.0
+        if self.device == "cuda":
+            vram_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
+
+        if eta_s >= 3600:
+            eta_str = f"{int(eta_s // 3600)}h {int((eta_s % 3600) // 60):02d}m"
+        elif eta_s >= 60:
+            eta_str = f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
+        else:
+            eta_str = f"{int(eta_s)}s"
+
+        print(
+            f"step {step:5d}/{self.cfg.max_steps:<5d} | "
+            f"loss {accumulated_loss:7.2f}  aux {accumulated_aux_loss / max(1, self.cfg.grad_accum_steps):5.2f} | "
+            f"lr {current_lr:.5f}  clip {dynamic_clip:<5.2f} | "
+            f"{speed:.0f} tok/s"
+            + (f"  vram {vram_mb:.0f}MB" if self.device == "cuda" else "")
+            + f"  ETA {eta_str}"
+        )
+
+        os.makedirs("checkpoints", exist_ok=True)
+        with open("checkpoints/metrics.jsonl", "a", encoding="utf-8") as log_f:
+            log_f.write(
+                json.dumps(
+                    {
+                        "step": step,
+                        "loss": accumulated_loss / max(1, self.cfg.grad_accum_steps),
+                        "aux_loss": accumulated_aux_loss / max(1, self.cfg.grad_accum_steps),
+                        "lr": current_lr,
+                        "speed": speed,
+                        "vram": vram_mb,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        log_event(
+            "step_complete",
+            step=step,
+            loss=round(accumulated_loss / max(1, self.cfg.grad_accum_steps), 4),
+            aux_loss=round(accumulated_aux_loss / max(1, self.cfg.grad_accum_steps), 4),
+            lr=round(current_lr, 7),
+            tokens_per_s=round(speed, 1),
+            vram_mb=round(vram_mb, 1),
+            batch=current_batch_size,
+            chunk=current_chunk_size,
+        )
+        return last_log_time, last_log_tokens, speed
+
     def run(self, state: StageState) -> StageState:
         """Execute the pretrain training loop for cfg.max_steps."""
         if self.cfg is None:
             raise RuntimeError("setup() must be called before run()")
 
-        if self.device == "cuda" or self.device == "cpu":
-            autocast_dtype = torch.bfloat16
-        else:
-            autocast_dtype = torch.float16
-        autocast_enabled = self.device in ("cuda", "mps")
-
-        use_cuda_stream = self.device == "cuda"
-        prefetch_stream = torch.cuda.Stream() if use_cuda_stream else None
-        current_batch: Any = None
-        try:
-            current_batch = next(self.dataloader_iter)
-        except StopIteration:
+        self._init_training_state()
+        current_batch = self._fetch_initial_batch(state)
+        if current_batch is None:
             return state
 
         start_time = time.time()
@@ -867,7 +970,6 @@ class buselPretrainStage:
         last_log_tokens = 0
         current_chunk_size = self.cfg.chunk_size // 4
         current_batch_size = self.cfg.batch_size
-        self._spd_window: list[float] = []
         cumulative_processed_tokens = (
             self.start_step * current_batch_size * self.cfg.grad_accum_steps * current_chunk_size
         )
@@ -876,89 +978,36 @@ class buselPretrainStage:
             step = self.start_step + step_offset
             progress = float(step) / float(self.cfg.max_steps) if self.cfg.max_steps else 0.0
 
-            if self.cfg.use_hestia and hestia_temp is not None:
-                import math as _math
-                cosine_decay = 0.5 * (1.0 + _math.cos(_math.pi * progress))
-                hestia_val = self.cfg.hestia_end_temp + (self.cfg.hestia_init_temp - self.cfg.hestia_end_temp) * cosine_decay
-                hestia_temp.fill_(hestia_val)
+            self._update_hestia_temp(progress)
 
-            if os.path.exists(_STOP_FILE):
-                print(f"\n🛑 Graceful stop requested (file {_STOP_FILE} present) at step {step}.")
-                log_event("stop_requested", step=step, reason="stop_file_present", profile=self.profile_name)
-                try:
-                    os.remove(_STOP_FILE)
-                except OSError:
-                    pass
-                state.step = step
-                return state
+            stopped = self._check_early_stop(step, state)
+            if stopped is not None:
+                return stopped
 
-            new_chunk_size = current_chunk_size
-            if progress < 0.15:
-                new_chunk_size = self.cfg.chunk_size // 4
-            elif progress < 0.35:
-                new_chunk_size = self.cfg.chunk_size // 2
-            else:
-                new_chunk_size = self.cfg.chunk_size
-
-            if new_chunk_size != current_chunk_size:
-                new_batch_size = max(
-                    1, (current_batch_size * current_chunk_size) // new_chunk_size
+            # --- chunk curriculum ---
+            target_chunk = self._compute_chunk_target(progress)
+            if target_chunk is not None and target_chunk != current_chunk_size:
+                new_batch_size = max(1, (current_batch_size * current_chunk_size) // target_chunk)
+                new_chunk, new_batch = self._maybe_block_chunk_growth(
+                    step, current_chunk_size, target_chunk, new_batch_size
                 )
-
-                chunk_grows = new_chunk_size > current_chunk_size
-                if chunk_grows and self.device == "cuda":
-                    vram_now = self._vram_used_mb()
-                    vram_total = self._vram_total_mb()
-                    ram_now = self._ram_used_mb()
-                    ram_total = self._ram_total_mb()
-                    vram_high = vram_total > 0 and vram_now / vram_total > 0.80
-                    ram_high = ram_total > 0 and ram_now / ram_total > 0.70
-                    if vram_high or ram_high:
-                        if step - self._last_chunk_block_step >= 100:
-                            reason = []
-                            if vram_high:
-                                reason.append(f"VRAM {vram_now:.0f}/{vram_total:.0f}MB")
-                            if ram_high:
-                                reason.append(f"RAM {ram_now:.0f}/{ram_total:.0f}MB")
-                            print(
-                                f"⏸️  Chunk {current_chunk_size}→{new_chunk_size} blocked: "
-                                f"{', '.join(reason)} too high for growth"
-                            )
-                            self._last_chunk_block_step = step
-                        log_event("chunk_growth_blocked", step=step, chunk=current_chunk_size,
-                                  vram_mb=round(vram_now, 1), vram_total_mb=round(vram_total, 1),
-                                  ram_mb=round(ram_now, 1), ram_total_mb=round(ram_total, 1))
-                        log_event("chunk_growth_blocked", step=step, chunk=current_chunk_size,
-                                  vram_mb=round(vram_now, 1), vram_total_mb=round(vram_total, 1))
-                        new_chunk_size = current_chunk_size
-                        new_batch_size = current_batch_size
-
-                current_chunk_size = new_chunk_size
-                current_batch_size = new_batch_size
-
-                from data.pipeline import get_busel_dataloader
-
-                self.dataloader = get_busel_dataloader(
-                    self.cfg.data_path,
-                    chunk_size=current_chunk_size,
-                    batch_size=current_batch_size,
-                    start_file_idx=self.global_current_file_idx,
-                    start_byte_offset=self.global_current_byte_offset,
-                    num_workers=0,
-                )
-                self.dataloader_iter = iter(self.dataloader)
-                try:
-                    current_batch = next(self.dataloader_iter)
-                except StopIteration:
+                current_chunk_size = new_chunk
+                current_batch_size = new_batch
+                new_batch = self._rebuild_dataloader_at_size(current_chunk_size, current_batch_size)
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                if new_batch is not None:
+                    current_batch = new_batch
+                else:
                     break
 
+            # --- forward/backward ---
             self.opt_engine.zero_grad(set_to_none=True)
             accumulated_loss = 0.0
             accumulated_aux_loss = 0.0
             tokens_this_step = 0
 
             _fwd_bwd_ok = False
-            _oom_retry = False
             for _fwd_bwd_attempt in range(3):
                 try:
                     self.opt_engine.zero_grad(set_to_none=True)
@@ -981,7 +1030,9 @@ class buselPretrainStage:
                         )
 
                         with torch.autocast(
-                            device_type=self.device, dtype=autocast_dtype, enabled=autocast_enabled
+                            device_type=self.device,
+                            dtype=self._autocast_dtype,
+                            enabled=self._autocast_enabled,
                         ):
                             if self.cfg.use_dispersion_loss:
                                 patches, embed_for_dispersion = self.patcher(input_bytes, return_embedding=True)
@@ -994,11 +1045,21 @@ class buselPretrainStage:
                             (logits_t1, logits_t2, logits_t3, logits_t4), aux_loss = self.model(
                                 patches, [targets] + mtp_targets[:-1], progress=progress
                             )
+                            # RHO-Loss: gradient only for hard tokens
+                            kr = max(0.3, min(0.7, 1.0 - progress))
+                            t1_rho = self.loss_engine.compute_rho_loss(
+                                logits_t1, targets, keep_ratio=kr,
+                            )
+                            t1_ce = self.loss_engine.compute_pretrain_loss(
+                                logits_t1, targets, [], [],
+                            )
                             loss = self.loss_engine.compute_pretrain_loss(
                                 logits_t1, targets,
                                 [logits_t2, logits_t3, logits_t4],
                                 mtp_targets,
-                            ) + aux_loss.float()
+                            )
+                            loss = t1_rho + (loss - t1_ce)
+                            loss = loss + aux_loss.float()
                             if self.cfg.use_dispersion_loss:
                                 loss = loss + self.loss_engine.compute_dispersion_loss(
                                     embed_for_dispersion,
@@ -1020,14 +1081,17 @@ class buselPretrainStage:
 
                         loss = loss / self.cfg.grad_accum_steps
                         loss.backward()
+                        for layer in self.model.layers:
+                            if hasattr(layer, 'moe') and hasattr(layer.moe, 'update_bias'):
+                                layer.moe.update_bias()
                         accumulated_loss += loss.item() * self.cfg.grad_accum_steps
                         accumulated_aux_loss += aux_loss.item()
                         tokens_this_step = current_batch_size * current_chunk_size
                         cumulative_processed_tokens += tokens_this_step
 
                         next_batch = None
-                        if use_cuda_stream:
-                            with torch.cuda.stream(prefetch_stream):
+                        if self._use_cuda_stream:
+                            with torch.cuda.stream(self._prefetch_stream):
                                 try:
                                     next_batch = next(self.dataloader_iter)
                                 except StopIteration:
@@ -1037,8 +1101,8 @@ class buselPretrainStage:
                                 next_batch = next(self.dataloader_iter)
                             except StopIteration:
                                 next_batch = None
-                        if use_cuda_stream:
-                            torch.cuda.current_stream().wait_stream(prefetch_stream)
+                        if self._use_cuda_stream:
+                            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
                         _iter_batch = next_batch
 
                     current_batch = _iter_batch
@@ -1065,7 +1129,6 @@ class buselPretrainStage:
                         new_batch=current_batch_size,
                         vram_mb=round(self._vram_used_mb(), 1),
                     )
-                    _oom_retry = True
                     cumulative_processed_tokens -= tokens_this_step
                     continue
 
@@ -1074,158 +1137,83 @@ class buselPretrainStage:
                 log_event("oom_gave_up", step=step, batch=current_batch_size)
                 break
 
+            # --- optimiser step ---
             dynamic_clip = self.autopilot.before_step(self.model, step, self.cfg.max_steps)
             if self.device == "cuda":
                 self.autopilot.inject_noise(self.model)
             current_lr, _ = self.autopilot.update_parameters(step, accumulated_loss, self.cfg.max_steps)
-            self.opt_engine.step()
+            
+            if getattr(self.cfg, "per_layer", False):
+                from training.per_layer import per_layer_optimizer_step
+                per_layer_optimizer_step(self.model, self.opt_engine, self.device)
+            else:
+                self.opt_engine.step()
+                
             if self.ema is not None:
                 self.ema.update(self.model)
 
-            if self._oom_reductions < self._max_oom_reductions:
-                vram_now = self._vram_used_mb()
-                vram_total = self._vram_total_mb()
-                ram_now = self._ram_used_mb()
-                ram_total = self._ram_total_mb()
+            # --- memory watchdog ---
+            current_batch_size = self._memory_watchdog(step, current_batch_size, current_chunk_size)
 
-                reduce_reason = None
-                if vram_total > 0:
-                    vram_pct = vram_now / vram_total
-                    if vram_pct > 0.93 and current_batch_size > 1:
-                        reduce_reason = f"VRAM {vram_now:.0f}/{vram_total:.0f}MB ({vram_pct*100:.0f}%)"
-                if ram_total > 0:
-                    ram_pct = ram_now / ram_total
-                    if ram_pct > 0.82 and current_batch_size > 1:
-                        reason = f"RAM {ram_now:.0f}/{ram_total:.0f}MB ({ram_pct*100:.0f}%)"
-                        reduce_reason = f"{reduce_reason} + {reason}" if reduce_reason else reason
+            # --- emergency checkpoint ---
+            self._handle_emergency_save(step)
 
-                if reduce_reason:
-                    new_bs = max(1, current_batch_size - 2)
-                    self.cfg.batch_size = new_bs
-                    current_batch_size = new_bs
-                    self._rebuild_dataloader(new_bs, current_chunk_size)
-                    gc.collect()
-                    if self.device == "cuda":
-                        torch.cuda.empty_cache()
-                    print(f"📉 {reduce_reason} → batch↓{new_bs}")
-                    log_event("memory_auto_reduce", step=step, new_batch=new_bs,
-                              vram_mb=round(vram_now, 1), ram_mb=round(ram_now, 1))
-                elif vram_total > 0 and vram_now / vram_total < 0.75 and ram_total > 0 and ram_now / ram_total < 0.60:
-                    if current_batch_size < self.cfg.batch_size + 8:
-                        new_bs = current_batch_size + 1
-                        self.cfg.batch_size = new_bs
-                        current_batch_size = new_bs
-                        self._rebuild_dataloader(new_bs, current_chunk_size)
-                        print(f"📈 VRAM {vram_now:.0f}MB + RAM {ram_now:.0f}MB → batch↑{new_bs}")
-                        log_event("memory_probe_up", step=step, new_batch=new_bs,
-                                  vram_mb=round(vram_now, 1), ram_mb=round(ram_now, 1))
+            # --- logging ---
+            last_log_time, last_log_tokens, speed = self._log_progress(
+                step, step_offset, start_time, last_log_time, last_log_tokens,
+                cumulative_processed_tokens, accumulated_loss, accumulated_aux_loss,
+                current_lr, dynamic_clip, current_batch_size, current_chunk_size,
+                tokens_this_step,
+            )
 
-            if self._emergency_save_requested["value"]:
-                os.makedirs("checkpoints", exist_ok=True)
-                try:
-                    from model.checkpoint import strip_compile_prefix
-                    torch.save(
-                        {
-                            "model_state_dict": strip_compile_prefix(self.model.state_dict()),
-                            "patcher_state_dict": strip_compile_prefix(self.patcher.state_dict()),
-                            "step": step,
-                            "file_idx": self.global_current_file_idx,
-                            "byte_offset": self.global_current_byte_offset,
-                        },
-                        "checkpoints/latest_crash_backup.pt",
-                    )
-                    log_event("emergency_checkpoint", step=step, path="checkpoints/latest_crash_backup.pt")
-                except Exception as save_err:
-                    print(f"❌ Emergency save failed: {type(save_err).__name__}: {save_err}")
-                finally:
-                    self._emergency_save_requested["value"] = False
-                sys.exit(0)
-
-            if step % 10 == 0:
-                current_time = time.time()
-                if step_offset == 0:
-                    elapsed_interval = current_time - start_time
-                    tokens_interval = tokens_this_step * self.cfg.grad_accum_steps
-                else:
-                    elapsed_interval = current_time - last_log_time
-                    tokens_interval = cumulative_processed_tokens - last_log_tokens
-                speed = tokens_interval / elapsed_interval if elapsed_interval > 0 else 0.0
-                last_log_time = current_time
-                last_log_tokens = cumulative_processed_tokens
-
-                steps_per_s = 10.0 / elapsed_interval if elapsed_interval > 0 else 0.0
-                self._spd_window.append(steps_per_s)
-                if len(self._spd_window) > 30:
-                    self._spd_window = self._spd_window[-30:]
-                avg_steps_per_s = sum(self._spd_window) / len(self._spd_window) if self._spd_window else steps_per_s
-                remaining = max(0, self.cfg.max_steps - step)
-                eta_s = remaining / avg_steps_per_s if avg_steps_per_s > 0 else 0.0
-
-                vram_mb = 0.0
-                if self.device == "cuda":
-                    vram_mb = torch.cuda.max_memory_allocated() / 1024**2
-
-                if eta_s >= 3600:
-                    eta_str = f"{int(eta_s // 3600)}h {int((eta_s % 3600) // 60):02d}m"
-                elif eta_s >= 60:
-                    eta_str = f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
-                else:
-                    eta_str = f"{int(eta_s)}s"
-
-                print(
-                    f"{_teto_frame('idle', step // 10)} "
-                    f"Step {step:05d}/{self.cfg.max_steps:05d} | "
-                    f"Total: {accumulated_loss:.2f} | "
-                    f"Aux: {accumulated_aux_loss / max(1, self.cfg.grad_accum_steps):.2f} | "
-                    f"LR: {current_lr:.5f} | "
-                    f"Clip: {dynamic_clip:.2f} | "
-                    f"Batch: {current_batch_size} | "
-                    f"{speed:.0f} tokens/s"
-                    + (f" | VRAM: {vram_mb:.0f}MB" if self.device == "cuda" else "")
-                    + f" | ETA: {eta_str}"
-                )
-
-                os.makedirs("checkpoints", exist_ok=True)
-                with open("checkpoints/metrics.jsonl", "a", encoding="utf-8") as log_f:
-                    log_f.write(
-                        json.dumps(
-                            {
-                                "step": step,
-                                "loss": accumulated_loss / max(1, self.cfg.grad_accum_steps),
-                                "aux_loss": accumulated_aux_loss / max(1, self.cfg.grad_accum_steps),
-                                "lr": current_lr,
-                                "speed": speed,
-                                "vram": vram_mb,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                log_event(
-                    "step_complete",
-                    step=step,
-                    loss=round(accumulated_loss / max(1, self.cfg.grad_accum_steps), 4),
-                    aux_loss=round(accumulated_aux_loss / max(1, self.cfg.grad_accum_steps), 4),
-                    lr=round(current_lr, 7),
-                    tokens_per_s=round(speed, 1),
-                    vram_mb=round(vram_mb, 1),
-                    batch=current_batch_size,
-                    chunk=current_chunk_size,
-                )
-
+            # --- scheduled checkpoint ---
             if step % 100 == 0 and step > 0:
-                self._save_scheduled_checkpoint(step, last_file_idx, last_byte_offset, accumulated_loss, current_lr)
+                self._save_scheduled_checkpoint(
+                    step, last_file_idx, last_byte_offset, accumulated_loss, current_lr
+                )
 
+            # --- state update ---
             state.step = step
-            state.best_loss = min(state.best_loss, accumulated_loss) if accumulated_loss > 0 else state.best_loss
+            state.best_loss = (
+                min(state.best_loss, accumulated_loss) if accumulated_loss > 0 else state.best_loss
+            )
             state.metrics = {
                 "loss": accumulated_loss,
                 "lr": current_lr,
                 "tokens_per_s": speed if step % 10 == 0 else state.metrics.get("tokens_per_s", 0.0),
             }
 
+            # Validation
+            val_every = getattr(self.cfg, "val_every", 0)
+            if val_every > 0 and step > 0 and step % val_every == 0:
+                self._run_validation(step, state)
+
         state.last_checkpoint_path = None
         return state
+
+    def _run_validation(self, step, state):
+        """Quick perplexity check on current data."""
+        self.model.eval()
+        try:
+            batch = next(self.dataloader_iter)
+        except StopIteration:
+            self.model.train()
+            return
+        byte_batch = batch.to(self.device)
+        input_bytes = byte_batch[:, :-self.patcher.stride] if byte_batch.shape[1] > self.patcher.stride else byte_batch
+        with torch.no_grad(), torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            patches = self.patcher(input_bytes)
+            T = patches.shape[1]
+            targets = byte_batch[:, self.patcher.stride::self.patcher.stride][:, :T]
+            if targets.shape[1] < T:
+                targets = F.pad(targets, (0, T - targets.shape[1]))
+            (logits_t1, _, _, _), _ = self.model(patches)
+            val_loss = self.loss_engine.compute_pretrain_loss(logits_t1, targets, [], [])
+        ppl = torch.exp(val_loss).item()
+        state.metrics["val_loss"] = val_loss.item()
+        state.metrics["val_ppl"] = ppl
+        print(f"  [val] step {step}: loss {val_loss.item():.4f}, ppl {ppl:.1f}")
+        self.model.train()
 
     def _save_scheduled_checkpoint(self, step, last_file_idx, last_byte_offset, accumulated_loss, current_lr) -> None:
         os.makedirs("checkpoints", exist_ok=True)
@@ -1244,30 +1232,22 @@ class buselPretrainStage:
         if self.ema is not None:
             ckpt["ema_state_dict"] = self.ema.state_dict()
         try:
-            torch.save(ckpt, temp_path)
-            file_size = os.path.getsize(temp_path)
-            if file_size < 2_000_000:
-                os.remove(temp_path)
-                log_event("checkpoint_rejected", step=step, file_size=file_size, reason="too_small")
-            else:
-                os.rename(temp_path, checkpoint_path)
-                print(f"💾 Scheduled checkpoint saved: {checkpoint_path} ({file_size / 1024 / 1024:.1f} MB)")
-                log_event(
-                    "checkpoint_saved",
-                    step=step,
-                    path=checkpoint_path,
-                    file_size_mb=round(file_size / 1024 / 1024, 2),
-                    loss=round(accumulated_loss, 4),
-                    lr=round(current_lr, 7),
-                )
-                deleted = _cleanup_old_checkpoints(self.profile_name, getattr(self.cfg, "keep_last_n", 5))
-                if deleted:
-                    print(f"🧹 Checkpoint rotation: kept last {getattr(self.cfg, 'keep_last_n', 5)}, deleted {deleted} old (frees ~{deleted * 443} MB)")
+            # Async: clone to CPU, save in background thread
+            import threading
+            ckpt_cpu = {k: v.cpu().clone() if hasattr(v, 'cpu') else v for k, v in ckpt.items()}
+            def _bg_save():
+                torch.save(ckpt_cpu, temp_path)
+                sz = os.path.getsize(temp_path)
+                if sz >= 2_000_000:
+                    os.rename(temp_path, checkpoint_path)
+                    print(f"[save] Checkpoint: {checkpoint_path} ({sz/1024/1024:.1f} MB)")
+            threading.Thread(target=_bg_save, daemon=True).start()
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
         except Exception as e:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            import logging as _logging
-            log_event("checkpoint_failed", step=step, error=str(e), level=_logging.WARNING)
+            log_event("checkpoint_failed", step=step, error=str(e))
 
     def finalize(self, state: StageState) -> StageState:
         """Save the final checkpoint + emit stage_complete event."""
@@ -1289,7 +1269,7 @@ class buselPretrainStage:
             ckpt["ema_state_dict"] = self.ema.state_dict()
         try:
             torch.save(ckpt, final_path)
-            print(f"💾 Final checkpoint: {final_path}")
+            print(f"[save] Final checkpoint: {final_path}")
             log_event(
                 "stage_complete",
                 stage=self.name,
