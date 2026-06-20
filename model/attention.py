@@ -1,5 +1,5 @@
 """
-💡 busel ATTENTION v5.2 - Gated DeltaNet-2 & MLA (Stabilized Broadcasting)
+💡 busel - Gated DeltaNet-2 & MLA (Stabilized Broadcasting)
 Интегрирован раздельный закон стирания и записи GDN-2,
 когерентный логарифмический распад alpha (Eq. 12) с выверенным бродкастом.
 """
@@ -7,14 +7,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fla.ops.gdn2 import fused_recurrent_gdn2
 from model.layers import BitLinear_a4_8, H_BitLinear, RMSNorm, nvtx_range_push, nvtx_range_pop
 from busel_registry import register
-
-try:
-    from fla.ops.gdn2 import chunk_gdn2
-    HAS_FLA_GDN2 = True
-except ImportError:
-    HAS_FLA_GDN2 = False
 
 try:
     from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
@@ -50,49 +45,6 @@ def _sdpa_or_flex(q, k, v, use_flex: bool = False, is_causal: bool = False):
     return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
 
-@torch.jit.script
-def stable_gdn2_recurrent_jit(q, k, v, b, w, alpha):
-    """
-    Высокооптимизированный JIT-компилированный рекуррентный цикл GDN-2 (NVIDIA, 2026).
-    Реализует раздельные канальные гейты стирания (b) и записи (w) с поканальным затуханием (alpha).
-    """
-    B, T, H, dk = q.size()
-    dv = v.size(-1)
-    
-    # S: [B, H, dk, dv]
-    S = torch.zeros(B, H, dk, dv, device=q.device, dtype=q.dtype)
-    out = torch.zeros(B, T, H, dv, device=q.device, dtype=q.dtype)
-    
-    for t in range(T):
-        q_t = q[:, t]          # [B, H, dk]
-        k_t = k[:, t]          # [B, H, dk]
-        v_t = v[:, t]          # [B, H, dv]
-        b_t = b[:, t]          # [B, H, dk]
-        w_t = w[:, t]          # [B, H, dv]
-        alpha_t = alpha[:, t]  # [B, H, dk]
-        
-        # 1. Затухание прошлого состояния по канальной маске альфа: S_bar = D_t * S_{t-1}
-        S_bar = S * alpha_t.unsqueeze(-1)
-        
-        # 2. Вычисление проекции стирания: r_t = S_bar^T * (b_t ⊙ k_t)
-        erase_key = b_t * k_t
-        r_t = torch.einsum('bhkd,bhk->bhd', S_bar, erase_key)
-        
-        # 3. Вычисление целевой записи: z_t = w_t ⊙ v_t
-        z_t = w_t * v_t
-        
-        # 4. Обновление состояния: S_t = S_bar + k_t * (z_t - r_t)^T
-        update = z_t - r_t
-        outer = k_t.unsqueeze(-1) * update.unsqueeze(-2)
-        S = S_bar + outer
-        
-        # 5. Считывание выхода: o_t = S_t^T * q_t
-        out_t = torch.einsum('bhkd,bhk->bhd', S, q_t)
-        out[:, t] = out_t
-        
-    return out.reshape(B, T, -1)
-
-
 @register("attention", "gdn2")
 class BulbaGDN2SeRoPEBlock(nn.Module):
     def __init__(self, d_model=1536, n_heads=12):
@@ -119,12 +71,6 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         # Обучаемый вектор масштаба логарифмического затухания, инициализируемый отрицательным числом
         self.alpha_a = nn.Parameter(torch.ones(n_heads, 1) * -3.0)
         
-        # Активируем Triton-ядро только если оно есть в библиотеке и мы на GPU с поддержкой CUDA
-        if HAS_FLA_GDN2 and torch.cuda.is_available():
-            self.use_fla = True
-        else:
-            self.use_fla = False
-            
         # Низкоранговый выходной гейт (Output Gating — Формула 10)
         self.g_proj_down = BitLinear_a4_8(d_model, d_model // 4)
         self.g_proj_up = BitLinear_a4_8(d_model // 4, d_model)
@@ -165,37 +111,19 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         v_conv = self.v_conv(F.pad(v_proj, (3, 0)))
         v = F.silu(v_conv).transpose(1, 2).view(B, T, self.n_heads, self.d_v)
         
-        # L2-нормализация ключей и запросов для рекуррентной стабильности
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-        
         q, k = self.apply_serope(T, q, k)
         
         b = torch.sigmoid(self.b_proj(x)).view(B, T, self.n_heads, self.d_k)
         w = torch.sigmoid(self.w_proj(x)).view(B, T, self.n_heads, self.d_v)
         
-        # 🎯 ВЫЧИСЛЕНИЕ ЛОГАРИФМИЧЕСКОГО РАСПАДА (NVIDIA GDN-2 Spec — Формула 12):
-        # view(1, 1, self.n_heads, 1) выравнивает размерность альфа-а под бродкаст на [B, T, n_heads, d_k]
-        alpha_proj = self.alpha_proj(x).view(B, T, self.n_heads, self.d_k)
-        g_t = -torch.exp(self.alpha_a).view(1, 1, self.n_heads, 1) * F.softplus(alpha_proj)
-        alpha = torch.exp(g_t)
-        
-        if self.use_fla:
-            # 🚀 СВЕРХБЫСТРЫЙ И КОРРЕКТНЫЙ TRITON-ИНФЕРЕНС GDN-2 (PR #920):
-            # Передаем q, k, v, логарифмический распад g_t, гейт очистки b и гейт записи w.
-            # По умолчанию в FLA используется формат [B, T, H, D]
-            out, _ = chunk_gdn2(
-                q, 
-                k, 
-                v, 
-                g_t,        # Передаем логарифмический распад g_t
-                b,          # Передаем гейт стирания b
-                w,          # Передаем гейт записи w
-                scale=1.0 / (self.d_k ** 0.5)
-            )
-            out = out.reshape(B, T, -1)
-        else:
-            out = stable_gdn2_recurrent_jit(q, k, v, b, w, alpha)
+        g = self.alpha_proj(x).view(B, T, self.n_heads, self.d_k)
+        out = fused_recurrent_gdn2(
+            q, k, v, g, b, w,
+            A_log=self.alpha_a.squeeze(-1),
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+        )[0]
+        out = out.view(B, T, -1)
             
         # Применение выходного гейта и RMSNorm (Формула 10)
         gate = torch.sigmoid(self.g_proj_up(self.g_proj_down(x)))

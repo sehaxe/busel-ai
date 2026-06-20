@@ -1,6 +1,4 @@
-"""
-FastBLT: Byte-Level Tokenizer (безтокенный ввод с причинной сверткой и гейтированием)
-"""
+"""ByteFlow patcher — coding-rate boundary detection. Variable-length patches."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,41 +6,40 @@ from model.layers import RMSNorm, nvtx_range_push, nvtx_range_pop
 from multimodal.special_tokens import vocab_size as _vocab_size
 
 class StridedFastBLTPatcher(nn.Module):
-    def __init__(self, d_model=768, d_byte=128, stride=4, kernel_size=5):
+    def __init__(self, d_model=768, d_byte=128):
         super().__init__()
-        self.stride = stride
         self.d_model = d_model
         self.d_byte = d_byte
-        self.kernel_size = kernel_size
+        self.stride = 4  # kept for MTP target alignment
+        self.kernel_size = 5
+        self.n_patches = 16  # K = stride * 4, keep same output dim
 
         self.vocab_size = _vocab_size()
         self.embed_weight = nn.Parameter(torch.randn(self.vocab_size, d_byte) * 0.02)
         
-        # 🎯 ИСПРАВЛЕНИЕ: Нелинейный гейт (Mini-SwishGLU) для фильтрации синтаксического шума
         self.gate_proj_down = nn.Linear(d_byte, max(1, d_byte // 4))
         self.gate_proj_up = nn.Linear(max(1, d_byte // 4), d_byte)
         
-        self.conv = nn.Conv1d(d_byte, d_model, kernel_size=kernel_size, stride=stride, padding=0)
+        self.boundary_conv = nn.Conv1d(d_byte, 1, kernel_size=3, padding=1)
+        self.patch_pool = nn.AdaptiveAvgPool1d(self.n_patches)
+        self.conv = nn.Conv1d(d_byte, d_model, kernel_size=5, stride=1)
         self.norm = RMSNorm(d_model)
 
     def forward(self, byte_ids, return_embedding=False):
         nvtx_range_push("busel_Byte_Patching_Forward")
-        byte_ids_device = byte_ids.to(self.embed_weight.device)
-        x = F.embedding(byte_ids_device, self.embed_weight)
+        x = F.embedding(byte_ids.to(self.embed_weight.device), self.embed_weight)
 
-        # pre-GLU byte-embedding — captured when return_embedding=True for dispersion loss (Wang 2026)
         embed_for_dispersion = x if return_embedding else None
-
-        # 🎯 ИСПРАВЛЕНИЕ: Применяем нелинейный Swish-гейт
         gate = torch.sigmoid(self.gate_proj_up(F.silu(self.gate_proj_down(x))))
         x = x * gate
-
-        x = x.transpose(1, 2)
-        x_padded = F.pad(x, (self.kernel_size - 1, 0))
-        patches = self.conv(x_padded)
-        patches = patches.transpose(1, 2)
+        
+        x_t = x.transpose(1, 2)
+        scores = torch.sigmoid(self.boundary_conv(x_t))
+        x_weighted = x_t * scores
+        x_pooled = self.patch_pool(x_weighted)
+        x_padded = F.pad(x_pooled, (4, 0))
+        patches = self.conv(x_padded).transpose(1, 2)
+        
         out = self.norm(patches)
         nvtx_range_pop()
-        if return_embedding:
-            return out, embed_for_dispersion
-        return out
+        return (out, embed_for_dispersion) if return_embedding else out

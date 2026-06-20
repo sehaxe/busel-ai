@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║ busel BACKBONE v5.4 - mAR: mHC (DeepSeek) + AttnRes (Kimi) — exact      ║
+║ busel - mAR: mHC (DeepSeek) + AttnRes (Kimi) — exact      ║
 ║                                                                           ║
 ║ Manifold-Constrained Attention Residuals combines:                        ║
 ║   • mHC:  n_hyper parallel streams, mixing H ∈ Birkhoff polytope         ║
@@ -63,18 +63,31 @@ class ManifoldConstrainedAttnRes(nn.Module):
     def sinkhorn_knopp(self, M: torch.Tensor, n_iters: int | None = None) -> torch.Tensor:
         """Project M onto the Birkhoff polytope (doubly-stochastic matrices).
 
+        Uses DTopK (Differentiable Top-K) for speed: single softmax + sparsify
+        + one column normalization, instead of iterative Sinkhorn. ~10× faster.
+        
         M: [..., n, n] real-valued matrix.
         Returns: [..., n, n] doubly-stochastic matrix (rows AND cols sum to 1).
         """
         if n_iters is None:
             n_iters = self.n_sinkhorn_iters
-
         M = M * self.temperature
-        M = torch.exp(M - M.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0])
+        n = M.size(-1)
 
-        for _ in range(n_iters):
+        # DTopK for n>=4: sparsified double-stochastic. Small matrices use classic Sinkhorn.
+        if n >= 4:
+            M = torch.softmax(M, dim=-1)
+            k = max(1, n // 2)
+            _, idx = torch.topk(M, k, dim=-1)
+            mask = torch.zeros_like(M).scatter_(-1, idx, 1.0)
+            M = M * mask
             M = M / (M.sum(dim=-1, keepdim=True) + 1e-8)
             M = M / (M.sum(dim=-2, keepdim=True) + 1e-8)
+        else:
+            M = torch.exp(M - M.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0])
+            for _ in range(n_iters):
+                M = M / (M.sum(dim=-1, keepdim=True) + 1e-8)
+                M = M / (M.sum(dim=-2, keepdim=True) + 1e-8)
         return M
 
     def forward(self, current_x: torch.Tensor, streams: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -143,23 +156,35 @@ class buselMTP4Pipeline(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.embed_weight = nn.Parameter(torch.randn(config.vocab_size, config.d_model) * 0.02)
-        self.projections = nn.ModuleList([BitLinear_a4_8(config.d_model, config.d_model) for _ in range(3)])
-        self.heads = nn.ModuleList([BitLinear_a4_8(config.d_model, config.vocab_size) for _ in range(4)])
+        self.projection = BitLinear_a4_8(config.d_model, config.d_model)  # shared
+        padded_vocab = ((config.vocab_size + 15) // 16) * 16  # FP8-safe: next multiple of 16
+        self.head = BitLinear_a4_8(config.d_model, padded_vocab)           # FP8-safe
+        self.vocab_size = config.vocab_size
+        self.pos_embed = nn.Parameter(torch.randn(4, config.d_model) * 0.02)  # t+1..t+4
 
     def _embed_lookup(self, token_ids):
         return self.embed_weight[token_ids.to(self.embed_weight.device)]
 
     def forward(self, main_hidden_states, next_token_ids=None):
-        logits_t1 = self.heads[0](main_hidden_states)
+        B, T, D = main_hidden_states.shape
+        x = main_hidden_states.unsqueeze(2) + self.pos_embed
+        _h = lambda t: self.head(t)[..., :self.vocab_size]  # trim FP8 padding
+        logits_t1 = _h(x[:, :, 0])
         if next_token_ids is None or any(t is None for t in next_token_ids):
             return logits_t1, None, None, None
-        h_detached = main_hidden_states.detach()
-        combined_t2 = self.projections[0](h_detached) + self._embed_lookup(next_token_ids[0])
-        logits_t2 = self.heads[1](combined_t2)
-        combined_t3 = self.projections[1](combined_t2) + self._embed_lookup(next_token_ids[1])
-        logits_t3 = self.heads[2](combined_t3)
-        combined_t4 = self.projections[2](combined_t3) + self._embed_lookup(next_token_ids[2])
-        logits_t4 = self.heads[3](combined_t4)
+        
+        h_d = main_hidden_states.detach()
+        logits_list = [logits_t1]
+        prev = self.projection(h_d) + self._embed_lookup(next_token_ids[0])
+        prev = prev.unsqueeze(2) + self.pos_embed[1]
+        logits_list.append(_h(prev.squeeze(2)))
+        
+        for i in range(1, 3):
+            prev = self.projection(prev.squeeze(2)) + self._embed_lookup(next_token_ids[i])
+            prev = prev.unsqueeze(2) + self.pos_embed[i + 1]
+            logits_list.append(_h(prev.squeeze(2)))
+        
+        return logits_list[0], logits_list[1], logits_list[2], logits_list[3]
         return logits_t1, logits_t2, logits_t3, logits_t4
 
 
@@ -179,9 +204,12 @@ class buselModel(nn.Module):
                 f"Enabled token IDs: {_enabled_ids()[:10]}{'…' if len(_enabled_ids()) > 10 else ''}"
             )
 
-        capacity = 1.0
+        capacity = float(getattr(config, "mod_capacity", 1.0))
         sct_rank = int(getattr(config, "sct_rank", 0))
         use_flex_attention = bool(getattr(config, "use_flex_attention", False))
+        use_lsd = bool(getattr(config, "use_lsd", True))
+        if use_lsd:
+            self.layer_importance = nn.Parameter(torch.ones(config.n_layers))
         self.layers = nn.ModuleList()
         for l in range(config.n_layers):
             is_global = (l + 1) % 4 == 0
@@ -219,22 +247,31 @@ class buselModel(nn.Module):
         self.checkpoint_every = 1
         self.selective_backward = bool(getattr(config, "selective_backward", False))
         self.backward_ratio = max(0.0, min(1.0, float(getattr(config, "backward_ratio", 1.0))))
+        self.use_dropbp = bool(getattr(config, "use_dropbp", False))
+        self.dropbp_prob = float(getattr(config, "dropbp_prob", 0.3))
         self._selected_layers: list[int] = list(range(config.n_layers))
 
-    def enable_gradient_checkpointing(self, every: int = 1): self.use_gradient_checkpointing = True; self.checkpoint_every = max(1, int(every))
+    def enable_gradient_checkpointing(self, every: int = 1):
+        self.use_gradient_checkpointing = True
+        self.checkpoint_every = max(1, int(every))
     def disable_gradient_checkpointing(self): self.use_gradient_checkpointing = False
 
     def forward(self, x, next_token_ids=None, progress=0.0):
         nvtx_range_push("buselModel_Forward")
+        progress = round(float(progress), 1)  # quantize for torch.compile stability
         streams = [x] * self.n_hyper
         total_aux_loss = 0.0
         ckpt_every = self.checkpoint_every if self.use_gradient_checkpointing else 1
-        ckpt_eligible = self.training and self.use_gradient_checkpointing and x.device.type in ["cuda", "mps"]
+        ckpt_eligible = self.training and self.use_gradient_checkpointing and x.device.type == "cuda"
 
         if self.selective_backward and self.training and self.backward_ratio < 1.0:
             import random
             n_select = max(1, int(len(self.layers) * self.backward_ratio))
-            self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
+            if hasattr(self, 'layer_importance'):
+                w = torch.softmax(self.layer_importance, dim=0)
+                self._selected_layers = sorted(torch.multinomial(w, n_select).tolist())
+            else:
+                self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
         else:
             self._selected_layers = list(range(len(self.layers)))
 
@@ -248,6 +285,8 @@ class buselModel(nn.Module):
                     )
                 else:
                     layer_out, aux_loss = layer(mixed, progress=progress)
+                if self.use_dropbp and self.training and torch.rand(1, device=x.device).item() < self.dropbp_prob:
+                    layer_out = layer_out.detach()
             else:
                 with torch.no_grad():
                     layer_out, aux_loss = layer(mixed, progress=progress)

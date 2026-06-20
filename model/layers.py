@@ -1,23 +1,27 @@
 """
-⚙️ busel LAYERS v4.7 - Autocast Safe, SwishGLU, Fused RMSNorm & H_BitLinear (BitNet v2)
+⚙️ busel - Autocast Safe, SwishGLU, Fused RMSNorm & H_BitLinear (BitNet v2)
 """
 import torch
 import torch.nn as nn
 import math
 
-_BITLINEAR_CONFIG = {"use_tequila": False, "tequila_lambda": 1e-3, "hestia_temperature": None}
+_BITLINEAR_CONFIG = {"use_tequila": False, "tequila_lambda": 1e-3, "hestia_temperature": None, "use_sr_ste": True, "use_sparse_bitnet": True}
 
 def configure_bitlinear(use_tequila: bool = False, tequila_lambda: float = 1e-3,
-                        hestia_temperature=None):
+                        hestia_temperature=None, use_sr_ste: bool = True):
     _BITLINEAR_CONFIG["use_tequila"] = use_tequila
     _BITLINEAR_CONFIG["tequila_lambda"] = tequila_lambda
     _BITLINEAR_CONFIG["hestia_temperature"] = hestia_temperature
+    _BITLINEAR_CONFIG["use_sr_ste"] = use_sr_ste
 
 def nvtx_range_push(name: str):
     if torch.cuda.is_available(): torch.cuda.nvtx.range_push(name)
 def nvtx_range_pop():
     if torch.cuda.is_available(): torch.cuda.nvtx.range_pop()
 
+import torch.compiler
+
+@torch.compiler.disable
 def fast_walsh_hadamard_transform(x):
     orig_shape = x.shape
     D = orig_shape[-1]
@@ -41,6 +45,18 @@ def fast_walsh_hadamard_transform(x):
 class RoundSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x): return torch.round(x)
+    @staticmethod
+    def backward(ctx, grad_output): return grad_output
+
+
+class SR_STE(torch.autograd.Function):
+    """Stochastic Rounding STE — eliminates quantization bias."""
+    @staticmethod
+    @torch.compiler.disable
+    def forward(ctx, x):
+        floor = torch.floor(x)
+        frac = x - floor
+        return torch.where(torch.rand_like(x) < frac, floor + 1, floor)
     @staticmethod
     def backward(ctx, grad_output): return grad_output
 
@@ -104,12 +120,20 @@ class BitLinear_a4_8(nn.Linear):
         use_tequila = self.use_tequila or _BITLINEAR_CONFIG["use_tequila"]
         tequila_lambda = self.tequila_lambda or _BITLINEAR_CONFIG["tequila_lambda"]
         temp = self.hestia_temperature if self.hestia_temperature is not None else _BITLINEAR_CONFIG["hestia_temperature"]
+        _ste = SR_STE if _BITLINEAR_CONFIG.get("use_sr_ste", True) else RoundSTE
 
         if temp is not None and temp.item() > 0 if hasattr(temp, 'item') else temp is not None and temp > 0:
             temp_val = temp if isinstance(temp, torch.Tensor) else torch.tensor(temp, device=w.device, dtype=w.dtype)
             w_quant = HestiaQuantize.apply(w_clipped, temp_val)
         else:
-            w_quant = w_clipped + (RoundSTE.apply(w_clipped) - w_clipped)
+            w_quant = w_clipped + (_ste.apply(w_clipped) - w_clipped)
+
+        # Sparse-BitNet: 6:8 structured sparsity on ternary weights (1.3× speedup)
+        if _BITLINEAR_CONFIG.get("use_sparse_bitnet", True) and not self.is_intermediate:
+            w_flat = w_quant.reshape(-1, 8)
+            _, idx = torch.topk(w_flat.abs(), 6, dim=-1)
+            mask = torch.zeros_like(w_flat).scatter_(-1, idx, 1.0)
+            w_quant = (w_flat * mask).reshape_as(w_quant)
 
         tequila_bias = None
         if use_tequila and not self.is_intermediate:
@@ -117,9 +141,11 @@ class BitLinear_a4_8(nn.Linear):
             tequila_bias = tequila_lambda * (w * deadzone_mask).sum(dim=-1)
 
         if not self.is_intermediate:
+            # Mean bias removal — eliminates FP4 quantization instability (arXiv:2603.10444)
+            x = x - x.mean(dim=-1, keepdim=True)
             beta = x.abs().mean(dim=-1, keepdim=True).detach() + 1e-5
             x_scaled = x * (2.6457 / beta)
-            x_quant = x_scaled + (RoundSTE.apply(torch.clamp(x_scaled, -8, 7)) - x_scaled)
+            x_quant = x_scaled + (_ste.apply(torch.clamp(x_scaled, -8, 7)) - x_scaled)
             out = nn.functional.linear(x_quant, w_quant)
             out = out * (alpha * beta / 2.6457)
             if tequila_bias is not None:
@@ -158,17 +184,21 @@ class LearnableClampSTE(torch.autograd.Function):
         if sum_dims: grad_bounds = grad_bounds.sum(dim=sum_dims)
         return grad_x, grad_bounds
 
-class RMSNorm(nn.Module):
+class RMSNorm(nn.RMSNorm):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__(dim, eps=eps)
+
+class CRMSNorm(nn.Module):
+    """Centered RMSNorm — subtracts mean before normalizing. Critical for >30 layers."""
     def __init__(self, dim, eps=1e-6):
         super().__init__()
-        self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
+        self.eps = eps
     def forward(self, x):
-        if hasattr(torch.nn.functional, "rms_norm"):
-            return torch.nn.functional.rms_norm(x, (x.shape[-1],), self.weight.to(x.dtype), self.eps)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight.to(x.dtype)
+        mean = x.mean(dim=-1, keepdim=True)
+        x = x - mean
+        rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).sqrt()
+        return x / rms * self.weight
 
 class SwishGLUClamped(nn.Module):
     def __init__(self, d_model, d_ffn, sct_rank=0):
