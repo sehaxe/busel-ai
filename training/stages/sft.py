@@ -1,5 +1,5 @@
 """
-🤖 busel SFT STAGE v1.0 — Supervised fine-tuning on chat-formatted data
+🤖 busel — Supervised fine-tuning on chat-formatted data
 The second stage of the pipeline. Resumes from a pretrain checkpoint and
 fine-tunes on multi-turn chat JSONL with **assistant-only loss masking**.
 

@@ -1,5 +1,5 @@
 """
-🛸 busel STAGES v1.0 — Multi-Stage Training Pipeline
+🛸 busel — Multi-Stage Training Pipeline
 Plug-in extension points for training stages (pretrain, SFT, DPO, eval, REPL).
 
 Each stage is registered via @register_stage("name") and implements the

@@ -1,5 +1,5 @@
 """
-🛸 busel STAGE BASE v1.0 — Protocol + State + Registry Helpers
+🛸 busel — Protocol + State + Registry Helpers
 A single training stage encapsulates one phase (pretrain, SFT, DPO, eval,
 REPL). Stages are registered via @register_stage("name") and run by the
 pipeline orchestrator in tools/orchestrator.py.

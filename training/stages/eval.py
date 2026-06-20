@@ -1,5 +1,5 @@
 """
-🛰️ busel EVAL STAGE v1.0 — Pipeline stage that runs all eval metrics
+🛰️ busel — Pipeline stage that runs all eval metrics
 Loads a checkpoint, runs `tools.eval.run_all_metrics`, stashes the result
 dict in `state.artifact` for downstream consumers (Telegram bot, web
 dashboard, or just the orchestrator log).

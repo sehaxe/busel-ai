@@ -1,5 +1,5 @@
 """
-🤖 busel DPO STAGE v1.0 — Direct Preference Optimization (Rafailov et al. 2023)
+🤖 busel — Direct Preference Optimization (Rafailov et al. 2023)
 The third stage of the pipeline. Resumes from an SFT checkpoint and runs
 DPO on `(prompt, chosen, rejected)` triples.
 
