@@ -65,9 +65,7 @@ def _build(profile_name, batch_size, device, **flags):
         pass
     cfg = Cfg()
     cfg.vocab_size = _vocab_size()
-    cfg.optimizer_type = "lotus_muon"
     cfg.lotus_rank = 8
-    cfg.lotus_lr_scale = 0.5
     cfg.lr_multipliers = None
     cfg.n_hyper = 2
     cfg.use_ema = True
@@ -122,13 +120,7 @@ def _build(profile_name, batch_size, device, **flags):
         model,
         lr_muon=cfg.learning_rate_muon,
         lr_adamw=cfg.learning_rate_adamw,
-        optimizer_type=cfg.optimizer_type,
         lotus_rank=cfg.lotus_rank,
-        lotus_lr_scale=cfg.lotus_lr_scale,
-        use_schedule_free=cfg.use_schedule_free,
-        use_cautious=cfg.use_cautious,
-        use_quest=getattr(cfg, "use_quest", False),
-        quest_bits=getattr(cfg, "quest_bits", 1.58),
     )
     autopilot = buselAutoPilot(opt, max_lr_muon=cfg.learning_rate_muon,
                                  max_lr_adamw=cfg.learning_rate_adamw, target_wd=cfg.weight_decay)
@@ -250,7 +242,7 @@ def _print_table(title, results):
 
 
 def mode_shpak_v60(device):
-    print("🚀 busel SHPAK v6.0 CUMULATIVE PROFILER — builds the best config from validated winners")
+    print("🚀 busel SHPAK CUMULATIVE PROFILER — builds the best config from validated winners")
     print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
     print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
     print("   Each run adds one opt-in feature (all opt-in via buselPretrainConfig).")
@@ -269,12 +261,12 @@ def mode_shpak_v60(device):
         except Exception as e:
             print(f"   ❌ FAILED: {type(e).__name__}: {e}")
             results.append({"name": name, "error": str(e)})
-    _print_table("SHPAK v6.0 CUMULATIVE COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
+    _print_table("SHPAK CUMULATIVE COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
     return results
 
 
 def mode_shpak_disp(device):
-    print("🔵 busel SHPAK v6.1 DISPERSION PROFILER — Wang 2026 on token embeddings")
+    print("🔵 busel SHPAK DISPERSION PROFILER — Wang 2026 on token embeddings")
     print("   Profile: shpak 52.8M params, batch=16 ctx=4096")
     print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
     print("   Each run adds Dispersion Loss to the v6.0 winner (DA+Cautious+LCSB).")
@@ -292,13 +284,13 @@ def mode_shpak_disp(device):
         except Exception as e:
             print(f"   ❌ FAILED: {type(e).__name__}: {e}")
             results.append({"name": name, "error": str(e)})
-    _print_table("SHPAK v6.1 DISPERSION COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
+    _print_table("SHPAK DISPERSION COMPARISON (52.8M, batch=16 ctx=4096, 10 steps)", results)
     return results
 
 
 def mode_kruk_v85(device):
     """v8.5 Singularity profiler on kruk (~104M, 12 layers, 6 experts)."""
-    print("🔮 busel KRUK v8.5 SINGULARITY PROFILER — SCT + CLA + FlexAttention + auto-mode")
+    print("🔮 busel KRUK SINGULARITY PROFILER — SCT + CLA + FlexAttention + auto-mode")
     print("   Profile: kruk ~104M params (12 layers, 6 experts), batch=16 ctx=4096")
     print(f"   Steps per run: {N_MEASURE_5RUN} ({N_WARMUP_5RUN} warmup + {N_MEASURE_5RUN} measured)\n")
     print("   Tests v8.5 technologies: SCT, CLA, FlexAttention, Cautious, SF, QuEST, Hestia.\n")
@@ -323,12 +315,12 @@ def mode_kruk_v85(device):
         except Exception as e:
             print(f"   ❌ FAILED: {type(e).__name__}: {e}")
             results.append({"name": name, "error": str(e)})
-    _print_table("KRUK v8.5 SINGULARITY COMPARISON (~104M, batch=16 ctx=4096, 10 steps)", results)
+    _print_table("KRUK SINGULARITY COMPARISON (~104M, batch=16 ctx=4096, 10 steps)", results)
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="busel profile suite (v6.0 + v6.1 + v8.5)")
+    parser = argparse.ArgumentParser(description="busel profile suite")
     parser.add_argument("--mode", choices=["shpak-v60", "shpak-disp", "kruk-v85"],
                         default="kruk-v85", help="Which comparison to run (default: kruk-v85)")
     parser.add_argument("--out", default="checkpoints/v58_profile.json",

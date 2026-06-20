@@ -349,33 +349,8 @@ class StablebuselProfiler:
         print("="*80)
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="busel Stable Step Profiler (v2.1)")
-    parser.add_argument("--backend", type=str, default="auto",
-                        choices=["auto", "custom", "torch"],
-                        help="Profiler backend: auto (torch on CUDA, custom on MPS/CPU), custom (manual perf_counter, stable everywhere), torch (torch.profiler, hangs on MPS — CUDA only).")
-    parser.add_argument("--trace", type=str, default="checkpoints/busel_profiler_trace.json",
-                        help="Output path for torch.profiler Chrome trace (only used with --backend torch).")
-    parser.add_argument("--optimizer-type", type=str, default="lotus_muon",
-                        choices=["muon", "lotus_muon"],
-                        help="Muon variant: 'lotus_muon' (default, rank-r factorised) or 'muon' (fp32 NS×5, kept for ablation).")
-    parser.add_argument("--lotus-rank", type=int, default=8,
-                        help="Rank for lotus_muon (default 8, paper recommendation).")
-    parser.add_argument("--lotus-lr-scale", type=float, default=0.5,
-                        help="LR scale for lotus_muon (default 0.5, paper recommendation).")
-    parser.add_argument("--top-k", type=int, default=1,
-                        help="MoE top_k: 1 (default, ~35%% routed-FFN FLOP cut) or 2 for ensemble effect.")
-    parser.add_argument("--no-grad-ckpt", action="store_true",
-                        help="Disable gradient checkpointing (full activation memory, no recompute).")
-    parser.add_argument("--selective-backward", action="store_true",
-                        help="Enable LCSB selective per-layer backward (only k of n layers backprop per step).")
-    parser.add_argument("--backward-ratio", type=float, default=0.5,
-                        help="Fraction of layers to backprop when --selective-backward is on (default 0.5).")
-    parser.add_argument("--steps", type=int, default=10,
-                        help="Number of profiling steps (default 10).")
-    args = parser.parse_args()
-
+def run_profiler(args):
+    """Core profiler logic. *args* should have the same attributes as argparse Namespace."""
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.backend == "auto":
@@ -388,8 +363,7 @@ def main():
         backend = "custom"
 
     flags_summary = (
-        f"optimizer={args.optimizer_type}"
-        f"{f'(rank={args.lotus_rank})' if args.optimizer_type == 'lotus_muon' else ''}"
+        f"SF-NorLotusMuon(rank={args.lotus_rank})"
         f" | top_k={args.top_k}"
         f" | grad_ckpt={'off' if args.no_grad_ckpt else 'on(every=2)'}"
         f" | selective_bwd={'on' if args.selective_backward else f'off({args.backward_ratio if not args.selective_backward else 0})'}"
@@ -445,9 +419,7 @@ def main():
         model,
         lr_muon=cfg.learning_rate_muon,
         lr_adamw=cfg.learning_rate_adamw,
-        optimizer_type=args.optimizer_type,
         lotus_rank=args.lotus_rank,
-        lotus_lr_scale=args.lotus_lr_scale,
     )
     loss_engine = buselLossEngine(cfg.vocab_size)
     autopilot = buselAutoPilot(
@@ -485,6 +457,35 @@ def main():
                 os.rmdir(cfg.data_path)
             except OSError:
                 pass
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="busel Stable Step Profiler")
+    parser.add_argument("--backend", type=str, default="auto",
+                        choices=["auto", "custom", "torch"],
+                        help="Profiler backend: auto (torch on CUDA, custom on MPS/CPU), custom (manual perf_counter, stable everywhere), torch (torch.profiler, hangs on MPS — CUDA only).")
+    parser.add_argument("--trace", type=str, default="checkpoints/busel_profiler_trace.json",
+                        help="Output path for torch.profiler Chrome trace (only used with --backend torch).")
+    parser.add_argument("--optimizer-type", type=str, default="lotus_muon",
+                        choices=["muon", "lotus_muon"],
+                        help="Muon variant: 'lotus_muon' (default, rank-r factorised) or 'muon' (fp32 NS×5, kept for ablation).")
+    parser.add_argument("--lotus-rank", type=int, default=8,
+                        help="Rank for lotus_muon (default 8, paper recommendation).")
+    parser.add_argument("--lotus-lr-scale", type=float, default=0.5,
+                        help="LR scale for lotus_muon (default 0.5, paper recommendation).")
+    parser.add_argument("--top-k", type=int, default=1,
+                        help="MoE top_k: 1 (default, ~35%% routed-FFN FLOP cut) or 2 for ensemble effect.")
+    parser.add_argument("--no-grad-ckpt", action="store_true",
+                        help="Disable gradient checkpointing (full activation memory, no recompute).")
+    parser.add_argument("--selective-backward", action="store_true",
+                        help="Enable LCSB selective per-layer backward (only k of n layers backprop per step).")
+    parser.add_argument("--backward-ratio", type=float, default=0.5,
+                        help="Fraction of layers to backprop when --selective-backward is on (default 0.5).")
+    parser.add_argument("--steps", type=int, default=10,
+                        help="Number of profiling steps (default 10).")
+    args = parser.parse_args()
+    run_profiler(args)
 
 
 if __name__ == "__main__":

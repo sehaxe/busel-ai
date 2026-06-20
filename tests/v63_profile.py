@@ -68,9 +68,7 @@ def _build(batch_size, optimizer_type="lotus_muon", lr_schedule="cosine",
         pass
     cfg = Cfg()
     cfg.vocab_size = _vocab_size()
-    cfg.optimizer_type = optimizer_type
     cfg.lotus_rank = 8
-    cfg.lotus_lr_scale = 0.5
     cfg.use_quest = use_quest
     cfg.quest_bits = quest_bits
     cfg.wsd_s_enabled = wsd_s_enabled
@@ -109,11 +107,7 @@ def _build(batch_size, optimizer_type="lotus_muon", lr_schedule="cosine",
         model,
         lr_muon=cfg.learning_rate_muon,
         lr_adamw=cfg.learning_rate_adamw,
-        optimizer_type=cfg.optimizer_type,
         lotus_rank=cfg.lotus_rank,
-        lotus_lr_scale=cfg.lotus_lr_scale,
-        use_quest=cfg.use_quest,
-        quest_bits=cfg.quest_bits,
     )
     autopilot = buselAutoPilot(opt, max_lr_muon=cfg.learning_rate_muon,
                                max_lr_adamw=cfg.learning_rate_adamw,
@@ -225,7 +219,7 @@ def _run_one(name, batch_size, device, n_warmup, n_measure, **kwargs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v6.2–v7.0 profiler on shpak 52.8M")
+    parser = argparse.ArgumentParser(description="profiler on shpak 52.8M")
     parser.add_argument("--mode", choices=["all", "soap", "wsds", "wd33", "baseline",
                                             "tequila", "hestia", "muonq", "v7all"],
                         default="all", help="Which features to profile")
@@ -278,7 +272,7 @@ def main():
         results.append(r)
 
     print(f"\n{'=' * 80}")
-    print("📊 SUMMARY — v6.2–v7.0 on shpak 52.8M")
+    print("📊 SUMMARY — shpak 52.8M")
     print(f"{'=' * 80}")
     print(f"{'Name':<40} {'tok/s':>8} {'step(ms)':>10} {'loss':>8} {'VRAM':>6}")
     print(f"{'-'*40} {'-'*8} {'-'*10} {'-'*8} {'-'*6}")
