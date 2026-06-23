@@ -49,11 +49,6 @@ from multimodal.special_tokens import (
     get_special_token,
 )
 
-# Backward-compat alias — older code (v5.0-5.3) imports `IMAGE_MARKER` to mean
-# the generic "media start" token. The plug-in split makes the modality explicit
-# (MOD_IMAGE, MOD_VIDEO, ...) but we keep the legacy name for the same value.
-IMAGE_MARKER = MEDIA_START
-
 IMAGE_W = 32
 IMAGE_H = 32
 IMAGE_BYTES = IMAGE_W * IMAGE_H * 3
@@ -412,9 +407,6 @@ class TextEncoder:
     def encode_file(self, path: str) -> list:
         with open(path, "rb") as f:
             return [_resolve_modality_marker("text")] + list(f.read())
-
-
-ENCODER_REGISTRY: dict = {}
 
 
 def build_encoder_for(path: str):

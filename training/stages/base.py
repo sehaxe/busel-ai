@@ -234,3 +234,5 @@ def _apply_model_profile(cfg, m: dict) -> None:
     cfg.top_k = int(m.get("top_k", cfg.top_k))
     cfg.vocab_size = int(m.get("vocab_size", cfg.vocab_size))
     cfg.n_hyper = int(m.get("n_hyper", cfg.n_hyper))
+    cfg.nsa_n_heads = int(m.get("nsa_n_heads", getattr(cfg, "nsa_n_heads", 16)))
+    cfg.num_mtp_heads = int(m.get("num_mtp_heads", getattr(cfg, "num_mtp_heads", 3)))

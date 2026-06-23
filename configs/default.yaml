@@ -5,340 +5,223 @@ global:
   precision: "bf16"
 
 profiles:
-  validation:
+  # ═══════════════════════════════════════════════════════════════════
+  # sovereign_test — мини-тест (4M params, все фичи, ~3 мин)
+  # ═══════════════════════════════════════════════════════════════════
+  sovereign_test:
     model:
       d_model: 128
-      n_layers: 3
+      n_layers: 2
       n_heads: 4
       expert_hidden: 256
-      num_experts: 2
+      num_experts: 4
       top_k: 1
       vocab_size: 326
+      n_hyper: 2
+      num_mtp_heads: 12
       selective_backward: true
       backward_ratio: 0.5
-      use_differential_attention: true
+      nsa_n_heads: 16          # fallback to MLA при d_model<256
     data:
       data_path: "data_train"
       chunk_size: 256
-      batch_size: 8192
+      batch_size: 128
+      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
-      max_steps: 500
-      warmup_steps: 5
-      min_lr_ratio: 1.0
-      learning_rate_muon: 0.0030
+      max_steps: 200
+      warmup_steps: 10
+      min_lr_ratio: 0.3
+      learning_rate_muon: 0.003
       learning_rate_adamw: 0.0003
       weight_decay: 0.1
       grad_accum_steps: 2
-      optimization_mode: manual
+      mod_capacity: 0.5
+      mod_interval: 1
       use_dispersion_loss: true
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-      use_schedule_free: true
-      use_cautious: false
-      use_tequila: true
-      use_quest: false
       use_rho_loss: true
-      rho_keep_ratio: 0.5
+      lr_schedule: "wsd"
+      wsd_decay_frac: 0.1
+      sct_rank: 8
       use_dropbp: true
-      dropbp_prob: 0.3
-      lr_schedule: "cosine"
-      grad_accum_steps: 1
-      use_chunk_curriculum: false
-      use_routing_free: true
     perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
       keep_last_n: 3
-      dynamic_compile: false
+      grad_ckpt_every: 3
 
-  micro_test:
+  # ═══════════════════════════════════════════════════════════════════
+  # sovereign_5h — ~5 часов (~70M params) — минимальный чат-бот
+  # ═══════════════════════════════════════════════════════════════════
+  sovereign_5h:
     model:
-      d_model: 128           # Small but enough to learn patterns
-      n_layers: 3            # 3 layers for better learning
-      n_heads: 4
-      expert_hidden: 256
-      num_experts: 2         # 2 experts for speed
-      top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      selective_backward: false
-      backward_ratio: 1.0
-    data:
-      data_path: "data_train"
-      chunk_size: 256       # Small context for speed
-      batch_size: 4096       # Large batch for fast convergence
-    training:
-      max_steps: 2000        # Enough steps to get coherent output
-      warmup_steps: 100
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.003
-      learning_rate_adamw: 0.0003
-      weight_decay: 0.1
-      grad_accum_steps: 1
-      checkpoint_interval: 500  # Save every 500 steps
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-
-  quick_test:
-    model:
-      d_model: 128
-      n_layers: 4
-      n_heads: 4
-      expert_hidden: 256
-      num_experts: 2
-      top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      selective_backward: false
-      backward_ratio: 1.0
-    data:
-      data_path: "data_train"
-      chunk_size: 256
-      batch_size: 2048
-    training:
-      max_steps: 500
-      warmup_steps: 20
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.002
-      learning_rate_adamw: 0.0002
-      weight_decay: 0.1
-      grad_accum_steps: 1
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-
-  chyzh:
-    model:
-      d_model: 192          # Снижено до 192 (даст емкость ровно ~10M параметров)
-      n_layers: 6           # 6 слоев
-      n_heads: 3            # 3 головы (192 / 3 = 64)
-      expert_hidden: 384    # 2 * d_model
-      num_experts: 4        # 4 эксперта MoE
-      top_k: 1
-      vocab_size: 326        # 256 raw bytes + 3 legacy + 67 plug-in specials
-      selective_backward: true
-      backward_ratio: 0.5
-    data:
-      data_path: "data_train"
-      chunk_size: 16384
-      batch_size: 32
-    training:
-      max_steps: "auto"
-      warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0006
-      learning_rate_adamw: 0.00006
-      weight_decay: 0.1
-      grad_accum_steps: 1   # Auto-Batcher адаптирует батч сам
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-    perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
-      keep_last_n: 5
-      dynamic_compile: true
-
-  # ═══════════════════════════════════════════════════════════════
-  # BUSEL SCALING LAWS — scale_m used by tests/scaling_laws.py
-  # ═══════════════════════════════════════════════════════════════
-
-  scale_m:
-    model:
-      d_model: 128
-      n_layers: 4
-      n_heads: 4
-      expert_hidden: 256
-      num_experts: 2
-      top_k: 1
-      vocab_size: 326
-      selective_backward: false
-      backward_ratio: 1.0
-    data:
-      data_path: "data_train"
-      chunk_size: 512
-      batch_size: 128
-    training:
-      max_steps: 2000
-      warmup_steps: 100
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.003
-      learning_rate_adamw: 0.0003
-      weight_decay: 0.1
-      grad_accum_steps: 1
-      checkpoint_interval: 500
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-
-  shpak:
-    model:
-      d_model: 384
+      d_model: 512
       n_layers: 8
-      n_heads: 6
-      expert_hidden: 768
-      num_experts: 4
-      top_k: 1
-      vocab_size: 326
-      selective_backward: true
-      backward_ratio: 0.5
-      use_differential_attention: true
-      use_hestia: false
-    data:
-      data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 64
-    training:
-      max_steps: 89518
-      warmup_steps: "auto"
-      min_lr_ratio: 1.0
-      learning_rate_muon: 0.0005
-      learning_rate_adamw: 0.00005
-      weight_decay: 0.1
-      grad_accum_steps: 1
-      use_dispersion_loss: true
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-      use_schedule_free: true
-      use_cautious: false
-      use_tequila: true
-      use_quest: false
-      use_dropbp: true
-      dropbp_prob: 0.3
-      use_rho_loss: true
-      rho_keep_ratio: 0.5
-      lr_schedule: "cosine"
-    perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
-      keep_last_n: 5
-      dynamic_compile: false
-
-  noc:
-    model:
-      d_model: 448           # ~75M params (448/384)^2 * 52.8M ≈ 72M
-      n_layers: 8
-      n_heads: 7             # 448 / 7 = 64 per head
-      expert_hidden: 896     # 2 * d_model
-      num_experts: 4
-      top_k: 1
-      vocab_size: 326
-      selective_backward: true
-      backward_ratio: 0.5
-    data:
-      data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 32         # Slightly smaller batch for larger model
-    training:
-      max_steps: "auto"      # Auto-computed from Busel Scaling Laws
-      warmup_steps: "auto"
-      min_lr_ratio: 0.1
-      learning_rate_muon: 0.0010
-      learning_rate_adamw: 0.0001
-      weight_decay: 0.1
-      grad_accum_steps: 1
-      use_dispersion_loss: false
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-    perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
-      keep_last_n: 5
-      dynamic_compile: true
-
-  # ═══════════════════════════════════════════════════════════════
-  # KRUK — Singularity sandbox (~65M params, 12 layers, 6 experts)
-  # "Ворон умнее аиста" — песочница для v8.5 технологий
-  # (SCT, FlexAttention, CLA, auto-mode, DeepSeekMoE shared experts).
-  # Проходит 50M scale gate → все heavy optimizers доступны.
-  # 12 слоёв — критично для cross-layer attention (CLA/MoDA);
-  # 6 экспертов — критично для expert diversity (DeepSeekMoE/ERC).
-  # На RTX 5060 Ti 16GB: ~120k tok/s, 5000 шагов за ~15-20 минут.
-  # ═══════════════════════════════════════════════════════════════
-  kruk:
-    model:
-      d_model: 384
-      n_layers: 12
-      n_heads: 6
-      expert_hidden: 768
+      n_heads: 8
+      expert_hidden: 1024
       num_experts: 6
       top_k: 1
       vocab_size: 326
+      n_hyper: 2
+      num_mtp_heads: 8
       selective_backward: true
       backward_ratio: 0.5
-      use_differential_attention: true
-      use_hestia: true
-      use_cla: false
+      nsa_n_heads: 16          # d_k=512/16=32 ✓
+    data:
+      data_path: "data_train"
+      chunk_size: 4096
+      batch_size: 256
+      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+    training:
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.3
+      learning_rate_muon: 0.002
+      learning_rate_adamw: 0.0002
+      weight_decay: 0.1
+      grad_accum_steps: 1       # no accumulation — full batch per step
+      mod_capacity: 1.0       # MoD off — 58M too small, hurts training
+      mod_interval: 1
+      use_dropbp: false       # DropBP off — 58M too small, hurts training
+      use_dispersion_loss: true
+      use_rho_loss: true
+      lr_schedule: "wsd"
+      wsd_decay_frac: 0.1
+      sct_rank: 8
+    perf:
+      keep_last_n: 3
+      dynamic_compile: false   # меньше Python overhead между слоями
+      grad_ckpt_every: 4    # batch=288 хватает VRAM → меньше рекомпьюта
+
+  # ═══════════════════════════════════════════════════════════════════
+  # sovereign_12h — ~12 часов (~170M params, 37 tok/param → 6.3B tokens)
+  # ═══════════════════════════════════════════════════════════════════
+  sovereign_12h:
+    model:
+      d_model: 768
+      n_layers: 8
+      n_heads: 8
+      expert_hidden: 1536
+      num_experts: 6
+      top_k: 1
+      vocab_size: 326
+      n_hyper: 2
+      num_mtp_heads: 10
+      selective_backward: true
+      backward_ratio: 0.5
+      nsa_n_heads: 16
+    data:
+      data_path: "data_train"
+      chunk_size: 4096
+      batch_size: 96
+      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+    training:
+      max_steps: "auto"
+      warmup_steps: "auto"
+      min_lr_ratio: 0.3
+      learning_rate_muon: 0.002
+      learning_rate_adamw: 0.0002
+      weight_decay: 0.1
+      grad_accum_steps: 2
+      mod_capacity: 0.5
+      mod_interval: 1
+      use_dispersion_loss: true
+      use_rho_loss: true
+      use_ascii_curriculum: true
+      lr_schedule: "wsd"
+      wsd_decay_frac: 0.1
+      sct_rank: 8
+      use_dropbp: true
+    perf:
+      keep_last_n: 4
+      grad_ckpt_every: 3
+
+  # ═══════════════════════════════════════════════════════════════════
+  # sovereign_24h — ~24 часа (~350M params, 37 tok/param → 13B tokens)
+  # ═══════════════════════════════════════════════════════════════════
+  sovereign_24h:
+    model:
+      d_model: 768
+      n_layers: 16
+      n_heads: 8
+      expert_hidden: 1536
+      num_experts: 6
+      top_k: 1
+      vocab_size: 326
+      n_hyper: 2
+      num_mtp_heads: 12
+      selective_backward: true
+      backward_ratio: 0.5
+      progressive_freeze: true
+      nsa_n_heads: 16
     data:
       data_path: "data_train"
       chunk_size: 4096
       batch_size: 64
+      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
       warmup_steps: "auto"
-      min_lr_ratio: 1.0
-      learning_rate_muon: 0.005
-      learning_rate_adamw: 0.0005
+      min_lr_ratio: 0.3
+      learning_rate_muon: 0.002
+      learning_rate_adamw: 0.0002
       weight_decay: 0.1
       grad_accum_steps: 2
-      optimization_mode: manual
+      mod_capacity: 0.5
+      mod_interval: 1
       use_dispersion_loss: true
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-      use_schedule_free: true
-      use_cautious: false
-      lr_schedule: "cosine"
-      use_tequila: true
-      use_quest: true
-      use_dropbp: true
-      dropbp_prob: 0.3
       use_rho_loss: true
-      rho_keep_ratio: 0.5
+      use_ascii_curriculum: true
+      lr_schedule: "wsd"
+      wsd_decay_frac: 0.1
+      sct_rank: 8
+      use_dropbp: true
     perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
       keep_last_n: 5
-      dynamic_compile: true
+      grad_ckpt_every: 3
 
-  byvol:
+  # ═══════════════════════════════════════════════════════════════════
+  # sovereign_3d — ~3 дня (~1B params, 37 tok/param → 37B tokens)
+  # ═══════════════════════════════════════════════════════════════════
+  sovereign_3d:
     model:
-      d_model: 2048
-      n_layers: 24
+      d_model: 1024
+      n_layers: 18
       n_heads: 16
-      expert_hidden: 4096
-      num_experts: 8
+      expert_hidden: 2048
+      num_experts: 6
       top_k: 1
       vocab_size: 326
+      n_hyper: 2
+      num_mtp_heads: 12
       selective_backward: true
       backward_ratio: 0.5
-      use_differential_attention: true
+      progressive_freeze: true
+      nsa_n_heads: 16
     data:
       data_path: "data_train"
-      chunk_size: 8192
-      batch_size: 8
+      chunk_size: 4096
+      batch_size: 28
+      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
       warmup_steps: "auto"
-      min_lr_ratio: 1.0
-      learning_rate_muon: 0.0002
-      learning_rate_adamw: 0.00002
+      min_lr_ratio: 0.3
+      learning_rate_muon: 0.002
+      learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 4
+      grad_accum_steps: 2
+      mod_capacity: 0.5
+      mod_interval: 1
       use_dispersion_loss: true
-      dispersion_weight: 0.1
-      dispersion_temperature: 2.0
-      use_schedule_free: true
-      use_cautious: false
-      use_tequila: true
-      use_8bit: true
-      lr_schedule: "cosine"
+      use_rho_loss: true
+      use_ascii_curriculum: true
+      lr_schedule: "wsd"
+      wsd_decay_frac: 0.1
+      sct_rank: 8
+      use_dropbp: true
     perf:
-      inductor_cache_dir: "~/.cache/busel/inductor"
-      inductor_cache_clean: false
-      inductor_cache_max_gb: 0.0
-      keep_last_n: 3
-      dynamic_compile: true
+      keep_last_n: 5
+      grad_ckpt_every: 3
+    yarn:
+      enabled: false
+      target_scale: 32.0
+      start_step_frac: 0.92
+      duration_frac: 0.08

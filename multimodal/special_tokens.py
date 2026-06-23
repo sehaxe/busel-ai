@@ -1,9 +1,10 @@
 """
-🛰️ busel — Plug-in Vocabulary Expansion (67 tokens, 12 layers)
+🛰️ busel — Plug-in Vocabulary (18 tokens, 5 layers)
 
-Sovereign byte-level vocabulary (vocab_size=326): 256 raw bytes + 3 legacy
-reserved tokens (256-258) + 67 plug-in special tokens across 12 layers.
-Tokens are computed dynamically — no hardcoded IDs outside this module.
+Sovereign byte-level vocabulary (vocab_size=277): 256 raw bytes + 3 legacy
+reserved tokens (256-258) + 18 plug-in special tokens across 5 layers.
+Tool calls, code blocks, file paths etc. are emitted as raw UTF-8 bytes —
+the model learns byte sequences, not single-token shortcuts.
 
 See `multimodal/AGENTS.md` for the full layer inventory.
 See `list_special_tokens()` and `layer_summary()` for the live registry.
@@ -73,15 +74,6 @@ _SPECIAL_TOKENS:    dict[str, SpecialToken]      = {}
 _LAYER_TOKENS:      dict[str, list[str]]         = {}
 _ID_LOCK            = threading.Lock()
 _NEXT_ID:           int                          = SPECIAL_VOCAB_BASE
-
-
-def _alloc_id() -> int:
-    """Atomically allocate the next available ID. Thread-safe."""
-    global _NEXT_ID
-    with _ID_LOCK:
-        cur = _NEXT_ID
-        _NEXT_ID += 1
-        return cur
 
 
 # === Public API ===
@@ -232,13 +224,6 @@ def enabled_ids() -> list[int]:
         return sorted(list(LEGACY_TOKENS.values()) + plug_in)
 
 
-def all_ids() -> list[int]:
-    """Return ALL special-token IDs (enabled + disabled, plug-in + legacy) ascending."""
-    with _ID_LOCK:
-        plug_in = sorted(t.id for t in _SPECIAL_TOKENS.values())
-        return sorted(list(LEGACY_TOKENS.values()) + plug_in)
-
-
 def vocab_size() -> int:
     """Total vocabulary size: BYTE_COUNT (256) + enabled plug-ins.
 
@@ -251,28 +236,15 @@ def vocab_size() -> int:
         return BYTE_COUNT + len(LEGACY_TOKENS) + n
 
 
-def layer_summary() -> dict[str, int]:
-    """Return {layer_name: enabled_token_count} for all layers."""
-    with _ID_LOCK:
-        out: dict[str, int] = {}
-        for layer, names in _LAYER_TOKENS.items():
-            out[layer] = sum(
-                1 for n in names
-                if n in _SPECIAL_TOKENS and _SPECIAL_TOKENS[n].enabled
-            )
-        return out
-
-
-# === Auto-define the 70 plug-in tokens ===
+# === Auto-define the 18 plug-in tokens ===
 # To ADD a new token: append one line below. Vocab grows by 1.
 # To REMOVE a token: delete the line. Vocab shrinks by 1.
 # To DISABLE temporarily: call disable_special_token("name") at runtime.
 
-# Layer 1: Sequence control (4)
+# Layer 1: Sequence control (3)
 BOS = register_special_token("bos", "sequence", "Beginning of sequence")
 EOS = register_special_token("eos", "sequence", "End of sequence / generation stop")
 PAD = register_special_token("pad", "sequence", "Padding (no-op attention)")
-UNK = register_special_token("unk", "sequence", "Unknown / out-of-vocab")
 
 # Layer 2: Modality (6)
 MOD_IMAGE = register_special_token("mod_image", "modality", "Image payload header")
@@ -293,87 +265,22 @@ ROLE_USER      = register_special_token("role_user",      "role", "<user> turn")
 ROLE_ASSISTANT = register_special_token("role_assistant", "role", "<assistant> turn")
 ROLE_TOOL      = register_special_token("role_tool",      "role", "<tool> result turn")
 
-# Layer 5: Reasoning / CoT (4) — o1/o3 + Claude extended thinking
+# Layer 5: Reasoning (2) — Claude extended thinking
 THINK_START = register_special_token("think_start", "reasoning", "Open extended-thinking block")
 THINK_END   = register_special_token("think_end",   "reasoning", "Close extended-thinking block")
-PLAN_START  = register_special_token("plan_start",  "reasoning", "Open planning block")
-PLAN_END    = register_special_token("plan_end",    "reasoning", "Close planning block")
 
-# Layer 6: Code (4) — Markdown spec
-CODE_BLOCK_START = register_special_token("code_block_start", "code", "Open ```code block")
-CODE_BLOCK_END   = register_special_token("code_block_end",   "code", "Close ```code block")
-DIFF_START       = register_special_token("diff_start",       "code", "Open unified diff block (```diff)")
-DIFF_END         = register_special_token("diff_end",         "code", "Close unified diff block")
-
-# Layer 7: Tool XML (12) — Anthropic-style (opencode / claude / code-execution)
-TOOL_CALLS_START   = register_special_token("tool_calls_start",   "tool_xml", "<function_calls>")
-TOOL_CALLS_END     = register_special_token("tool_calls_end",     "tool_xml", "</function_calls>")
-TOOL_INVOKE_START  = register_special_token("tool_invoke_start",  "tool_xml", "<invoke name=\"...\">")
-TOOL_INVOKE_END    = register_special_token("tool_invoke_end",    "tool_xml", "</invoke>")
-TOOL_PARAM_START   = register_special_token("tool_param_start",   "tool_xml", "<parameter name=\"...\">")
-TOOL_PARAM_END     = register_special_token("tool_param_end",     "tool_xml", "</parameter>")
-TOOL_RESULTS_START = register_special_token("tool_results_start", "tool_xml", "<function_results>")
-TOOL_RESULTS_END   = register_special_token("tool_results_end",   "tool_xml", "</function_results>")
-TOOL_RESULT_START  = register_special_token("tool_result_start",  "tool_xml", "<result>")
-TOOL_RESULT_END    = register_special_token("tool_result_end",    "tool_xml", "</result>")
-TOOL_ERROR_START   = register_special_token("tool_error_start",   "tool_xml", "<error>")
-TOOL_ERROR_END     = register_special_token("tool_error_end",     "tool_xml", "</error>")
-
-# Layer 8: Common tools (12) — opencode 17-tool subset (most common)
-TOOL_BASH   = register_special_token("tool_bash",   "tool", "Bash / shell command")
-TOOL_READ   = register_special_token("tool_read",   "tool", "Read file")
-TOOL_WRITE  = register_special_token("tool_write",  "tool", "Write file (new)")
-TOOL_EDIT   = register_special_token("tool_edit",   "tool", "Edit file (find/replace)")
-TOOL_GREP   = register_special_token("tool_grep",   "tool", "Grep for pattern")
-TOOL_GLOB   = register_special_token("tool_glob",   "tool", "Glob path pattern")
-TOOL_FETCH  = register_special_token("tool_fetch",  "tool", "Fetch URL (HTTP)")
-TOOL_SEARCH = register_special_token("tool_search", "tool", "Web search")
-TOOL_TASK   = register_special_token("tool_task",   "tool", "Delegate sub-task to subagent")
-TOOL_TODO   = register_special_token("tool_todo",   "tool", "Update todo list")
-TOOL_LSP    = register_special_token("tool_lsp",    "tool", "LSP query (go-to-def, refs, hover)")
-TOOL_ASK    = register_special_token("tool_ask",    "tool", "Ask user clarifying question")
-
-# Layer 9: Task management (4)
-TODO_START   = register_special_token("todo_start",   "task", "<todo>")
-TODO_END     = register_special_token("todo_end",     "task", "</todo>")
-TASK_DONE    = register_special_token("task_done",    "task", "[x] task done")
-TASK_PENDING = register_special_token("task_pending", "task", "[ ] task pending")
-
-# Layer 10: References (6) — Cline / Cursor style
-FILE_PATH_START = register_special_token("file_path_start", "reference", "<file_path>")
-FILE_PATH_END   = register_special_token("file_path_end",   "reference", "</file_path>")
-URL_START       = register_special_token("url_start",       "reference", "<url>")
-URL_END         = register_special_token("url_end",         "reference", "</url>")
-CITE_START      = register_special_token("cite_start",      "reference", "<cite>")
-CITE_END        = register_special_token("cite_end",        "reference", "</cite>")
-
-# Layer 11: Subagent (4) — opencode delegate_task
-SUBAGENT_START        = register_special_token("subagent_start",        "subagent", "<subagent>")
-SUBAGENT_END          = register_special_token("subagent_end",          "subagent", "</subagent>")
-SUBAGENT_RESULT_START = register_special_token("subagent_result_start", "subagent", "<subagent_result>")
-SUBAGENT_RESULT_END   = register_special_token("subagent_result_end",   "subagent", "</subagent_result>")
-
-# Layer 12: Status (4) — Cline / Claude API
-STATUS_SUCCESS   = register_special_token("status_success",   "status", "OK / success")
-STATUS_ERROR     = register_special_token("status_error",     "status", "error / failed")
-STATUS_TIMEOUT   = register_special_token("status_timeout",   "status", "timed out")
-STATUS_CANCELLED = register_special_token("status_cancelled", "status", "cancelled by user")
-
+# Tool calls, code blocks, file paths, etc. are emitted as raw UTF-8 bytes —
+# the model learns the byte sequences, not single-token shortcuts. This keeps
+# the vocabulary compact and avoids dead embedding rows that receive gradients
+# but are never targeted during training (masked at inference).
 
 # === Layer descriptions (for AGENTS.md / __str__ / docs) ===
 LAYER_DESCRIPTIONS: dict[str, str] = {
-    "sequence":  "BOS / EOS / PAD / UNK",
+    "sequence":  "BOS / EOS / PAD",
     "modality":  "Image / Video / Audio / PDF / DOCX / Text payload headers",
     "mm_struct": "Frame / chunk / channel separators",
     "role":      "System / User / Assistant / Tool",
-    "reasoning": "Think / Plan open/close (o1, Claude extended thinking)",
-    "code":      "Code-block / Diff open/close (```)",
-    "tool_xml":  "Anthropic XML: <function_calls>…</function_calls>",
-    "tool":      "Bash / Read / Write / Edit / Grep / Glob / Fetch / Search / Task / Todo / LSP / Ask",
-    "task":      "Todo / Task state markers",
-    "reference": "File path / URL / Citation open/close (Cline style)",
-    "subagent":  "Subagent delegation open/close (opencode)",
-    "status":    "Success / Error / Timeout / Cancelled",
+    "reasoning": "Think open/close (Claude extended thinking)",
 }
 
 

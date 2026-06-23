@@ -7,16 +7,16 @@
 multimodal/
 ├── __init__.py        # public API: build_encoder_for, auto_encode, list_encoders, special_tokens
 ├── encoders.py        # 6 encoder classes + registry + dispatch (335 LOC)
-└── special_tokens.py  # SpecialToken dataclass + 70-token plug-in registry (490 LOC)
+└── special_tokens.py  # SpecialToken dataclass + 18-token plug-in registry (316 LOC)
 ```
 
-## VOCABULARY (v5.4.0 — 326 tokens)
+## VOCABULARY (v5.5.0 — 277 tokens)
 - **0-255** — raw UTF-8 bytes
 - **256** `MEDIA_START` — legacy payload start
 - **257** `MEDIA_END` — legacy payload end
 - **258** `DOC_SEP` — cross-document boundary
-- **259-325** — 67 plug-in special tokens across 12 functional layers
-- See `special_tokens.py` for the full breakdown; `list_special_tokens()` returns the live registry; `enabled_ids()` is the 70 ints that must be masked in inference logits.
+- **259-276** — 18 plug-in special tokens across 5 functional layers
+- See `special_tokens.py` for the full breakdown; `list_special_tokens()` returns the live registry; `enabled_ids()` is the 21 ints that must be masked in inference logits.
 
 ## WHERE TO LOOK
 | Want to... | Edit | Notes |
@@ -44,13 +44,10 @@ multimodal/
 | `layer_summary()` | function | special_tokens.py | `dict[layer, count]`. |
 | `MEDIA_START`, `MEDIA_END`, `DOC_SEP` | constants | encoders.py | Legacy token IDs `256`, `257`, `258` |
 | `MOD_IMAGE`, `MOD_VIDEO`, `MOD_AUDIO`, `MOD_PDF`, `MOD_DOCX`, `MOD_TEXT` | constants | special_tokens.py | Modality markers (263-268). Encoder payload prefix. |
-| `BOS`, `EOS`, `PAD`, `UNK` | constants | special_tokens.py | Sequence control (259-262) |
-| `FRAME_SEP`, `AUDIO_CHUNK_SEP`, `CHANNEL_SEP` | constants | special_tokens.py | Multimodal structure (269-271) |
-| `ROLE_*`, `THINK_*`, `PLAN_*`, `CODE_BLOCK_*`, `DIFF_*` | constants | special_tokens.py | Chat/coder semantics (272-283) |
-| `TOOL_CALLS_*`, `TOOL_INVOKE_*`, `TOOL_PARAM_*`, `TOOL_RESULTS_*`, `TOOL_RESULT_*`, `TOOL_ERROR_*` | constants | special_tokens.py | Anthropic-style XML tool format (284-295) |
-| `TOOL_BASH`, `TOOL_READ`, `TOOL_WRITE`, `TOOL_EDIT`, `TOOL_GREP`, `TOOL_GLOB`, `TOOL_FETCH`, `TOOL_SEARCH`, `TOOL_TASK`, `TOOL_TODO`, `TOOL_LSP`, `TOOL_ASK` | constants | special_tokens.py | opencode 12-tool vocabulary (296-307) |
-| `TODO_*`, `TASK_*`, `FILE_PATH_*`, `URL_*`, `CITE_*` | constants | special_tokens.py | Task tracking + references (308-317) |
-| `SUBAGENT_*`, `STATUS_*` | constants | special_tokens.py | Subagent delegation + result status (318-325) |
+| `BOS`, `EOS`, `PAD` | constants | special_tokens.py | Sequence control (259-261) |
+| `FRAME_SEP`, `AUDIO_CHUNK_SEP`, `CHANNEL_SEP` | constants | special_tokens.py | Multimodal structure (265-267) |
+| `ROLE_SYSTEM`, `ROLE_USER`, `ROLE_ASSISTANT`, `ROLE_TOOL` | constants | special_tokens.py | Chat role tokens (268-271) |
+| `THINK_START`, `THINK_END` | constants | special_tokens.py | Reasoning block markers (272-273) |
 | `IMAGE_BYTES` | constant | encoders.py | `32 * 32 * 3 = 3072` payload tokens per image |
 | `HAS_CV2`, `HAS_PIL`, `HAS_IMAGEIO`, `HAS_SOUNDFILE`, `HAS_DOCX`, `HAS_DOCLING` | flags | encoders.py | Lazy import guards (`True` if dep installed) |
 | `ImageEncoder` | class | encoders.py | **cv2 (fast) → PIL (fallback)** → 32×32 RGB → `[MOD_IMAGE, *3072 pixels*, MEDIA_END]` |
@@ -64,11 +61,11 @@ multimodal/
 | `list_encoders()` | function | encoders.py | `busel_registry.list_registered("encoder")` |
 
 ## CONVENTIONS
-- **Output type:** `list[int]` (NOT `bytes`). Python `bytes` cannot represent values ≥ 256, but the model vocab is 326. The collate function in `data/pipeline.py:collate_busel_batch` handles `list` input via its `else` branch (produces `int32` tensor).
-- **Marker tokens:** `MEDIA_START=256`, `MEDIA_END=257`, `DOC_SEP=258` (legacy), plus `MOD_*` prefixes (263-268) and 60+ chat/tool/reference/status tokens. All are integer token IDs in the model's embedding table, not bytes.
-- **Payload range:** Real bytes 0-255; markers 256-325. Every encoder must respect this and never produce values outside `[0, 326)`.
+- **Output type:** `list[int]` (NOT `bytes`). Python `bytes` cannot represent values ≥ 256, but the model vocab is 277. The collate function in `data/pipeline.py:collate_busel_batch` handles `list` input via its `else` branch (produces `int32` tensor).
+- **Marker tokens:** `MEDIA_START=256`, `MEDIA_END=257`, `DOC_SEP=258` (legacy), plus `MOD_*` prefixes (262-267) and chat/role tokens. All are integer token IDs in the model's embedding table, not bytes.
+- **Payload range:** Real bytes 0-255; markers 256-276. Every encoder must respect this and never produce values outside `[0, 277)`.
 - **Modality prefix contract:** every payload-bearing encoder prepends a `MOD_*` token so the model knows what's coming. Legacy bare `[256, ..., 257]` is still accepted by the decoder for backward compat.
-- **Registry pattern (special tokens):** plug-in via `register_special_token(name, layer, description)`. Auto-allocates the next available ID (256+legacy_count, then sequential plug-ins). The full 70-token vocabulary is auto-defined at import time in `special_tokens.py`.
+- **Registry pattern (special tokens):** plug-in via `register_special_token(name, layer, description)`. Auto-allocates the next available ID (256+legacy_count, then sequential plug-ins). The 18-token vocabulary is auto-defined at import time in `special_tokens.py`.
 - **Registry pattern (encoders):** every encoder class is decorated with `@register("encoder", name)`. The `name` attribute MUST match the registry key. Use `override=True` to replace a registered encoder.
 - **Round-trip lossless:** Each `encode()` is followed by a `decode()` that returns the original artifact (for inspection / debugging). Lossy transforms (e.g. video subsampling, audio truncation) are documented in the docstring.
 - **Fast path priority:** `cv2` is the default for image/video. `PIL` and `imageio` are fallbacks (3-5× slower). The class falls back silently when `HAS_CV2` is False.
@@ -92,20 +89,14 @@ multimodal/
 - **NEVER** use `imageio.imiter` to count video frames — it forces a full decode pass. Use `cv2.CAP_PROP_FRAME_COUNT` for O(1) metadata lookup.
 
 ## NOTES
-- **Why `list[int]` and not `bytes`:** The model's `vocab_size = 326` (256 real bytes + 3 reserved legacy tokens + 67 plug-in special tokens). The reserved tokens are integer token IDs in the embedding table — they are NOT representable in Python's `bytes` type. Returning a `list[int]` is the only way to express the multimodal stream in Python.
-- **Special-token design (12 layers, 70 tokens):**
-  1. **sequence** (4): `BOS EOS PAD UNK` — control
+- **Why `list[int]` and not `bytes`:** The model's `vocab_size = 277` (256 real bytes + 3 reserved legacy tokens + 18 plug-in special tokens). Tool calls, code blocks, and other variable-length content are emitted as raw UTF-8 bytes — the model learns byte sequences, not single-token shortcuts. The reserved tokens are integer token IDs in the embedding table — they are NOT representable in Python's `bytes` type. Returning a `list[int]` is the only way to express the multimodal stream in Python.
+- **Special-token design (5 layers, 18 tokens):**
+  1. **sequence** (3): `BOS EOS PAD` — control
   2. **modality** (6): `MOD_IMAGE MOD_VIDEO MOD_AUDIO MOD_PDF MOD_DOCX MOD_TEXT` — what kind of payload
   3. **mm_struct** (3): `FRAME_SEP AUDIO_CHUNK_SEP CHANNEL_SEP` — payload structure
   4. **role** (4): `ROLE_SYSTEM ROLE_USER ROLE_ASSISTANT ROLE_TOOL` — chat turn ownership
-  5. **reasoning** (4): `THINK_START THINK_END PLAN_START PLAN_END` — chain-of-thought / planning
-  6. **code** (4): `CODE_BLOCK_START CODE_BLOCK_END DIFF_START DIFF_END` — code/diff regions
-  7. **tool_xml** (12): Anthropic-style `<function_calls>...</function_calls>` envelope (start/end per tag × 6 tags)
-  8. **tool** (12): 12 opencode tools — `TOOL_BASH TOOL_READ TOOL_WRITE TOOL_EDIT TOOL_GREP TOOL_GLOB TOOL_FETCH TOOL_SEARCH TOOL_TASK TOOL_TODO TOOL_LSP TOOL_ASK`
-  9. **task** (4): `TODO_START TODO_END TASK_DONE TASK_PENDING` — todo list state
-  10. **reference** (6): `FILE_PATH_START END` + `URL_START END` + `CITE_START END` — references
-  11. **subagent** (4): `SUBAGENT_START END` + `SUBAGENT_RESULT_START END` — delegate_task format
-  12. **status** (4): `STATUS_SUCCESS ERROR TIMEOUT CANCELLED` — result status
+  5. **reasoning** (2): `THINK_START THINK_END` — chain-of-thought
+- Tool calls, code blocks, file paths, and status markers are emitted as raw UTF-8 byte sequences, not single-token IDs. This keeps the vocabulary compact and avoids dead embedding rows.
 - **Image dimensions are fixed at 32×32.** The model expects exactly 3072 payload tokens per image. Changing the image size requires retraining.
 - **Video subsampling** uses `step = max(1, n_total // max_frames)` — videos with fewer than `max_frames` frames yield all frames.
 - **Audio header** stores the *source* sample rate (no resampling). The 16-bit PCM payload is `int16` little-endian.

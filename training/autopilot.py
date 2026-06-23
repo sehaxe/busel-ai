@@ -10,8 +10,8 @@ import math
 class buselAutoPilot:
     def __init__(self, opt_engine, max_lr_muon, max_lr_adamw, target_wd=0.1,
                  warmup_steps="auto", min_lr_ratio=0.1, noise_scale=0.01,
-                 noise_decay=0.999, lr_schedule="cosine", wsd_decay_fraction=0.2,
-                 wsd_s_enabled=False, wsd_s_interval=1000, wsd_s_decay_steps=200):
+                 noise_decay=0.999, lr_schedule="cosine", wsd_decay_frac=0.1,
+                 grad_clip=2.0):
         self.opt_engine = opt_engine
         self.max_lr_muon = max_lr_muon
         self.max_lr_adamw = max_lr_adamw
@@ -21,30 +21,22 @@ class buselAutoPilot:
         self.noise_scale = noise_scale
         self.noise_decay = noise_decay
         self.lr_schedule = lr_schedule
-        self.wsd_decay_fraction = wsd_decay_fraction
-        self.wsd_s_enabled = wsd_s_enabled
-        self.wsd_s_interval = wsd_s_interval
-        self.wsd_s_decay_steps = wsd_s_decay_steps
+        self.wsd_decay_frac = wsd_decay_frac
+        self.grad_clip = grad_clip
         
         self.loss_history = []
         self.grad_norm_history = []
         self.recovery_countdown = 0
         self.stabilization_factor = 1.0
         self.warmup_steps = 0
-        
-        self._wsd_s_phase = "stable"
-        self._wsd_s_step_in_phase = 0
-        self._wsd_s_cycle = 0
-        self._wsd_s_checkpoint_callback = None
-        self._wsd_s_load_callback = None
 
     def before_step(self, model, step, max_steps):
         if not any(p.grad is not None for p in model.parameters()):
             return 1.0
         
         if step < 50:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, foreach=True)
-            return 2.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.grad_clip, foreach=True)
+            return self.grad_clip
 
         with torch.no_grad():
             current_grad_norm = torch.nn.utils.get_total_norm(
@@ -94,13 +86,6 @@ class buselAutoPilot:
 
         return clipping_threshold
 
-    def set_wsd_s_callbacks(self, save_fn, load_fn):
-        self._wsd_s_checkpoint_callback = save_fn
-        self._wsd_s_load_callback = load_fn
-
-    def should_load_wsd_s_checkpoint(self):
-        return self._wsd_s_load_callback is not None
-
     def update_parameters(self, step, current_loss, max_steps):
         if step == 0 or self.warmup_steps == 0:
             if self.warmup_steps_raw == "auto" or self.warmup_steps_raw is None:
@@ -132,45 +117,19 @@ class buselAutoPilot:
             progress = min(1.0, max(0.0, progress))
             if progress > 0.90:
                 self.noise_scale = 0.0
-
-            if self.wsd_s_enabled and self._wsd_s_phase == "decay":
-                decay_progress = float(self._wsd_s_step_in_phase) / float(self.wsd_s_decay_steps)
-                decay_progress = min(1.0, max(0.0, decay_progress))
-                lr_factor = 0.55 * (1.0 - math.sqrt(decay_progress))
-            elif self.lr_schedule == "wsd":
-                stable_end = 1.0 - self.wsd_decay_fraction
-                if progress < stable_end:
-                    lr_factor = 0.55
+            if self.lr_schedule == "wsd":
+                st_steps = max_steps - self.warmup_steps
+                d_steps = int(st_steps * self.wsd_decay_frac)
+                s_steps = st_steps - d_steps
+                s_elapsed = int((step - self.warmup_steps))
+                if s_elapsed < s_steps:
+                    lr_factor = 1.0
                 else:
-                    decay_progress = (progress - stable_end) / self.wsd_decay_fraction
-                    decay_progress = min(1.0, max(0.0, decay_progress))
-                    lr_factor = 0.55 * (1.0 - math.sqrt(decay_progress))
-            elif self.lr_schedule == "wd33":
-                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-                lr_factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine_decay
-                if progress > 0.67:
-                    warmdown_progress = (progress - 0.67) / 0.33
-                    warmdown_progress = min(1.0, max(0.0, warmdown_progress))
-                    lr_factor = lr_factor * (1.0 - 0.9 * warmdown_progress)
+                    d_progress = (s_elapsed - s_steps) / max(1, d_steps)
+                    lr_factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * math.sqrt(1.0 - d_progress)
             else:
                 cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
                 lr_factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine_decay
-
-            if self.wsd_s_enabled:
-                self._wsd_s_step_in_phase += 1
-                if self._wsd_s_phase == "stable" and self._wsd_s_step_in_phase >= self.wsd_s_interval:
-                    self._wsd_s_phase = "decay"
-                    self._wsd_s_step_in_phase = 0
-                    self._wsd_s_cycle += 1
-                    if self._wsd_s_checkpoint_callback:
-                        self._wsd_s_checkpoint_callback(f"wsd_s_cycle_{self._wsd_s_cycle}")
-                    print(f"\n🔄 [WSD-S]: Cycle {self._wsd_s_cycle} — switching to decay phase")
-                elif self._wsd_s_phase == "decay" and self._wsd_s_step_in_phase >= self.wsd_s_decay_steps:
-                    self._wsd_s_phase = "stable"
-                    self._wsd_s_step_in_phase = 0
-                    if self._wsd_s_load_callback:
-                        self._wsd_s_load_callback()
-                    print(f"\n🔄 [WSD-S]: Cycle {self._wsd_s_cycle} — resuming from decayed checkpoint")
             
         lr_factor *= self.stabilization_factor
         new_lr_muon = self.max_lr_muon * lr_factor
@@ -178,9 +137,17 @@ class buselAutoPilot:
         
         if self.opt_engine.opt_muon is not None:
             for pg in self.opt_engine.opt_muon.param_groups:
-                pg['lr'] = new_lr_muon * pg.get('lr_mult', 1.0)
+                v = new_lr_muon * pg.get('lr_mult', 1.0)
+                if isinstance(pg['lr'], torch.Tensor):
+                    pg['lr'].fill_(v)
+                else:
+                    pg['lr'] = v
             for pg in self.opt_engine.opt_adamw.param_groups:
-                pg['lr'] = new_lr_adamw * pg.get('lr_mult', 1.0)
+                v = new_lr_adamw * pg.get('lr_mult', 1.0)
+                if isinstance(pg['lr'], torch.Tensor):
+                    pg['lr'].fill_(v)
+                else:
+                    pg['lr'] = v
                 
         if self.recovery_countdown == 0:
             self.noise_scale *= self.noise_decay

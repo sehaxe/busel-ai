@@ -8,40 +8,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fla.ops.gdn2 import fused_recurrent_gdn2
+try:
+    from fla.ops.gdn2 import chunk_gdn2
+    _HAS_CHUNK_GDN2 = True
+except ImportError:
+    _HAS_CHUNK_GDN2 = False
 from model.layers import BitLinear_a4_8, H_BitLinear, RMSNorm, nvtx_range_push, nvtx_range_pop
 from busel_registry import register
 
-try:
-    from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
-    _HAS_FLEX = True
-except ImportError:
-    _HAS_FLEX = False
 
-_flex_causal_mask_cache: dict = {}
-
-def _get_flex_causal_mask(seq_len: int, device: str, dtype: torch.dtype):
-    """Pre-compiled causal block mask for FlexAttention (cached per seq_len)."""
-    if not _HAS_FLEX:
-        return None
-    key = (seq_len, str(device), str(dtype))
-    if key not in _flex_causal_mask_cache:
-        def causal_mask(b, h, q_idx, kv_idx):
-            return torch.where(q_idx >= kv_idx, 0.0, -float('inf'))
-        _flex_causal_mask_cache[key] = _create_block_mask(causal_mask, B=None, H=None, Q=seq_len, KV=seq_len, device=device)
-    return _flex_causal_mask_cache[key]
-
-def _sdpa_or_flex(q, k, v, use_flex: bool = False, is_causal: bool = False):
-    """SDPA with optional FlexAttention. Falls back to SDPA on any error."""
-    if use_flex and _HAS_FLEX and q.is_cuda:
-        try:
-            if is_causal:
-                mask = _get_flex_causal_mask(q.shape[-2], str(q.device), q.dtype)
-                if mask is not None:
-                    return _flex_attention(q, k, v, block_mask=mask)
-            else:
-                return _flex_attention(q, k, v)
-        except Exception:
-            pass
+def _sdpa(q, k, v, is_causal: bool = False):
     return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
 
@@ -79,13 +55,16 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         # o_proj заменена на H_BitLinear по спецификации BitNet v2
         self.o_proj = H_BitLinear(d_model, d_model)
         self.register_buffer("freqs", 10000 ** (-torch.arange(0, self.d_k, 2).float() / self.d_k))
+        self.rope_scale: float = 1.0  # ponytail: YaRN scaling factor. 1.0→32.0 for 4K→128K
 
     def apply_serope(self, T, q, k):
         B, _, H, _ = q.shape
         q_real, q_imag = q[..., 0::2], q[..., 1::2]
         k_real, k_imag = k[..., 0::2], k[..., 1::2]
         
-        angles = torch.arange(T, device=q.device).view(1, T, 1, 1) * self.freqs.view(1, 1, 1, -1)
+        # ponytail: YaRN scaling — multiply freqs by rope_scale for context extension
+        scaled_freqs = self.freqs * self.rope_scale
+        angles = torch.arange(T, device=q.device).view(1, T, 1, 1) * scaled_freqs.view(1, 1, 1, -1)
         cos, sin = torch.cos(angles), torch.sin(angles)
         
         q_out = torch.zeros_like(q)
@@ -98,9 +77,8 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         nvtx_range_push("busel_GDN2_SeRoPE_Forward")
         B, T, C = x.shape
         
-        # 1. Линейные проекции и каузальные свертки
         q_proj = self.q_proj(x).transpose(1, 2)
-        q_conv = self.q_conv(F.pad(q_proj, (3, 0)))  # Левосторонний причинный паддинг
+        q_conv = self.q_conv(F.pad(q_proj, (3, 0)))
         q = F.silu(q_conv).transpose(1, 2).view(B, T, self.n_heads, self.d_k)
         
         k_proj = self.k_proj(x).transpose(1, 2)
@@ -115,17 +93,17 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         
         b = torch.sigmoid(self.b_proj(x)).view(B, T, self.n_heads, self.d_k)
         w = torch.sigmoid(self.w_proj(x)).view(B, T, self.n_heads, self.d_v)
-        
         g = self.alpha_proj(x).view(B, T, self.n_heads, self.d_k)
-        out = fused_recurrent_gdn2(
-            q, k, v, g, b, w,
+        _gdn2_fn = chunk_gdn2 if (_HAS_CHUNK_GDN2 and self.training and T >= 1024) else fused_recurrent_gdn2
+        # ponytail: fp32 GDN-2 inputs prevent bf16 overflow at d_model≥640
+        out = _gdn2_fn(
+            q.float(), k.float(), v.float(), g.float(), b.float(), w.float(),
             A_log=self.alpha_a.squeeze(-1),
             use_gate_in_kernel=True,
             use_qk_l2norm_in_kernel=True,
-        )[0]
+        )[0].to(x.dtype)
         out = out.view(B, T, -1)
             
-        # Применение выходного гейта и RMSNorm (Формула 10)
         gate = torch.sigmoid(self.g_proj_up(self.g_proj_down(x)))
         out_gated = self.out_norm(out) * gate
         
@@ -136,7 +114,7 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
 
 @register("attention", "mla")
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, d_model=1536, n_heads=12, d_c=128, use_differential=False, use_qknorm_l2=False, use_flex_attention=False):
+    def __init__(self, d_model=1536, n_heads=12, d_c=128, use_differential=False, use_qknorm_l2=False):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -144,7 +122,6 @@ class MultiHeadLatentAttention(nn.Module):
         self.d_v = d_model // n_heads
         self.use_differential = use_differential
         self.use_qknorm_l2 = use_qknorm_l2
-        self.use_flex_attention = use_flex_attention
 
         self.kv_compress = BitLinear_a4_8(d_model, d_c)
         self.kv_norm = RMSNorm(d_c)
@@ -179,14 +156,14 @@ class MultiHeadLatentAttention(nn.Module):
             q = F.normalize(q, p=2, dim=-1)
             k = F.normalize(k, p=2, dim=-1)
 
-        attn1 = _sdpa_or_flex(q, k, v, use_flex=self.use_flex_attention)
+        attn1 = _sdpa(q, k, v)
         if self.use_differential:
             q2 = self.q2_decompress(self.q_norm(self.q2_compress(x))).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
             k2 = self.k2_decompress(kv_latent).view(B, T, self.n_heads, self.d_v).transpose(1, 2)
             if self.use_qknorm_l2:
                 q2 = F.normalize(q2, p=2, dim=-1)
                 k2 = F.normalize(k2, p=2, dim=-1)
-            attn2 = _sdpa_or_flex(q2, k2, v, use_flex=self.use_flex_attention)
+            attn2 = _sdpa(q2, k2, v)
             context = (attn1 - attn2) * self.diff_lambda
         else:
             context = attn1
@@ -194,3 +171,50 @@ class MultiHeadLatentAttention(nn.Module):
         out = self.o_proj(self.out_norm(context))
         nvtx_range_pop()
         return out
+
+
+# ── NSA — Native Sparse Attention (DeepSeek 2025) ─────────────────────────
+
+@register("attention", "nsa")
+class BulbaNSAAttention(nn.Module):
+    """Native Sparse Attention — hardware-aligned, natively trainable sparse attention.
+    DeepSeek 2025 (arXiv:2502.11089). 3× faster than dense MLA, matches/exceeds quality.
+    Requires n_heads % 16 == 0 (FlA constraint).
+    """
+    def __init__(self, d_model=1536, n_heads=16):
+        super().__init__()
+        assert n_heads % 16 == 0, f"NSA requires n_heads divisible by 16, got {n_heads}"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.q_proj = BitLinear_a4_8(d_model, n_heads * self.d_k)
+        self.k_proj = BitLinear_a4_8(d_model, self.d_k)  # 1 key head (GQA)
+        self.v_proj = BitLinear_a4_8(d_model, self.d_k)
+        # 3 branch gates: compression, selection, sliding window
+        self.g_cmp = BitLinear_a4_8(d_model, n_heads)
+        self.g_slc = BitLinear_a4_8(d_model, n_heads)
+        self.g_swa = BitLinear_a4_8(d_model, n_heads)
+        self.o_proj = H_BitLinear(d_model, d_model)
+        self.out_norm = RMSNorm(d_model)
+
+    def forward(self, x):
+        nvtx_range_push("busel_NSA_Forward")
+        B, T, C = x.shape
+        # NSA API differs: output drops B dim, requires per-batch call
+        from fla.ops.nsa import parallel_nsa
+        outs = []
+        for b in range(B):
+            xb = x[b:b+1]
+            q = self.q_proj(xb).view(1, T, self.n_heads, self.d_k)
+            k = self.k_proj(xb).view(1, T, 1, self.d_k)
+            v = self.v_proj(xb).view(1, T, 1, self.d_k)
+            g_cmp = self.g_cmp(xb).view(1, T, self.n_heads)
+            g_slc = self.g_slc(xb).view(1, T, self.n_heads)
+            g_swa = self.g_swa(xb).view(1, T, self.n_heads)
+            ctx = parallel_nsa(q, k, v, g_cmp=g_cmp, g_slc=g_slc, g_swa=g_swa, block_size=32)[0]
+            outs.append(ctx.reshape(1, T, -1))
+        context = torch.cat(outs, dim=0)
+        out = self.o_proj(self.out_norm(context))
+        nvtx_range_pop()
+        return out
+

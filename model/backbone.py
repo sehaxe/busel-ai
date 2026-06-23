@@ -10,10 +10,11 @@
 ╚═══════════════════════════════════════════════════════════════════════════╝
 """
 import math
+import random
 import torch
 import torch.nn as nn
 from model.layers import BitLinear_a4_8, RMSNorm, nvtx_range_push, nvtx_range_pop
-from model.attention import BulbaGDN2SeRoPEBlock, MultiHeadLatentAttention
+from model.attention import BulbaGDN2SeRoPEBlock, MultiHeadLatentAttention, BulbaNSAAttention
 from model.routing import MoDSequenceRouter, BulbaTernaryTitanMoE
 from multimodal.special_tokens import vocab_size as _vocab_size, enabled_ids as _enabled_ids
 
@@ -90,43 +91,46 @@ class ManifoldConstrainedAttnRes(nn.Module):
                 M = M / (M.sum(dim=-2, keepdim=True) + 1e-8)
         return M
 
-    def forward(self, current_x: torch.Tensor, streams: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    def forward(self, current_x: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
         """Mix n_hyper streams using input-dependent doubly-stochastic H.
 
         Args:
             current_x: [B, T, d_model] — input to current layer.
-            streams: tuple of n_hyper tensors, each [B, T, d_model].
+            streams: [n_hyper, B, T, d_model] — stacked tensor of streams.
 
         Returns:
             y: [B, T, d_model] — mixed stream (mean over n_hyper).
         """
         n = self.n_hyper
-        if len(streams) != n:
-            raise ValueError(f"Expected {n} streams, got {len(streams)}")
+        if streams.shape[0] != n:
+            raise ValueError(f"Expected {n} streams, got {streams.shape[0]}")
         B, T, _ = current_x.shape
 
         q = self.q_proj(current_x).view(B, T, n, self.d_head)
 
-        ks = [self.k_proj(s) for s in streams]
-        k_stack = torch.stack(ks, dim=2)
+        k_stack = self.k_proj(streams).permute(1, 2, 0, 3)
 
         H_logits = torch.einsum('btqd,btkd->btqk', q, k_stack) / math.sqrt(self.d_head)
         H_logits = H_logits + self.identity_bias
 
         H = self.sinkhorn_knopp(H_logits)
 
-        streams_stack = torch.stack(streams, dim=2)
+        streams_stack = streams.permute(1, 2, 0, 3)
         y_streams = torch.einsum('btij,btjd->btid', H, streams_stack)
         y = y_streams.mean(dim=2)
         return self.norm(y)
 
 
 class buselDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, use_qknorm_l2=False, sct_rank=0, use_flex_attention=False):
+    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, layer_idx=0, mod_interval=2, nsa_n_heads=16, sct_rank=0):
         super().__init__()
         self.mod_router = MoDSequenceRouter(d_model, capacity_factor=capacity_factor)
-        if is_global:
-            self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential, use_qknorm_l2=use_qknorm_l2, use_flex_attention=use_flex_attention)
+        self.layer_idx = layer_idx
+        self.mod_interval = mod_interval
+        if is_global and d_model >= 256 and nsa_n_heads % 16 == 0:
+            self.attn = BulbaNSAAttention(d_model, nsa_n_heads)
+        elif is_global:
+            self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential)
         else:
             self.attn = BulbaGDN2SeRoPEBlock(d_model, n_heads)
         self.moe = BulbaTernaryTitanMoE(d_model, expert_hidden, num_experts=num_experts, top_k=top_k, sct_rank=sct_rank)
@@ -134,58 +138,69 @@ class buselDecoderLayer(nn.Module):
         self.moe_norm = RMSNorm(d_model)
 
     def forward(self, x, progress=0.0):
-        if self.mod_router.capacity_factor >= 1.0:
+        # ponytail: only apply MoD every mod_interval layers to avoid token starvation
+        do_mod = self.mod_router.capacity_factor < 1.0 and (self.layer_idx % self.mod_interval == 0)
+        if not do_mod:
             attn_out = self.attn(self.attn_norm(x))
             moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
             return moe_out, aux_loss
         B, T, C = x.shape
-        mask, logits = self.mod_router(x)
-        k = int(T * self.mod_router.capacity_factor)
-        if k == 0:
-            return torch.zeros_like(x), torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        mask, logits, mod_aux = self.mod_router(x)
+        k = max(2, int(T * self.mod_router.capacity_factor))
+        if k >= T:  # ponytail: guard against degenerate routing (<2 tokens)
+            attn_out = self.attn(self.attn_norm(x))
+            moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
+            return moe_out, aux_loss + mod_aux
         active_tokens = x[mask].view(B, k, C)
         attn_out = self.attn(self.attn_norm(active_tokens))
         moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
         gated_out = moe_out * torch.sigmoid(logits[mask]).view(B, k, 1)
+        # Non-selected tokens output zero → x_new = mixed + 0 = mixed (identity via residual).
         out = torch.zeros_like(x)
-        out[mask] = gated_out.view(-1, C)
-        return out, aux_loss
+        out[mask] = gated_out.view(-1, C).to(out.dtype)
+        return out, aux_loss + mod_aux
 
 
-class buselMTP4Pipeline(nn.Module):
+class buselMTPPipeline(nn.Module):
+    """Multi-Token Prediction pipeline — predicts the next N patch tokens.
+
+    Uses N-1 autoregressive steps (t+1 is direct from main_hidden_states).
+    Each future head: detach → projection → embed_lookup(prev_token) → next head.
+    """
     def __init__(self, config):
         super().__init__()
+        self.n_mtp_heads = int(getattr(config, "num_mtp_heads", 4))
         self.embed_weight = nn.Parameter(torch.randn(config.vocab_size, config.d_model) * 0.02)
         self.projection = BitLinear_a4_8(config.d_model, config.d_model)  # shared
         padded_vocab = ((config.vocab_size + 15) // 16) * 16  # FP8-safe: next multiple of 16
         self.head = BitLinear_a4_8(config.d_model, padded_vocab)           # FP8-safe
         self.vocab_size = config.vocab_size
-        self.pos_embed = nn.Parameter(torch.randn(4, config.d_model) * 0.02)  # t+1..t+4
+        self.pos_embed = nn.Parameter(torch.randn(self.n_mtp_heads, config.d_model) * 0.02)
 
     def _embed_lookup(self, token_ids):
         return self.embed_weight[token_ids.to(self.embed_weight.device)]
 
     def forward(self, main_hidden_states, next_token_ids=None):
         B, T, D = main_hidden_states.shape
-        x = main_hidden_states.unsqueeze(2) + self.pos_embed
         _h = lambda t: self.head(t)[..., :self.vocab_size]  # trim FP8 padding
-        logits_t1 = _h(x[:, :, 0])
+
+        # t+1: direct from main_hidden_states
+        x = main_hidden_states.unsqueeze(2) + self.pos_embed[:1]
+        logits = [_h(x[:, :, 0])]
+
         if next_token_ids is None or any(t is None for t in next_token_ids):
-            return logits_t1, None, None, None
-        
+            # Fill remaining with None for API compatibility
+            logits.extend([None] * (self.n_mtp_heads - 1))
+            return tuple(logits)
+
         h_d = main_hidden_states.detach()
-        logits_list = [logits_t1]
-        prev = self.projection(h_d) + self._embed_lookup(next_token_ids[0])
-        prev = prev.unsqueeze(2) + self.pos_embed[1]
-        logits_list.append(_h(prev.squeeze(2)))
-        
-        for i in range(1, 3):
-            prev = self.projection(prev.squeeze(2)) + self._embed_lookup(next_token_ids[i])
-            prev = prev.unsqueeze(2) + self.pos_embed[i + 1]
-            logits_list.append(_h(prev.squeeze(2)))
-        
-        return logits_list[0], logits_list[1], logits_list[2], logits_list[3]
-        return logits_t1, logits_t2, logits_t3, logits_t4
+        prev_h = h_d
+        for i in range(1, self.n_mtp_heads):
+            prev_h = self.projection(prev_h) + self._embed_lookup(next_token_ids[i - 1])
+            h_pos = prev_h.unsqueeze(2) + self.pos_embed[i:i+1]
+            logits.append(_h(h_pos.squeeze(2)))
+
+        return tuple(logits)
 
 
 class buselModel(nn.Module):
@@ -205,22 +220,22 @@ class buselModel(nn.Module):
             )
 
         capacity = float(getattr(config, "mod_capacity", 1.0))
+        mod_interval = int(getattr(config, "mod_interval", 2))
+        nsa_n_heads = int(getattr(config, "nsa_n_heads", 16))
+        use_differential = bool(getattr(config, "use_differential_attention", False))
         sct_rank = int(getattr(config, "sct_rank", 0))
-        use_flex_attention = bool(getattr(config, "use_flex_attention", False))
-        use_lsd = bool(getattr(config, "use_lsd", True))
-        if use_lsd:
-            self.layer_importance = nn.Parameter(torch.ones(config.n_layers))
         self.layers = nn.ModuleList()
         for l in range(config.n_layers):
-            is_global = (l + 1) % 4 == 0
+            # 7:1 GDN-2:NSA ratio (MiniMax M3). ≥1 global layer guaranteed.
+            is_global = (l == config.n_layers - 1) or ((l + 1) % 8 == 0)
             self.layers.append(buselDecoderLayer(
                 config.d_model, config.n_heads, config.expert_hidden,
                 config.num_experts, is_global=is_global, capacity_factor=capacity,
                 top_k=int(getattr(config, "top_k", 2)),
-                use_differential=bool(getattr(config, "use_differential_attention", False)),
-                use_qknorm_l2=bool(getattr(config, "use_qknorm_l2", False)),
+                use_differential=use_differential,
+                layer_idx=l, mod_interval=mod_interval,
+                nsa_n_heads=nsa_n_heads,
                 sct_rank=sct_rank,
-                use_flex_attention=use_flex_attention,
             ))
 
         self.m_residuals = nn.ModuleList([
@@ -228,74 +243,82 @@ class buselModel(nn.Module):
             for _ in range(config.n_layers)
         ])
 
-        use_cla = bool(getattr(config, "use_cla", False))
-        cla_share_every = max(1, int(getattr(config, "cla_share_every", 2)))
-        if use_cla:
-            mla_indices = [i for i in range(config.n_layers) if (i + 1) % 4 == 0]
-            for group_start in range(0, len(mla_indices), cla_share_every):
-                group = mla_indices[group_start:group_start + cla_share_every]
-                if len(group) <= 1:
-                    continue
-                first_attn = self.layers[group[0]].attn
-                for idx in group[1:]:
-                    self.layers[idx].attn.kv_compress = first_attn.kv_compress
-                    self.layers[idx].attn.kv_norm = first_attn.kv_norm
-
         self.final_norm = RMSNorm(config.d_model)
-        self.mtp_pipeline = buselMTP4Pipeline(config)
+        self.mtp_pipeline = buselMTPPipeline(config)
+        self.n_mtp_heads = int(getattr(config, "num_mtp_heads", 4))
         self.use_gradient_checkpointing = False
         self.checkpoint_every = 1
         self.selective_backward = bool(getattr(config, "selective_backward", False))
         self.backward_ratio = max(0.0, min(1.0, float(getattr(config, "backward_ratio", 1.0))))
+        # ponytail: D5 — freeze stabilized layers in late training (1.5× speedup). Disabled until step 50%.
+        self._progressive_freeze = bool(getattr(config, "progressive_freeze", False))
+        self._freeze_threshold = float(getattr(config, "freeze_threshold", 0.1))
+        self._frozen_layers: set[int] = set()
+        self._layer_var: dict[int, list[float]] = {}
+        self._selected_layers: list[int] = list(range(config.n_layers))
         self.use_dropbp = bool(getattr(config, "use_dropbp", False))
         self.dropbp_prob = float(getattr(config, "dropbp_prob", 0.3))
-        self._selected_layers: list[int] = list(range(config.n_layers))
 
     def enable_gradient_checkpointing(self, every: int = 1):
         self.use_gradient_checkpointing = True
         self.checkpoint_every = max(1, int(every))
     def disable_gradient_checkpointing(self): self.use_gradient_checkpointing = False
 
+    def set_rope_scale(self, scale: float):
+        """YaRN: set rotary position encoding scale for all GDN-2 layers. 1.0→32.0 for 4K→128K."""
+        for layer in self.layers:
+            if hasattr(layer.attn, 'rope_scale'):
+                layer.attn.rope_scale = scale
+
     def forward(self, x, next_token_ids=None, progress=0.0):
         nvtx_range_push("buselModel_Forward")
         progress = round(float(progress), 1)  # quantize for torch.compile stability
-        streams = [x] * self.n_hyper
+        streams = x.unsqueeze(0).expand(self.n_hyper, *x.shape).contiguous()
         total_aux_loss = 0.0
         ckpt_every = self.checkpoint_every if self.use_gradient_checkpointing else 1
         ckpt_eligible = self.training and self.use_gradient_checkpointing and x.device.type == "cuda"
 
         if self.selective_backward and self.training and self.backward_ratio < 1.0:
-            import random
-            n_select = max(1, int(len(self.layers) * self.backward_ratio))
-            if hasattr(self, 'layer_importance'):
-                w = torch.softmax(self.layer_importance, dim=0)
-                self._selected_layers = sorted(torch.multinomial(w, n_select).tolist())
-            else:
-                self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
+            n_layers = len(self.layers)
+            n_select = max(1, int(n_layers * self.backward_ratio))
+            self._selected_layers = list(range(n_layers - n_select, n_layers))
         else:
             self._selected_layers = list(range(len(self.layers)))
+
+        # DropBP: randomly skip backward through layers (independent per-layer probability)
+        _dropbp = set()
+        if self.use_dropbp and self.training:
+            _dropbp = {i for i in range(len(self.layers)) if random.random() < self.dropbp_prob}
+
+        # ponytail: D5 — progressive layer freezing. After 50% progress, freeze last layers (1.5× late speedup).
+        frozen = set()
+        if self._progressive_freeze and progress > 0.5:
+            freeze_frac = min(0.75, (progress - 0.5) / 0.4 * 0.75)
+            n_active = int(len(self.layers) * (1.0 - freeze_frac))
+            frozen = set(range(n_active, len(self.layers)))
 
         for i, layer in enumerate(self.layers):
             mixed = self.m_residuals[i](x, streams)
 
-            if i in self._selected_layers:
-                if ckpt_eligible and (i % ckpt_every == 0):
-                    layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
-                        layer, mixed, progress, use_reentrant=False, determinism_check="none"
-                    )
-                else:
-                    layer_out, aux_loss = layer(mixed, progress=progress)
-                if self.use_dropbp and self.training and torch.rand(1, device=x.device).item() < self.dropbp_prob:
-                    layer_out = layer_out.detach()
-            else:
+            no_grad = i in frozen or (i not in self._selected_layers and self.training) or i in _dropbp
+            if no_grad:
                 with torch.no_grad():
                     layer_out, aux_loss = layer(mixed, progress=progress)
+            elif ckpt_eligible and (i % ckpt_every == 0):
+                layer_out, aux_loss = torch.utils.checkpoint.checkpoint(
+                    layer, mixed, progress, use_reentrant=False, determinism_check="none"
+                )
+            else:
+                layer_out, aux_loss = layer(mixed, progress=progress)
 
             x = mixed + layer_out
+            # ponytail: clamp extreme values to prevent bf16 overflow at scale
+            if self.training: x = torch.clamp(x, -100.0, 100.0)
             total_aux_loss += aux_loss
-            streams = list(streams[1:]) + [x]
+            streams = torch.cat([streams[1:], x.unsqueeze(0)], dim=0)
 
         final_hidden = self.final_norm(x)
+        self._last_hidden = final_hidden  # ponytail: exposed for EMA self-distillation (D3)
         mtp_outputs = self.mtp_pipeline(final_hidden, next_token_ids)
         nvtx_range_pop()
         return mtp_outputs, total_aux_loss

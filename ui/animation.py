@@ -48,22 +48,12 @@ _FRAME_MAP: dict[str, str | tuple[str, ...]] = {
 }
 
 
-def teto_frames() -> list[str]:
-    """Return the 12 idle animation frames (kawaii emoticon cycle)."""
-    return list(_IDLE_FRAMES)
-
-
 def teto_frame(state: str = "idle", tick: int = 0) -> str:
     """Return a single frame for the given state at the given tick."""
     entry = _FRAME_MAP.get(state, "")
     if isinstance(entry, tuple):
         return entry[tick % len(entry)]
     return entry
-
-
-def teto_states() -> list[str]:
-    """Return the list of all available state names."""
-    return list(_FRAME_MAP.keys())
 
 
 # ── Animation ─────────────────────────────────────────────────────────────────

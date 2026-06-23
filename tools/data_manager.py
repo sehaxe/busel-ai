@@ -35,14 +35,20 @@ app = typer.Typer()
 # Реестр умных пресетов на базе Busel Scaling Laws (37 токенов на параметр для <3B моделей, 80 для ≥3B)
 PRESETS = {
     "shpak": {
-        "text_limit": 360000,   
-        "sft_limit": 8000,      
-        "vision_limit": 1000    
+        "text_limit": 360000,
+        "sft_limit": 8000,
+        "vision_limit": 1000
     },
     "chyzh": {
-        "text_limit": 62000,   
-        "sft_limit": 2000,      
-        "vision_limit": 200     
+        "text_limit": 62000,
+        "sft_limit": 2000,
+        "vision_limit": 200
+    },
+    "busel_340m": {
+        "text_limit": 800000,     # ~10GB FineWeb-Edu + Wiki
+        "cosmopedia_limit": 500000, # ~6GB Cosmopedia synthetic
+        "sft_limit": 8000,
+        "vision_limit": 0
     }
 }
 
@@ -130,7 +136,7 @@ def _download_text(limit: int, source: str):
         dataset_name, split_name, name_param, text_key = "roneneldan/TinyStories", "train", None, "text"
         output_file = os.path.join(DATA_DIR, "pretrain_tinystories.txt")
     elif source_clean == "fineweb":
-        dataset_name, split_name, name_param, text_key = "HuggingFaceFW/fineweb-edu", "train", "sample-10BT", "text"
+        dataset_name, split_name, name_param, text_key = "HuggingFaceFW/fineweb-edu", "train", "default", "text"
         output_file = os.path.join(DATA_DIR, "pretrain_fineweb.txt")
     elif source_clean in ["smollm", "cosmopedia"]:
         dataset_name, split_name, name_param, text_key = "HuggingFaceTB/smollm-corpus", "train", "cosmopedia-v2", "text"
@@ -138,6 +144,12 @@ def _download_text(limit: int, source: str):
     elif source_clean == "wikipedia":
         dataset_name, split_name, name_param, text_key = "wikimedia/wikipedia", "20231101.en", "train", "text"
         output_file = os.path.join(DATA_DIR, "pretrain_wiki.txt")
+    elif source_clean == "codeparrot":
+        dataset_name, split_name, name_param, text_key = "codeparrot/codeparrot-clean", "train", None, "content"
+        output_file = os.path.join(DATA_DIR, "pretrain_codeparrot.txt")
+    elif source_clean == "stack":
+        dataset_name, split_name, name_param, text_key = "bigcode/the-stack-dedup", "train", None, "content"
+        output_file = os.path.join(DATA_DIR, "pretrain_stack.txt")
     else:
         typer.echo(typer.style("❌ Unsupported source!", fg=typer.colors.RED))
         return
@@ -162,16 +174,32 @@ def _download_text(limit: int, source: str):
         for item in dataset:
             if count >= limit:
                 break
-            try:
-                text_content = item[text_key].strip()
-                if not text_content: 
+            files = item.get("files")
+            if files is not None:
+                for file in files:
+                    if count >= limit:
+                        break
+                    try:
+                        text_content = file.get("content", "").strip()
+                        if not text_content:
+                            continue
+                        f.write(text_content + "\n\n")
+                        count += 1
+                        if count % 2000 == 0:
+                            typer.echo(f"   Saved: {count}/{limit} texts...")
+                    except Exception:
+                        continue
+            else:
+                try:
+                    text_content = item[text_key].strip()
+                    if not text_content:
+                        continue
+                    f.write(text_content + "\n\n")
+                    count += 1
+                    if count % 2000 == 0:
+                        typer.echo(f"   Saved: {count}/{limit} texts...")
+                except Exception:
                     continue
-                f.write(text_content + "\n\n")
-                count += 1
-                if count % 2000 == 0:
-                    typer.echo(f"   Saved: {count}/{limit} texts...")
-            except Exception:
-                continue
     typer.echo(typer.style(f"✅ Successfully saved {count} texts to '{output_file}'", fg=typer.colors.GREEN))
 
     # Избегаем GIL-конфликтов при очистке потоков PyArrow
@@ -332,13 +360,26 @@ def _hf_row_to_sft_jsonl(row: dict, format_adapter: str) -> dict | None:
             return None
         cleaned = []
         for m in messages:
-            if not isinstance(m, dict) or "role" not in m or "content" not in m:
+            if not isinstance(m, dict) or "role" not in m:
                 continue
             role = str(m["role"]).strip().lower()
-            content = str(m["content"]).strip()
-            if role not in ("system", "user", "assistant", "tool") or not content:
+            if role not in ("system", "user", "assistant", "tool"):
                 continue
-            cleaned.append({"role": role, "content": content})
+            content = str(m.get("content", "")).strip()
+            reasoning = str(m.get("reasoning_content", "")) if role == "assistant" else ""
+            has_tool_calls = bool(m.get("tool_calls"))
+            if not content and not reasoning and not has_tool_calls:
+                continue
+            entry: dict[str, Any] = {"role": role, "content": content}
+            if reasoning:
+                entry["reasoning_content"] = reasoning
+            if has_tool_calls:
+                entry["tool_calls"] = m["tool_calls"]
+            if role == "tool":
+                tc_id = m.get("tool_call_id", "")
+                if tc_id:
+                    entry["tool_call_id"] = tc_id
+            cleaned.append(entry)
         return {"messages": cleaned} if cleaned else None
 
     if format_adapter == FMT_PROMPT_CHOSEN_REJECTED:
@@ -530,14 +571,6 @@ def download_data(
         f"✅ Done. {len(names)} preset(s) processed. Run `uv run cli.py train-all` to start training.",
         fg=typer.colors.GREEN, bold=True,
     ))
-
-
-@app.command()
-def label_vision(
-    source_dir: str = typer.Option("my_photos", "--dir", "-s", help="Directory with raw images"),
-    model: str = typer.Option("moondream", "--model", "-m", help="Local vision model in Ollama")
-):
-    pass
 
 
 def _synth_image(path: str, w: int, h: int, seed: int):

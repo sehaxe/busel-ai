@@ -3,9 +3,10 @@ name = "busel"
 version = "1.0.0"
 description = "busel - Sovereign 1-bit Omni-LLM"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
+
 dependencies = [
-    "flash-linear-attention>=0.5.0",
+    "flash-linear-attention>=0.5.1",
     "maturin>=1.13.3",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
@@ -19,7 +20,8 @@ dependencies = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=2.37.3",
     "opencv-python-headless>=4.13.0.92",
-    "fla",
+    "liger-kernel>=0.8.0",
+    "torchao>=0.17.0",
 ]
 
 [project.optional-dependencies]
@@ -58,7 +60,6 @@ pythonpath = ["."]
 dev = ["pytest>=8.0"]
 
 [tool.uv]
-dev-dependencies = ["pytest>=8.0"]
 conflicts = [
     [
         { extra = "cpu" },

@@ -9,7 +9,6 @@ Beauty layer:
     • spinner()            — rich.status context manager for any blocking op
     • progress_bar()       — context manager with bar/eta/sparkle columns
     • stats_table()        — render a key/value table inside a rich Panel
-    • project_tree()       — rich.tree.Tree of the busel module hierarchy
     • safe_print()         — print that survives broken pipes (head | tail)
 """
 from __future__ import annotations
@@ -36,7 +35,6 @@ try:
     from rich.status import Status
     from rich.table import Table
     from rich.text import Text
-    from rich.tree import Tree
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
@@ -154,45 +152,6 @@ def stats_table(title: str, rows: list[tuple[str, str, str]]) -> None:
     for k, v, d in rows:
         print(f"  {k:20s} {v:14s}  {d}")
     print("---")
-
-
-def project_tree() -> None:
-    """Print a rich.tree.Tree of the busel module hierarchy."""
-    if not HAS_RICH:
-        print("busel/")
-        print("├── model/         (architecture)")
-        print("├── training/      (optimizer, autopilot, loss)")
-        print("├── data/          (byte-streaming pipeline)")
-        print("├── ui/            (Teto avatar + rich panels)")
-        print("├── busel_registry / busel_logging")
-        print("├── tests/         (unittest suite)")
-        print("├── tools/         (CLI: data, profile, inference)")
-        print("├── train.py       (entrypoint)")
-        print("└── cli.py         (Typer)")
-        return
-    c = console()
-    if c is None:
-        return
-    root = Tree("🌿 [bold green]busel[/bold green] (Sovereign 1-bit LLM)")
-    m = root.add("📐 [cyan]model/[/cyan]")
-    m.add("patching.py  — byte→patch (vocab=259)")
-    m.add("layers.py    — BitLinear, RMSNorm, SwishGLU")
-    m.add("attention.py — GDN-2 + MLA  [italic](registered)[/italic]")
-    m.add("routing.py   — MoD + MoE w/ Blackboard")
-    m.add("backbone.py  — mAR + buselModel")
-    tr = root.add("⚙️ [cyan]training/[/cyan]")
-    tr.add("optimizer.py — Muon + AdamW hybrid  [italic](registered)[/italic]")
-    tr.add("autopilot.py — predictive dampening + AGC")
-    tr.add("recipe.py    — MTP-4 weighted loss")
-    d = root.add("📚 [cyan]data/[/cyan]")
-    d.add("pipeline.py — byte-streamer loader")
-    u = root.add("🎯 [cyan]ui/[/cyan]")
-    u.add("teto.py     — kasane teto emoticons")
-    u.add("animation.py— rich.live wrapper")
-    u.add("cli.py      — panels, spinners, trees")
-    root.add("🛸 [cyan]busel_registry.py[/cyan] — extension-point registry")
-    root.add("📚 [cyan]busel_logging.py[/cyan] — JSONL event stream")
-    c.print(root)
 
 
 @contextmanager

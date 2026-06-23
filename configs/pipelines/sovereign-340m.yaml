@@ -1,0 +1,21 @@
+name: sovereign-3d
+stages:
+  - name: pretrain
+    data_preset: sovereign_3d
+    checkpoint_out: checkpoints/busel_3d_FINAL.pt
+    params:
+      profile_name: sovereign_3d
+      no_fp8: true
+      batch_size: 112
+  - name: sft
+    resume: checkpoints/busel_3d_FINAL.pt
+    data_preset: sovereign_3d
+    params:
+      profile_name: sovereign_3d
+      no_compile: true
+      data_glob: "data_train/sft/**/*.jsonl"
+      sft_data_glob: "data_train/sft/**/*.jsonl"
+      max_steps: 2000
+      warmup_steps: 100
+      sft_lr_scale: 0.3
+global_params: {}

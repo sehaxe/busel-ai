@@ -208,7 +208,7 @@ class StablebuselProfiler:
             mres_time = 0.0
             x = patches
             n_hyper = getattr(model, "n_hyper", 2)
-            streams = [x] * n_hyper  # pad with input copies (matches buselModel.forward)
+            streams = x.unsqueeze(0).expand(n_hyper, *x.shape).contiguous()  # [n_hyper, B, T, d_model] tensor
 
             with torch.autocast(device_type=self.device, dtype=torch.float16 if self.device == "mps" else torch.bfloat16):
                 for i, layer in enumerate(model.layers):
@@ -225,7 +225,7 @@ class StablebuselProfiler:
                     layer_time += (time.perf_counter() - t0)
 
                     # Обновляем streams (FIFO shift, length stays = n_hyper)
-                    streams = list(streams[1:]) + [x]
+                    streams = torch.cat([streams[1:], x.unsqueeze(0)], dim=0)
             
             timings["attention_moe_layers"].append(layer_time)
             timings["m_residuals"].append(mres_time)
@@ -234,7 +234,7 @@ class StablebuselProfiler:
             start = time.perf_counter()
             with torch.autocast(device_type=self.device, dtype=torch.float16 if self.device == "mps" else torch.bfloat16):
                 hidden = model.final_norm(x)
-                logits_t1 = model.mtp_pipeline.heads[0](hidden)
+                logits_t1 = model.mtp_pipeline.head(hidden)[..., :model.mtp_pipeline.vocab_size]
                 loss = loss_engine.compute_pretrain_loss(logits_t1, targets) + aux.float()
             if self.device == "mps": torch.mps.synchronize()
             timings["final_norm"].append(time.perf_counter() - start)

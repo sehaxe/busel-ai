@@ -13,7 +13,7 @@
 ## OVERVIEW
 **busel** — Sovereign 1-bit (1.58b) Any-to-Text LLM. Hybrid Python + Rust (PyO3 via maturin). Targets consumer HW (RTX 5060 Ti 16 GB / Apple Silicon). Trained via CLI, documented in `site/` (Astro+Starlight, Bun).
 
-**Architecture:** 1.58-bit ternary weights · byte-level vocab=326 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-4 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-8) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
+**Architecture:** 1.58-bit ternary weights · byte-level vocab=277 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-4 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-8) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
 
 ## STRUCTURE
 ```
@@ -21,7 +21,7 @@ busel-ai/
 ├── model/             # BitNet v2 architecture (layers/attention/routing/backbone/patching/checkpoint)
 ├── training/          # SF-NorLotusMuon + FP8 AdamW, EMA, AutoPilot, MTP-4 loss, **stages/** framework
 ├── data/              # Stream-interleaving token loader (list[int], Rust mmap or Python fallback)
-├── multimodal/        # Any-to-token encoders (image/video/audio/PDF/docx) + 70-token special vocab
+├── multimodal/        # Any-to-token encoders (image/video/audio/PDF/docx) + 18-token special vocab
 ├── ui/                # Teto Vocaloid emoticon + rich terminal helpers (animation.py, cli.py)
 ├── tools/             # Typer CLI (orchestrator, data_manager, plotter, inference, **tool_executor**)
 ├── tests/             # unittest suite (175) + ultra-stable profiler + 3 profile scripts
@@ -104,7 +104,7 @@ All profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyz
 | Modify training loop | [training/](file:///home/sehaxe/busel-ai/training/AGENTS.md) | Pretrain is `buselPretrainStage`; SFT/DPO/eval in `training/stages/` |
 | Add CLI command | [tools/](file:///home/sehaxe/busel-ai/tools/AGENTS.md) | Typer `@app.command`; subprocess pattern, never `import train` |
 | Modify data loader | [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) | Prefers Rust `ByteStreamer`; Python fallback exists |
-| Add a new modality | [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) | `@register("encoder", ...)`; return `list[int]` in `[0, 326)` |
+| Add a new modality | [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) | `@register("encoder", ...)`; return `list[int]` in `[0, 277)` |
 | Tune model size | [configs/default.yaml](file:///home/sehaxe/busel-ai/configs/default.yaml) | 12 profiles: validation / micro_test / quick_test / chyzh / scale_m / shpak / imu1 / noc / kruk / byvol / soap / quest |
 | Profile step perf | [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) | No `torch.profiler` (MPS hangs); use `tests/profiler_run.py` |
 | Edit docs site | [site/AGENTS.md](file:///home/sehaxe/busel-ai/site/AGENTS.md) | Bun + Starlight; 7 stable URL sections |
@@ -128,7 +128,7 @@ All profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyz
 - **Keep tests in `tests/test_suite.py`.** Never spawn a second test file. The suite is one big `unittest.TestCase` class.
 
 ## NEVER
-- **BPE / tokenizers** — model is byte-level, vocab=326 (256 raw bytes + 70 plug-in specials). See [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) for the 70-token breakdown.
+- **BPE / tokenizers** — model is byte-level, vocab=277 (256 raw bytes + 21 specials). See [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) for the 18-token breakdown.
 - **Raw `nn.Linear` in model** — must use `BitLinear_a4_8` or `H_BitLinear`. Breaks the 1.58-bit guarantee.
 - **`H_BitLinear` for non-`o_proj`** — BitNet v2 spec mandates it for output projection only (massive-activation mitigation).
 - **Disable any default in [DEFAULTS](#defaults-buselpretrainconfig--single-source-of-truth) without measuring** — LOTUS+Muon, EMA, Top-1, decoupled LR, selective ckpt, LCSB all help. Re-enabling them is the right move, not disabling.
@@ -142,7 +142,7 @@ All profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyz
 - **`assertTrue(x == y)` in tests** — use `assertEqual`. Better failure messages.
 - **`nn.Embedding` for tokens** — use `nn.Parameter(torch.randn(vocab_size(), d_byte))`. Size auto-tracks the special-token registry.
 - **Hardcoded vocab IDs** — import from `multimodal.special_tokens`. IDs are auto-allocated and may shift when tokens are added/disabled.
-- **Hardcoded `259` in embedding shape** — use `vocab_size()`. (Old constant from before the 70-token expansion.)
+- **Hardcoded `259` in embedding shape** — use `vocab_size()`. (Old constant from before the 18-token expansion.)
 - **Softmax on mAR logits** — Sinkhorn-Knopp projects to the Birkhoff polytope (doubly-stochastic), not softmax.
 - **Muon on 1D params** (norms, biases) — `buselOptimizerEngine` filters them.
 - **Muon on anything with `router` or `embed` in name** — `_MUON_EXCLUDE = ("router", "embed")`. Routers are policy, not value; embed is categorical.
@@ -206,7 +206,7 @@ This file is the project-level summary. Module-specific rules, anti-patterns, an
 - [model/AGENTS.md](file:///home/sehaxe/busel-ai/model/AGENTS.md) — BitLinear, H_BitLinear, GDN-2, MLA, mAR, MoE, MTP, compile-safe checkpoint loader
 - [training/AGENTS.md](file:///home/sehaxe/busel-ai/training/AGENTS.md) — SF-NorLotusMuon + FP8 AdamW, AutoPilot, loss engine, **stages/ framework** 
 - [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) — Rust mmap streamer, Python fallback, multimodal dispatch
-- [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) — 70-token vocab, 6 encoders (image/video/audio/PDF/docx/text)
+- [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) — 18-token vocab, 6 encoders (image/video/audio/PDF/docx/text)
 - [ui/AGENTS.md](file:///home/sehaxe/busel-ai/ui/AGENTS.md) — Teto emoticon frames, live animation, rich terminal helpers
 - [tools/AGENTS.md](file:///home/sehaxe/busel-ai/tools/AGENTS.md) — Typer CLI, pipeline orchestrator, **REPL tool executor**
 - [tests/AGENTS.md](file:///home/sehaxe/busel-ai/tests/AGENTS.md) — 175-test unittest suite, custom profiler, 3 profile scripts

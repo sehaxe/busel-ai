@@ -76,7 +76,7 @@ def train_single_profile(args_list):
     import argparse
     import shutil
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--profile", "-p", default="shpak")
+    p.add_argument("--profile", "-p", default="sovereign_3d")
     p.add_argument("--resume", "-r", default=None)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=None)
@@ -93,7 +93,7 @@ def train_single_profile(args_list):
 
 
 def autopilot(
-    profile_name: str = typer.Option("shpak", "--profile", "-p", help="Profile name: shpak or zubr")
+    profile_name: str = typer.Option("sovereign_5h", "--profile", "-p", help="Profile: sovereign_test | sovereign_5h | sovereign_12h | sovereign_24h | sovereign_3d")
 ):
     print_tui_header()
     load_env()
@@ -126,7 +126,7 @@ def autopilot(
 
 
 def train(
-    profile_name: str = typer.Option("shpak", "--profile", "-p", help="Profile: shpak or zubr"),
+        profile_name: str = typer.Option("sovereign_5h", "--profile", "-p", help="Profile: sovereign_test | sovereign_5h | sovereign_12h | sovereign_24h | sovereign_3d"),
     resume: str = typer.Option(None, "--resume", "-r", help="Path to checkpoint for resuming")
 ):
     args = ["--profile", profile_name]
@@ -221,7 +221,7 @@ def pipeline(
         merged_params = {**pipeline_cfg.global_params, **stage_spec.params}
         if stage_spec.checkpoint_out and "checkpoint_out" not in merged_params:
             merged_params["checkpoint_out"] = stage_spec.checkpoint_out
-        profile_name = merged_params.pop("profile_name", stage_spec.data_preset or "shpak")
+        profile_name = merged_params.pop("profile_name", stage_spec.data_preset or "sovereign_3d")
         profile_dict = _default_profiles.get(profile_name)
         if profile_dict is None:
             raise ValueError(f"Profile {profile_name!r} not in configs/default.yaml")
@@ -265,8 +265,8 @@ def pipeline(
     typer.echo(typer.style(f"\nPipeline {pipeline_cfg.name} complete — {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
 
 
-PROFILE_LADDER = ["chyzh", "shpak", "zubr"]
-PROFILE_PARAMS = {"chyzh": 10_000_000, "shpak": 55_000_000, "zubr": 120_000_000}
+PROFILE_LADDER = ["sovereign_5h", "sovereign_12h", "sovereign_24h", "sovereign_3d"]
+PROFILE_PARAMS = {"sovereign_5h": 70_000_000, "sovereign_12h": 170_000_000, "sovereign_24h": 350_000_000, "sovereign_3d": 1_000_000_000}
 # Two-tier Busel Scaling: <3B params → 37 tok/param, ≥3B → 80 tok/param
 _BUSEL_THRESHOLD = 3_000_000_000
 BUSEL_SCALING = {
@@ -379,7 +379,7 @@ def _print_escalation_plan(plan: dict) -> None:
 
 
 def escalate(
-    target: str = typer.Option("shpak", "--target", "-t", help="Target profile: chyzh | shpak | zubr"),
+    target: str = typer.Option("sovereign_3d", "--target", "-t", help="Target: sovereign_1h | sovereign_12h | sovereign_24h | sovereign_3d"),
     max_steps: int | None = typer.Option(None, "--max-steps", help="Cap total training across all stages (default: train to Busel scaling optimal)"),
     vram_gb: float = typer.Option(16.0, "--vram", help="Available VRAM in GB (clamps batch_size)"),
     recompile: bool = typer.Option(False, "--recompile", help="Wipe Inductor cache before compiling (default: reuse cache)"),

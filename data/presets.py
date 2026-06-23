@@ -17,7 +17,6 @@ from typing import Any, Optional
 
 STAGE_SFT = "sft"
 STAGE_DPO = "dpo"
-STAGE_EVAL = "eval"
 
 
 FMT_CHAT_MESSAGES = "chat_messages"
@@ -89,6 +88,16 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Claude Opus 4.7 trace inversion — inverted CoT + clean answers (5K English)",
         "license": "Apache 2.0",
     },
+    "sft-shpak-fable5": {
+        "stage": STAGE_SFT,
+        "hf_dataset": "Swarm-AI-Research/fable5-traces-sft",
+        "split": "train",
+        "limit": 4683,
+        "format_adapter": FMT_CHAT_MESSAGES,
+        "output_subdir": "sft/fable5",
+        "description": "Claude Fable 5 agent traces — CoT reasoning + tool calls (4.6K English)",
+        "license": "AGPL-3.0",
+    },
 }
 
 
@@ -111,25 +120,14 @@ def get_preset(name: str) -> dict[str, Any]:
 
 def resolve_preset(preset_name: str, override_limit: Optional[int] = None) -> dict[str, Any]:
     """Resolve a preset into a concrete download plan.
-
-    Returns a dict with all fields populated and `limit` applied (override
-    takes precedence over the preset's default).
-
-    Raises:
-        KeyError: preset name is unknown.
-        RuntimeError: preset depends on a generator script that hasn't been
-            generated yet (Phase 4 stub).
+    Returns a dict with all fields populated and `limit` applied
+    (override takes precedence over the preset's default).
+    Raises KeyError if preset name is unknown.
     """
     meta = get_preset(preset_name)
     plan = dict(meta)
     if override_limit is not None:
         plan["limit"] = override_limit
-    if plan.get("hf_dataset") is None and plan.get("generator_script"):
-        raise RuntimeError(
-            f"Preset {preset_name!r} is a generator stub. Run "
-            f"`uv run cli.py generate-safety-data --output <path>` first, "
-            f"or import {plan['generator_script']} directly."
-        )
     return plan
 
 

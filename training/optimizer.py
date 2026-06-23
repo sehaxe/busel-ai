@@ -5,7 +5,9 @@ from busel_registry import register
 
 try:
     from gram_newton_schulz.gram_newton_schulz import StandardNewtonSchulz
-    _NS = StandardNewtonSchulz(ns_use_kernels=False)
+    from gram_newton_schulz import POLAR_EXPRESS_COEFFICIENTS
+    # ponytail: POLAR_EXPRESS — per-step adaptive coefficients (aggressive→gentle), faster convergence than fixed quintic
+    _NS = StandardNewtonSchulz(ns_use_kernels=False, ns_coefficients=POLAR_EXPRESS_COEFFICIENTS)
     HAS_GRAM_NS = True
 except ImportError:
     _NS = None
@@ -18,15 +20,22 @@ _NS_COEFFS = (3.4445, -4.7750, 2.0315)
 def _newton_schulz_core(X, steps=5):
     a, b, c = _NS_COEFFS
     scale = X.norm()
+    if scale < 1e-8:
+        return X  # ponytail: zero input → skip NS
     X = X / scale
     for _ in range(steps):
         G = X.mT @ X
         X = a * X + b * X @ G + c * X @ G @ G
     return X
 
+# ponytail: compile once at first call, not every step
+_COMPILED_NS = None
 def _compiled_newton_schulz(X, steps=5):
-    try: return torch.compile(_newton_schulz_core)(X, steps)
-    except Exception: return _newton_schulz_core(X, steps)
+    global _COMPILED_NS
+    if _COMPILED_NS is None:
+        try: _COMPILED_NS = torch.compile(_newton_schulz_core)
+        except Exception: _COMPILED_NS = _newton_schulz_core
+    return _COMPILED_NS(X, steps)
 
 # ── Muon base + LOTUS + NorMuon ────────────────────────────────────────
 
@@ -43,6 +52,9 @@ class _MuonBase(torch.optim.Optimizer):
         buf.mul_(momentum).add_(grad.to(buf.dtype))
         return buf
     def _apply_weight_decay(self, p, lr, wd, m_t, group): p.mul_(1.0 - lr * wd)
+    def _orthogonalize(self, m_t, state, group, ns_steps):
+        if HAS_GRAM_NS and m_t.numel() > 1: return _NS(m_t)
+        return _compiled_newton_schulz(m_t, steps=ns_steps)
 
     @torch.no_grad()
     def step(self):
@@ -56,10 +68,7 @@ class _MuonBase(torch.optim.Optimizer):
                 if not self._has_momentum(state): self._init_momentum(p, state, group)
                 m_t = self._update_momentum(p, state, grad, momentum)
                 self._apply_weight_decay(p, lr, wd, m_t, group)
-                if HAS_GRAM_NS and m_t.numel() > 1:
-                    O_t = _NS(m_t)
-                else:
-                    O_t = _compiled_newton_schulz(m_t, steps=ns_steps)
+                O_t = self._orthogonalize(m_t, state, group, ns_steps)
                 O_t = O_t / (O_t.norm(dim=0, keepdim=True) + 1e-8)  # Muon+
                 A, B = p.shape[0], p.shape[1]
                 scale = 0.2 * math.sqrt(max(A, B))
@@ -80,6 +89,14 @@ class LotusMuon(_MuonBase):
         bp.mul_(momentum).add_(grad.to(bp.dtype) @ bq)
         bq.mul_(momentum).add_(grad.to(bq.dtype).T @ bp)
         return bp @ bq.T
+    def _orthogonalize(self, m_t, state, group, ns_steps):
+        # ponytail: D7 — NS on bp/bq (d×r) separately instead of m_t (d×d). 64× cheaper at r=8.
+        bp, bq = state['buf_p'], state['buf_q']
+        if bp.norm() < 1e-8 or bq.norm() < 1e-8:
+            return m_t  # ponytail: zero momentum → skip NS
+        if HAS_GRAM_NS and bp.numel() > 1:
+            return _NS(bp) @ _NS(bq).T
+        return _compiled_newton_schulz(bp, steps=ns_steps) @ _compiled_newton_schulz(bq, steps=ns_steps).T
 
 
 @register("optimizer", "norlotus_muon")
@@ -166,10 +183,15 @@ class buselOptimizerEngine:
             beta=sf_beta, gamma_factor=sf_gamma_factor
         )
         
-        # FP8 AdamW: always ON (Ampere+ native). 75% memory reduction.
-        from torchao.optim import AdamWFp8
-        adamw_opt = AdamWFp8(_build_groups(adamw_params), lr=lr_adamw, weight_decay=0.01)
-        print("🧊 [FP8-AdamW]: torchao FP8 optimizer — 75% memory")
+        # AdEMAMix8bit: 1.3× faster convergence than AdamW, same 8-bit memory
+        try:
+            from bitsandbytes.optim import AdEMAMix8bit
+            adamw_opt = AdEMAMix8bit(_build_groups(adamw_params), lr=lr_adamw, weight_decay=0.01)
+            print("🧊 [AdEMAMix8bit]: bnb 8-bit optimizer — 1.3× convergence")
+        except ImportError:
+            from torchao.optim import AdamWFp8
+            adamw_opt = AdamWFp8(_build_groups(adamw_params), lr=lr_adamw, weight_decay=0.01)
+            print("🧊 [FP8-AdamW]: torchao FP8 optimizer — 75% memory")
         
         self.opt_adamw = _ScheduleFreeWrapper(adamw_opt, beta=sf_beta, gamma_factor=sf_gamma_factor)
 
@@ -199,15 +221,11 @@ class EMA:
         for k, v in model.state_dict().items():
             if v.dtype.is_floating_point: self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
 
-    @torch.no_grad()
-    def apply_shadow(self, model):
-        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        sd = model.state_dict()
-        for k in sd:
-            if sd[k].dtype.is_floating_point: sd[k].copy_(self.shadow[k].to(sd[k].dtype))
-        return backup
+    def state_dict(self):
+        return {"decay": self.decay, "step": self._step_count, "shadow": self.shadow}
 
-    @torch.no_grad()
-    def restore(self, model, backup):
-        sd = model.state_dict()
-        for k in sd: sd[k].copy_(backup[k].to(sd[k].dtype))
+    def load_state_dict(self, sd, model=None):
+        self.decay = sd.get("decay", self.decay)
+        self._step_count = sd.get("step", 0)
+        if "shadow" in sd:
+            self.shadow = sd["shadow"]

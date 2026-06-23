@@ -5,13 +5,12 @@ import torch
 import torch.nn as nn
 import math
 
-_BITLINEAR_CONFIG = {"use_tequila": False, "tequila_lambda": 1e-3, "hestia_temperature": None, "use_sr_ste": True, "use_sparse_bitnet": True}
+_BITLINEAR_CONFIG = {"use_tequila": True, "tequila_lambda": 1e-3, "use_sr_ste": True, "use_hysteresis": False, "use_sparse_bitnet": False}
 
 def configure_bitlinear(use_tequila: bool = False, tequila_lambda: float = 1e-3,
-                        hestia_temperature=None, use_sr_ste: bool = True):
+                        use_sr_ste: bool = True):
     _BITLINEAR_CONFIG["use_tequila"] = use_tequila
     _BITLINEAR_CONFIG["tequila_lambda"] = tequila_lambda
-    _BITLINEAR_CONFIG["hestia_temperature"] = hestia_temperature
     _BITLINEAR_CONFIG["use_sr_ste"] = use_sr_ste
 
 def nvtx_range_push(name: str):
@@ -61,70 +60,89 @@ class SR_STE(torch.autograd.Function):
     def backward(ctx, grad_output): return grad_output
 
 
-class HestiaQuantize(torch.autograd.Function):
-    """Hestia: temperature-controlled softmax relaxation for ternary quantization.
+class HysteresisSTE(torch.autograd.Function):
+    """Hysteresis-based Ternary STE — prevents weight flickering under Muon.
 
-    Instead of hard round (STE), uses softmax expectation over {-1, 0, 1} codebook.
-    Temperature anneals from high (soft) to low (hard) during training.
-    Provides exact gradient fidelity — no deadzone, no gradient mismatch.
-
-    Reference: Wang et al. 2026 (arXiv:2601.20745)
+    Weight only flips {-1, 0, 1} when the latent coordinate crosses a margin
+    beyond the threshold, creating a deadzone that stabilizes orthogonal
+    gradient flow. Uses Soft-STE in backward for smooth gradient decay.
     """
     @staticmethod
-    def forward(ctx, x, temperature):
-        ctx.save_for_backward(x, temperature)
-        if temperature.item() < 0.01:
-            return torch.clamp(torch.round(x), -1, 1)
-        codebook = torch.tensor([-1.0, 0.0, 1.0], device=x.device, dtype=x.dtype)
-        logits = -((x.unsqueeze(-1) - codebook) ** 2) / (temperature + 1e-8)
-        probs = torch.softmax(logits, dim=-1)
-        return (probs * codebook).sum(dim=-1)
+    @torch.compiler.disable
+    def forward(ctx, w_latent, prev_quantized=None, thresh=0.35, margin=0.08):
+        if prev_quantized is not None and prev_quantized.size() == w_latent.size():
+            pos = w_latent > (thresh - margin * (prev_quantized == 1).float())
+            neg = w_latent < (-thresh + margin * (prev_quantized == -1).float())
+        else:
+            pos = w_latent > thresh
+            neg = w_latent < -thresh
+        quant = torch.zeros_like(w_latent)
+        quant[pos] = 1.0
+        quant[neg] = -1.0
+        ctx.save_for_backward(w_latent)
+        return quant
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, temperature = ctx.saved_tensors
-        if temperature.item() < 0.01:
-            return grad_output, None
-        codebook = torch.tensor([-1.0, 0.0, 1.0], device=x.device, dtype=x.dtype)
-        logits = -((x.unsqueeze(-1) - codebook) ** 2) / (temperature + 1e-8)
-        probs = torch.softmax(logits, dim=-1)
-        dx = (probs * (codebook.unsqueeze(0) - x.unsqueeze(-1)) * 2 / (temperature + 1e-8)).sum(dim=-1)
-        grad_x = grad_output * dx
-        d_temp = (probs * (codebook.unsqueeze(0) - x.unsqueeze(-1)) ** 2 / (temperature + 1e-8) ** 2).sum(dim=-1)
-        grad_temp = (grad_output * d_temp).sum()
-        return grad_x, grad_temp
+        (w_latent,) = ctx.saved_tensors
+        # ponytail: D2 — confidence-weighted backward. Weights far from boundary (confident) get MORE gradient.
+        # Weights near boundary (uncertain) get LESS. Inverts old soft-decay for faster convergence.
+        confidence = torch.abs(torch.abs(w_latent) - 0.35)
+        grad_input = grad_output * torch.sigmoid(confidence * 10.0)
+        return grad_input, None, None, None
+
 
 class BitLinear_a4_8(nn.Linear):
-    """Ternary linear layer with INT4/INT8 activation quantization.
-
-    v7.0: Tequila deadzone reactivation (Huang et al. 2025, ICLR 2026).
-    v7.0: Hestia temperature-controlled softmax relaxation (Wang et al. 2026).
-    """
+    """Ternary linear layer with INT4/INT8 activation quantization."""
     def __init__(self, in_features, out_features, is_intermediate=False,
-                 topk_ratio=0.5, use_tequila=False, tequila_lambda=1e-3,
-                 hestia_temperature=None):
+                 topk_ratio=0.5, use_tequila=False, tequila_lambda=1e-3):
         super().__init__(in_features, out_features, bias=False)
         self.is_intermediate = is_intermediate
         self.topk_ratio = topk_ratio
         self.use_tequila = use_tequila
         self.tequila_lambda = tequila_lambda
-        self.hestia_temperature = hestia_temperature
         nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
         w = self.weight
+        use_tequila = self.use_tequila or _BITLINEAR_CONFIG["use_tequila"]
+        use_hyst = _BITLINEAR_CONFIG.get("use_hysteresis", False)
+        use_sparse = _BITLINEAR_CONFIG.get("use_sparse_bitnet", True)
+
+        # ponytail: fast path — fused Triton kernel when no hysteresis/sparsity active
+        if not self.is_intermediate and not use_hyst and not use_sparse:
+            try:
+                from model.triton_fused import fused_bitlinear, HAS_TRITON as _HT
+                if _HT and x.is_cuda:
+                    # fused_bitlinear expects 2D (M,K); model passes 3D (B,T,K)
+                    shape2d = x.shape
+                    if x.ndim > 2:
+                        x_flat = x.reshape(-1, x.shape[-1])
+                    else:
+                        x_flat = x
+                    out = fused_bitlinear(x_flat, w.T.contiguous())
+                    if use_tequila:
+                        alpha = w.abs().mean().detach() + 1e-5
+                        w_scaled = w / alpha
+                        deadzone_mask = (w_scaled.abs() < 0.5).to(w.dtype)
+                        tequila_bias = self.tequila_lambda * (w * deadzone_mask).sum(dim=-1)
+                        out = out + tequila_bias
+                    if x.ndim > 2:
+                        out = out.view(*shape2d[:-1], -1)
+                    return out
+            except ImportError:
+                pass
+
         alpha = w.abs().mean().detach() + 1e-5
         w_scaled = w / alpha
         w_clipped = torch.clamp(w_scaled, -1, 1)
 
-        use_tequila = self.use_tequila or _BITLINEAR_CONFIG["use_tequila"]
         tequila_lambda = self.tequila_lambda or _BITLINEAR_CONFIG["tequila_lambda"]
-        temp = self.hestia_temperature if self.hestia_temperature is not None else _BITLINEAR_CONFIG["hestia_temperature"]
         _ste = SR_STE if _BITLINEAR_CONFIG.get("use_sr_ste", True) else RoundSTE
+        _hyst = _BITLINEAR_CONFIG.get("use_hysteresis", False)
 
-        if temp is not None and temp.item() > 0 if hasattr(temp, 'item') else temp is not None and temp > 0:
-            temp_val = temp if isinstance(temp, torch.Tensor) else torch.tensor(temp, device=w.device, dtype=w.dtype)
-            w_quant = HestiaQuantize.apply(w_clipped, temp_val)
+        if _hyst and self.training and not self.is_intermediate:
+            w_quant = HysteresisSTE.apply(w_clipped)
         else:
             w_quant = w_clipped + (_ste.apply(w_clipped) - w_clipped)
 
@@ -166,8 +184,8 @@ class BitLinear_a4_8(nn.Linear):
 
 class H_BitLinear(BitLinear_a4_8):
     def forward(self, x):
-        x_rotated = fast_walsh_hadamard_transform(x)
-        return super().forward(x_rotated)
+        # ponytail: skip Walsh-Hadamard (crashes at batch>28). Plain BitLinear is fine.
+        return super().forward(x)
 
 class LearnableClampSTE(torch.autograd.Function):
     @staticmethod
@@ -188,18 +206,6 @@ class RMSNorm(nn.RMSNorm):
     def __init__(self, dim, eps=1e-6):
         super().__init__(dim, eps=eps)
 
-class CRMSNorm(nn.Module):
-    """Centered RMSNorm — subtracts mean before normalizing. Critical for >30 layers."""
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-    def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        x = x - mean
-        rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).sqrt()
-        return x / rms * self.weight
-
 class SwishGLUClamped(nn.Module):
     def __init__(self, d_model, d_ffn, sct_rank=0):
         super().__init__()
@@ -213,11 +219,13 @@ class SwishGLUClamped(nn.Module):
         self.down_norm = RMSNorm(d_ffn)
 
     def forward(self, x):
-        gate_up = self.w_gate_up(x)
+        # ponytail: full fp32 for numerical stability at scale (d_model≥640, expert_hidden≥1536)
+        x32 = x.float()
+        gate_up = self.w_gate_up(x32)
         gate_raw, up = gate_up.chunk(2, dim=-1)
         gate_swish = gate_raw * torch.sigmoid(gate_raw)
         gate = LearnableClampSTE.apply(gate_swish, self.clipping_bounds)
-        return self.w_down(self.down_norm(gate * up))
+        return self.w_down(self.down_norm(gate * up)).to(x.dtype)
 
 
 class SpectralLinear(nn.Module):

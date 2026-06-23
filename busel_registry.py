@@ -27,21 +27,6 @@ _LOCK = threading.Lock()
 
 
 def register(kind: str, name: str, *, override: bool = False) -> Callable[[type[T]], type[T]]:
-    """Class decorator that registers a class under (kind, name).
-
-    Args:
-        kind: Category of component ("attention", "optimizer", "activation",
-            "patcher", "loss", "router", ...).
-        name: Human-readable unique identifier within the kind.
-        override: If True, allow replacing an already-registered class. Default
-            False → raises KeyError on collision (catches accidental re-imports).
-
-    Returns:
-        The class itself, unmodified (so it stays usable as a normal class).
-
-    Raises:
-        KeyError: If (kind, name) already registered and override=False.
-    """
     if not kind or not isinstance(kind, str):
         raise ValueError(f"register(): kind must be a non-empty string, got {kind!r}")
     if not name or not isinstance(name, str):
@@ -70,12 +55,6 @@ def register(kind: str, name: str, *, override: bool = False) -> Callable[[type[
 
 
 def get(kind: str, name: str) -> type:
-    """Retrieve a class registered under (kind, name).
-
-    Raises:
-        KeyError: If kind or name is unknown; message includes the available
-            names for that kind to make typos obvious.
-    """
     with _LOCK:
         bucket = _REGISTRY.get(kind, {})
         if name not in bucket:
@@ -88,23 +67,16 @@ def get(kind: str, name: str) -> type:
 
 
 def list_registered(kind: str) -> list[str]:
-    """Return sorted list of registered names for a given kind.
-
-    Returns an empty list if the kind is unknown (instead of raising) so callers
-    can safely check whether a category has any implementations yet.
-    """
     with _LOCK:
         return sorted(_REGISTRY.get(kind, {}).keys())
 
 
 def is_registered(kind: str, name: str) -> bool:
-    """Boolean check for (kind, name) without raising on misses."""
     with _LOCK:
         return name in _REGISTRY.get(kind, {})
 
 
 def unregister(kind: str, name: str) -> None:
-    """Remove a (kind, name) entry. Mostly useful in tests. No-op if absent."""
     with _LOCK:
         bucket = _REGISTRY.get(kind, {})
         bucket.pop(name, None)
@@ -113,6 +85,5 @@ def unregister(kind: str, name: str) -> None:
 
 
 def clear_registry() -> None:
-    """Wipe the entire registry. Only intended for test isolation."""
     with _LOCK:
         _REGISTRY.clear()

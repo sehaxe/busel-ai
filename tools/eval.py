@@ -218,17 +218,6 @@ def format_compliance(
     }
 
 
-def default_eval_prompts() -> list[str]:
-    """A small built-in set of eval prompts for format compliance."""
-    return [
-        "Hello, who are you?",
-        "What is 2 + 2?",
-        "Write a haiku about programming.",
-        "List 3 colors.",
-        "Translate 'hello' to French.",
-    ]
-
-
 def default_eval_bytes_samples(data_path: str = "data_train", max_bytes: int = 32 * 256) -> list[list[int]]:
     """Load a tiny held-out byte sample for perplexity. Reads first file found."""
     if not os.path.exists(data_path):
@@ -313,7 +302,15 @@ def run_all_metrics(
     ).items()})
 
     out.update({f"format/{k}": v for k, v in format_compliance(
-        model, patcher, default_eval_prompts(), device,
+        model, patcher,
+        [
+            "Hello, who are you?",
+            "What is 2 + 2?",
+            "Write a haiku about programming.",
+            "List 3 colors.",
+            "Translate 'hello' to French.",
+        ],
+        device,
         max_prompts=max_format_prompts,
     ).items()})
 
@@ -324,7 +321,6 @@ __all__ = [
     "perplexity",
     "sft_loss_metric",
     "format_compliance",
-    "default_eval_prompts",
     "default_eval_bytes_samples",
     "run_all_metrics",
 ]

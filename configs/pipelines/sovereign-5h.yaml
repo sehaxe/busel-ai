@@ -1,0 +1,23 @@
+name: sovereign-5h
+stages:
+  - name: pretrain
+    data_preset: sovereign_5h
+    checkpoint_out: checkpoints/busel_5h_FINAL.pt
+    params:
+      profile_name: sovereign_5h
+      no_fp8: true
+      no_compile: true       # 58M model: compile overhead > benefit
+      batch_size: 288   # max stable (320 crash — fla kernel)
+      grad_accum_steps: 1  # one forward+backward per step
+      grad_ckpt_every: 4   # less recompute (−5% overhead vs every=3)
+  - name: sft
+    resume: checkpoints/busel_5h_FINAL.pt
+    data_preset: sovereign_5h
+    params:
+      profile_name: sovereign_5h
+      no_compile: true
+      data_glob: "data_train/sft/**/*.jsonl"
+      max_steps: 500
+      warmup_steps: 25
+      sft_lr_scale: 0.3
+global_params: {}

@@ -16,7 +16,6 @@ Public API:
     ui.cli.header(title, subtitle)         -> None
     ui.cli.status_panel(title, **fields)   -> None
     ui.cli.stats_table(title, rows)        -> None
-    ui.cli.project_tree()                  -> None
     ui.cli.spinner(message)                -> context manager
     ui.cli.progress_bar(total, desc)       -> context manager yielding handle
     ui.cli.log(message, level="info")      -> None

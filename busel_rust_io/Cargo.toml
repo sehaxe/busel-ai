@@ -10,5 +10,5 @@ path = "lib.rs"
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module"] }
-rayon = "1.8"
 memmap2 = "0.9"
+rayon = "1.8"

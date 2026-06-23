@@ -18,20 +18,23 @@ def _entmax(logits, dim=-1):
 
 
 class MoDSequenceRouter(nn.Module):
-    """Token-level routing mask."""
+    """Token-level routing mask with load-balancing aux loss."""
     def __init__(self, d_model, capacity_factor=1.0):
         super().__init__()
         self.capacity_factor = capacity_factor
-        self.router = nn.Linear(d_model, 1)
+        self.router = BitLinear_a4_8(d_model, 1)
 
     def forward(self, x):
         if self.capacity_factor >= 1.0:
-            return None, None
-        logits = self.router(x.detach()).squeeze(-1)
-        k = int(x.shape[1] * self.capacity_factor)
+            return None, None, 0.0
+        logits = self.router(x.detach().float()).squeeze(-1)
+        k = max(2, int(x.shape[1] * self.capacity_factor))
         _, indices = torch.topk(logits, max(1, k), dim=-1)
         mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(-1, indices, True)
-        return mask, logits
+        # load-balancing aux loss: penalize routing imbalance (target: capacity_factor)
+        kept_frac = mask.float().mean()
+        aux_loss = ((kept_frac - self.capacity_factor) ** 2) * 0.1
+        return mask, logits, aux_loss
 
 
 class BulbaTernaryTitanExpertFFN(nn.Module):
@@ -81,10 +84,10 @@ class BulbaTernaryTitanMoE(nn.Module):
         # Routing-Free: last N dims of hidden state = expert logits
         router_logits = x_enriched[..., -self.num_experts:].to(dtype=x_enriched.dtype)
         
-        # Gumbel exploration
-        if self.training:
-            u = torch.rand_like(router_logits).clamp(1e-8, 1 - 1e-8)
-            router_logits = router_logits - torch.log(-torch.log(u)) * 0.1
+        # ponytail: Gumbel disabled (crashes at batch>28). Entmax + loss-free bias is sufficient.
+        # if self.training:
+        #     u = torch.rand_like(router_logits).clamp(1e-8, 1 - 1e-8)
+        #     router_logits = router_logits - torch.log(-torch.log(u)) * 0.1
         
         # Loss-Free bias
         router_logits = router_logits + self.expert_bias

@@ -10,9 +10,12 @@ import torch.nn.functional as F
 
 try:
     from liger_kernel.transformers.functional import liger_cross_entropy
+    from liger_kernel.transformers import LigerCrossEntropyLoss
     HAS_LIGER = True
+    _LIGER_CE = LigerCrossEntropyLoss(return_z_loss=True)
 except ImportError:
     HAS_LIGER = False
+    _LIGER_CE = None
 
 
 def validate_training_schedule(max_steps, warmup_steps):
@@ -59,44 +62,37 @@ class buselLossEngine:
         targets_device = targets.to(logits.device).long()
         
         # 1. Расчет основного лосса для головы t+1 (весовой коэффициент = 1.0)
-        if HAS_LIGER and logits.device.type == "cuda":
-            loss = liger_cross_entropy(
-                logits.reshape(-1, self.vocab_size),
-                targets_device.reshape(-1)
-            )
+        # ponytail: LigerFusedCrossEntropy with z-loss — prevents logit explosion, fused kernel
+        if _LIGER_CE is not None and logits.device.type == "cuda":
+            ce_out = _LIGER_CE(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
+            loss = ce_out.loss + 0.001 * ce_out.z_loss
+        elif HAS_LIGER and logits.device.type == "cuda":
+            loss = liger_cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
         else:
-            loss = F.cross_entropy(
-                logits.reshape(-1, self.vocab_size),
-                targets_device.reshape(-1)
-            )
+            loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
             
-        # 2. 🎯 РАСЧЕТ И ВЗВЕШИВАНИЕ ПОТЕРЬ MTP-4:
-        # Если переданы логиты и таргеты для голов предсказания будущего (t+2, t+3, t+4),
-        # мы рассчитываем лосс для каждой головы и суммируем их с затухающим коэффициентом.
+        # 2. 🎯 РАСЧЕТ И ВЗВЕШИВАНИЕ ПОТЕРЬ MTP-N:
+        # Если переданы логиты и таргеты для дополнительных голов предсказания будущего
+        # (t+2, t+3, ..., t+N), мы рассчитываем лосс для каждой головы и суммируем
+        # их с затухающим геометрическим коэффициентом 0.5^(i+1).
         if mtp_logits_list is not None and mtp_targets_list is not None:
-            # Веса важности предсказания каждого последующего шага (t+2, t+3, t+4)
-            mtp_weights = [0.5, 0.25, 0.125]
-            
             for i, (m_logits, m_targets) in enumerate(zip(mtp_logits_list, mtp_targets_list)):
                 if m_logits is None or m_targets is None:
                     continue
-                
+
                 m_targets_device = m_targets.to(m_logits.device).long()
-                
-                if HAS_LIGER and m_logits.device.type == "cuda":
-                    m_loss = liger_cross_entropy(
-                        m_logits.reshape(-1, self.vocab_size),
-                        m_targets_device.reshape(-1)
-                    )
+
+                if _LIGER_CE is not None and m_logits.device.type == "cuda":
+                    ce_out = _LIGER_CE(m_logits.reshape(-1, self.vocab_size), m_targets_device.reshape(-1))
+                    m_loss = ce_out.loss
+                elif HAS_LIGER and m_logits.device.type == "cuda":
+                    m_loss = liger_cross_entropy(m_logits.reshape(-1, self.vocab_size), m_targets_device.reshape(-1))
                 else:
-                    m_loss = F.cross_entropy(
-                        m_logits.reshape(-1, self.vocab_size),
-                        m_targets_device.reshape(-1)
-                    )
-                
-                # Аккуратно добавляем взвешенную потерю головы к общему лоссу
-                loss = loss + m_loss * mtp_weights[i]
-                
+                    m_loss = F.cross_entropy(m_logits.reshape(-1, self.vocab_size), m_targets_device.reshape(-1))
+
+                # Геометрически затухающий вес: T2=0.5, T3=0.25, T4=0.125, ...
+                weight = 0.5 ** (i + 1)
+                loss = loss + m_loss * weight
         return loss
 
     def compute_sft_loss(self, logits, targets, thought_mask):
@@ -108,20 +104,6 @@ class buselLossEngine:
             logits[mask].reshape(-1, self.vocab_size),
             masked_targets[mask].reshape(-1)
         )
-
-    def compute_kto_loss(self, policy_logps, reference_logps, labels, beta=0.1, kl_weight=0.1):
-        log_ratios = policy_logps - reference_logps
-        kl = torch.clamp(log_ratios, min=0.0).mean()
-
-        losses = []
-        for log_ratio, label in zip(log_ratios, labels):
-            if label == 1:
-                losses.append(-F.logsigmoid(beta * (log_ratio - kl)))
-            else:
-                losses.append(-F.logsigmoid(beta * (kl - log_ratio)))
-
-        kto_loss = torch.stack(losses).mean() + kl_weight * kl
-        return kto_loss
 
     @staticmethod
     def compute_dpo_loss(
@@ -222,49 +204,3 @@ class buselLossEngine:
             reduction='none',
         ).reshape(targets.shape)
         return (ce * mask).sum() / mask.sum()
-
-    def compute_kd_loss(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        targets: torch.Tensor,
-        temperature: float = 2.0,
-        alpha: float = 0.5,
-    ) -> torch.Tensor:
-        """Knowledge Distillation loss (Hinton et al. 2015) for SALT.
-        
-        L_KD = α * L_hard(targets) + (1-α) * T² * KL(softmax(z_t/T) || softmax(z_s/T))
-        
-        Args:
-            student_logits: (B, T, V) student model output
-            teacher_logits: (B, T, V) teacher model output (detached)
-            targets: (B, T) ground truth token IDs
-            temperature: softmax temperature (higher = softer distribution)
-            alpha: weight for hard label loss vs soft label loss
-        
-        Returns:
-            Scalar KD loss.
-        """
-        targets_device = targets.to(student_logits.device).long()
-        
-        if HAS_LIGER and student_logits.device.type == "cuda":
-            hard_loss = liger_cross_entropy(
-                student_logits.reshape(-1, self.vocab_size),
-                targets_device.reshape(-1)
-            )
-        else:
-            hard_loss = F.cross_entropy(
-                student_logits.reshape(-1, self.vocab_size),
-                targets_device.reshape(-1)
-            )
-        
-        student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits.detach() / temperature, dim=-1)
-        
-        soft_loss = F.kl_div(
-            student_log_probs,
-            teacher_log_probs.exp(),
-            reduction='batchmean',
-        ) * (temperature ** 2)
-        
-        return alpha * hard_loss + (1.0 - alpha) * soft_loss

@@ -30,7 +30,31 @@ from multimodal.special_tokens import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
     DOC_SEP,
+    THINK_START,
+    THINK_END,
 )
+
+
+def _tool_calls_to_content(tool_calls: list) -> str:
+    """Convert OpenAI-format tool_calls to Anthropic XML text bytes."""
+    parts = ["<function_calls>"]
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        args_str = func.get("arguments", "{}")
+        try:
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        parts.append(f'<invoke name="{name}">')
+        if isinstance(args, dict):
+            for k, v in args.items():
+                parts.append(f'<parameter name="{k}">{v}</parameter>')
+        else:
+            parts.append(f'<parameter name="arguments">{args_str}</parameter>')
+        parts.append("</invoke>")
+    parts.append("</function_calls>")
+    return "\n".join(parts)
 
 
 _ROLE_TOKENS: dict[str, int] = {
@@ -91,12 +115,52 @@ def format_chat_messages(
         content_bytes = list(content.encode("utf-8"))
         is_assistant = role == "assistant"
 
+        # Convert OpenAI tool_calls → Anthropic XML text for assistant
+        tool_calls_xml = ""
+        if is_assistant and msg.get("tool_calls"):
+            tool_calls_xml = _tool_calls_to_content(msg["tool_calls"])
+        if not content and tool_calls_xml:
+            content_bytes = list(tool_calls_xml.encode("utf-8"))
+            tool_calls_xml = ""  # consumed
+
         out_bytes.append(_ROLE_TOKENS[role])
         out_mask.append(0)
 
-        for b in content_bytes:
-            out_bytes.append(int(b))
-            out_mask.append(1 if is_assistant else 0)
+        if is_assistant:
+            reasoning = str(msg.get("reasoning_content", ""))
+            if reasoning:
+                # Claude trace format: reasoning inside think tags, content after
+                out_bytes.extend([int(THINK_START)])
+                out_mask.append(0)
+                reasoning_bytes = list(reasoning.encode("utf-8"))
+                for b in reasoning_bytes:
+                    out_bytes.append(int(b))
+                    out_mask.append(1)
+                out_bytes.extend([int(THINK_END)])
+                out_mask.append(1)
+                # actual output after reasoning
+                for b in content_bytes:
+                    out_bytes.append(int(b))
+                    out_mask.append(1)
+            else:
+                # No separate reasoning — wrap all content in think tags
+                out_bytes.extend([int(THINK_START)])
+                out_mask.append(0)
+                for b in content_bytes:
+                    out_bytes.append(int(b))
+                    out_mask.append(1)
+                out_bytes.extend([int(THINK_END)])
+                out_mask.append(1)
+            # append tool_calls XML after content when both present
+            if tool_calls_xml:
+                tc_bytes = list(tool_calls_xml.encode("utf-8"))
+                for b in tc_bytes:
+                    out_bytes.append(int(b))
+                    out_mask.append(1)
+        else:
+            for b in content_bytes:
+                out_bytes.append(int(b))
+                out_mask.append(0)
 
         if add_eos_after_each:
             out_bytes.append(int(EOS))
