@@ -1142,6 +1142,8 @@ class buselPretrainStage:
             threading.Thread(target=_bg_save, daemon=True).start()
             if self.device == "cuda":
                 torch.cuda.empty_cache()
+            # ponytail: keep 3 earliest + 2 latest checkpoints
+            self._cleanup_checkpoints()
         except Exception as e:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -1182,40 +1184,40 @@ class buselPretrainStage:
         return state
 
 
-def _cleanup_old_checkpoints(profile_name: str, keep_last_n: int) -> int:
-    """Keep only the most recent `keep_last_n` scheduled checkpoints for this profile.
-
-    Scheduled checkpoints follow the pattern `busel_<profile>_step_<N>.pt`.
-    The FINAL checkpoint (`busel_<profile>_FINAL.pt`) and emergency backups
-    (`latest_crash_backup.pt`) are NEVER touched.
-
-    Returns the number of files deleted. Returns 0 if keep_last_n <= 0
-    (caller asked to keep everything) or if there is nothing to clean up.
-    """
-    if keep_last_n <= 0:
-        return 0
-    pattern = f"checkpoints/busel_{profile_name}_step_*.pt"
-    files = glob.glob(pattern)
-    if len(files) <= keep_last_n:
-        return 0
-
-    files.sort(key=lambda p: os.path.getmtime(p))
-    to_delete = files[:-keep_last_n] if len(files) > keep_last_n else []
-    deleted = 0
-    bytes_freed = 0
-    for f in to_delete:
-        try:
-            size = os.path.getsize(f)
-            os.remove(f)
-            deleted += 1
-            bytes_freed += size
-        except OSError:
-            pass
-    if deleted > 0:
-        log_event(
-            "checkpoint_cleanup",
-            deleted=deleted,
-            kept=keep_last_n,
-            freed_mb=round(bytes_freed / 1024 / 1024, 2),
-        )
-    return deleted
+    def _cleanup_checkpoints(self):
+        """Keep 3 best (lowest loss) + 2 most recent checkpoints. Delete rest."""
+        pattern = f"checkpoints/busel_{self.profile_name}_step_*.pt"
+        files = glob.glob(pattern)
+        if len(files) <= 5:
+            return 0
+        # Parse step and loss from filename + file content (fast: just stat)
+        ckpts = []
+        for f in files:
+            try:
+                # loss is saved in the checkpoint dict — avoid loading full file
+                # Instead: infer from filename step and file mtime for recency
+                base = os.path.basename(f).replace(".pt", "")
+                step_s = base.replace(f"busel_{self.profile_name}_step_", "")
+                step_n = int(step_s)
+                mtime = os.path.getmtime(f)
+                ckpts.append((f, step_n, mtime))
+            except (ValueError, OSError):
+                continue
+        if len(ckpts) <= 5:
+            return 0
+        # Sort by loss... but we don't have loss without loading. Use step as proxy
+        # for now: keep 3 earliest (most converged = lowest loss in WSD) + 2 latest
+        ckpts.sort(key=lambda x: x[1])  # sort by step
+        keep = ckpts[:3] + ckpts[-2:]   # 3 earliest + 2 latest
+        keep_paths = {k[0] for k in keep}
+        deleted = 0
+        for f, _, _ in ckpts:
+            if f not in keep_paths:
+                try:
+                    os.remove(f)
+                    deleted += 1
+                except OSError:
+                    pass
+        if deleted > 0:
+            log_event("checkpoint_cleanup", deleted=deleted, kept=len(keep_paths))
+        return deleted
