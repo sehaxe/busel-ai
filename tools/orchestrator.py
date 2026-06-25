@@ -261,8 +261,8 @@ def pipeline(
     typer.echo(typer.style(f"\nPipeline {pipeline_cfg.name} complete — {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
 
 
-PROFILE_LADDER = ["verabey-67m", "sokal-120m", "kruk-210m", "busel-365m"]
-PROFILE_PARAMS = {"verabey-67m": 67000000, "sokal-120m": 120000000, "kruk-210m": 210000000, "busel-365m": 365000000}
+PROFILE_LADDER = ["verabey-40m", "sokal-120m", "kruk-210m", "busel-365m"]
+PROFILE_PARAMS = {"verabey-40m": 40000000, "sokal-120m": 120000000, "kruk-210m": 210000000, "busel-365m": 365000000}
 # Two-tier Busel Scaling: <3B params → 37 tok/param, ≥3B → 80 tok/param
 _BUSEL_THRESHOLD = 3_000_000_000
 BUSEL_SCALING = {

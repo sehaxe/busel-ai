@@ -39,9 +39,9 @@
 
 | Профиль | d_model×layers | Параметры | VRAM | batch×accum | Для чего |
 |---------|---------------|-----------|------|-------------|----------|
-| `chizh-9m` | 384×2 | 9M | 1 GB | 256×2 | CI / smoke test |
-| `verabey-67m` | 768×6 | 67M | 6 GB | 256×2 | ~6ч, хороший |
-| `sokal-120m` | 768×10 | 120M | 10 GB | 256×2 | ~12ч, сильный |
+| `chizh-9m` | 384×4 | 9M | 1 GB | 4096×4 | CI / smoke test |
+| `verabey-40m` | 512×12 | 40M (128M eff) | 3 GB | 8192×4 | GPT-2-mini эквивалент |
+| `sokal-120m` | 768×8 | 120M | 10 GB | 1536×4 | ~12ч, сильный |
 | `kruk-210m` | 768×16 | 210M | 14 GB | 768×4 | ~24ч, мощный |
 | `busel-365m` | 1024×18 | 365M | 20+ GB | 256×4 | Флагман |
 
@@ -59,7 +59,7 @@
 uv run python cli.py train --profile chizh-9m --max-steps 50
 
 # Средняя модель (67M, ~6 часов)
-uv run python cli.py autopilot --profile verabey-67m
+uv run python cli.py pipeline --name verabey-40m
 
 # Сильная модель (210M, ~24 часа)
 uv run python cli.py autopilot --profile kruk-210m
