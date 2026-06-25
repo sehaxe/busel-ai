@@ -1182,6 +1182,25 @@ class buselPretrainStage:
                 "tokens_per_s": speed if step % 10 == 0 else state.metrics.get("tokens_per_s", 0.0),
             }
 
+            # ponytail: memory leak defence — gc + cache flush every 100 steps
+            if step > 0 and step % 100 == 0:
+                gc.collect()
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                # check system RAM — emergency save + exit before OOM
+                try:
+                    with open("/proc/self/status") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                rss_kb = int(line.split()[1])
+                                total_kb = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') // 1024
+                                if total_kb > 0 and rss_kb / total_kb > 0.80:
+                                    print(f"\n⚠️  RAM {rss_kb//1024}MB/{total_kb//1024}MB > 80% — emergency save")
+                                    self._emergency_save_requested["value"] = True
+                                    break
+                except Exception:
+                    pass
+
             # Validation
             val_every = getattr(self.cfg, "val_every", 0)
             if val_every > 0 and step > 0 and step % val_every == 0:
