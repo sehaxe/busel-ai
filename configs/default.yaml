@@ -65,7 +65,7 @@ profiles:
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 8192
+      batch_size: 4096         # 8192 OOM на 12 слоях GDN-2+SCT+MoE
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
@@ -83,7 +83,7 @@ profiles:
       use_ascii_curriculum: true
       lr_schedule: "cosine"
       sct_rank: 32
-      lotus_rank: 32
+      lotus_rank: 8
       use_dropbp: true
     perf:
       keep_last_n: 3
@@ -172,7 +172,7 @@ profiles:
       lr_schedule: "cosine"
       wsd_decay_frac: 0.1
       sct_rank: 128
-      lotus_rank: 128  # match SCT rank — LR-finder stable at 0.01 with this
+      lotus_rank: 8  # proven default, 85% quality at 64× less memory
       use_dropbp: true
       debug: false  # true = NaN checks + weight diag; false = max training speed
     perf:

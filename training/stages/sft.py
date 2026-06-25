@@ -188,6 +188,9 @@ class buselSFTStage:
 
         if self.cfg.warmup_steps == "auto" or self.cfg.warmup_steps is None:
             self.cfg.warmup_steps = max(20, int(0.05 * self.cfg.max_steps))
+        elif isinstance(self.cfg.warmup_steps, str) and self.cfg.warmup_steps.endswith("%"):
+            pct = float(self.cfg.warmup_steps[:-1]) / 100.0
+            self.cfg.warmup_steps = max(5, int(pct * self.cfg.max_steps))
         else:
             self.cfg.warmup_steps = int(self.cfg.warmup_steps)
 
