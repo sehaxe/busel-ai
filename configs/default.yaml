@@ -46,51 +46,47 @@ profiles:
       grad_ckpt_every: 2
 
   # ═══════════════════════════════════════════════════════════════════
-  # verabey-27m — чат-бот (~67M SCT-128)
+  # v3gpt2mini — GPT-2-mini эквивалент (40M SCT-32, 128M эффект.)
   # ═══════════════════════════════════════════════════════════════════
-  verabey-67m:
+  v3gpt2mini:
     model:
       d_model: 512
-      n_layers: 8
+      n_layers: 12
       n_heads: 8
       expert_hidden: 1024
-      num_experts: 8          # 8 экспертов → лучше специализация
+      num_experts: 6
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
+      num_mtp_heads: 6
       selective_backward: true
-      backward_ratio: 0.3
-      use_differential_attention: true  # Diff MLA — острее NSA на коротких патчах
-      nsa_n_heads: 1                     # принудительно MLA (1%16≠0)
+      backward_ratio: 0.5
+      nsa_n_heads: 16
     data:
       data_path: "data_train"
-      chunk_size: 8192        # 8K контекст, curriculum 1024→2K→4K→8K
-      batch_size: 3072          # авто: 3072→1536→768→384 — ~5GB VRAM peak
+      chunk_size: 4096
+      batch_size: 8192
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
-      warmup_steps: "auto"
+      warmup_steps: "5%"
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
       grad_accum_steps: 4
-      mod_capacity: 0.5        # MoD: регуляризация улучшает качество
-      mod_interval: 2
-      use_chunk_curriculum: true
-      use_dropbp: false
+      mod_capacity: 0.5
+      mod_interval: 1
       use_dispersion_loss: false
-      use_rho_loss: false  # ponytail: RHO-Loss → NaN
+      use_rho_loss: false
       use_ascii_curriculum: true
-      use_fused_training: false
-      sct_rank: 128             # SCT rank — arXiv:2604.00733 sweet spot: 11.7× best PPL
-      lr_schedule: "wsd"
-      wsd_decay_frac: 0.1
+      lr_schedule: "cosine"
+      sct_rank: 32
+      lotus_rank: 32
+      use_dropbp: true
     perf:
-      grad_ckpt_every: 1       # checkpoint each layer — safety при chunk 8192×1536
       keep_last_n: 3
-      dynamic_compile: false
+      grad_ckpt_every: 3
 
   # ═══════════════════════════════════════════════════════════════════
   # sokal-120m — на ночь (~120M SCT-128, ~8 часов)
