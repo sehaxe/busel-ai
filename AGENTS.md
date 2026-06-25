@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE — busel (Бусел)
 
-**Last updated:** 2026-06-20
+**Last updated:** 2026-06-25
 **Branch:** main
-**Test count:** 175 (unittest, no pytest)
+**Test count:** 176 (unittest, no pytest)
 
 ## [PRIORITY] — read first
 1. **Performance + LOC** — when in doubt, the faster + shorter option wins.
@@ -13,7 +13,7 @@
 ## OVERVIEW
 **busel** — Sovereign 1-bit (1.58b) Any-to-Text LLM. Hybrid Python + Rust (PyO3 via maturin). Targets consumer HW (RTX 5060 Ti 16 GB / Apple Silicon). Trained via CLI, documented in `site/` (Astro+Starlight, Bun).
 
-**Architecture:** 1.58-bit ternary weights · byte-level vocab=277 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-4 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-8) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
+**Architecture:** 1.58-bit ternary weights · byte-level vocab=277 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-6 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-128) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
 
 ## STRUCTURE
 ```
@@ -40,16 +40,26 @@ busel-ai/
 These are hardcoded defaults in `buselOptimizerEngine` and `NorLotusMuon`:
 
 | Feature | Default | Why |
-|---|---|---|
-| **SF-NorLotusMuon** (Muon path) | Always ON | Schedule-Free + NorMuon + LOTUS rank-8 + cautious WD. Single path, no opt-out. |
+|---|---|---|---|
+| **SF-NorLotusMuon** (Muon path) | Always ON | Schedule-Free + NorMuon + LOTUS rank-128 + column norm. Single path, no opt-out. |
 | **FP8 AdamW** (AdamW path) | Always ON | `torchao.optim.AdamWFp8` — 75% memory reduction vs fp32 AdamW. |
-| **Gram NS** (orthogonalization) | Primary | `gram_newton_schulz.StandardNewtonSchulz` package. Falls back to `_newton_schulz_core` (quintic, 5 steps) if unavailable. |
+| **Gram NS** (orthogonalization) | Fallback | `gram_newton_schulz` package disabled — aggressive coefficients unstable on SCT. Uses built-in `_newton_schulz_core` (quintic, 5 steps). |
 | **Muon+** column normalization | Always ON | `O_t / (O_t.norm(dim=0, keepdim=True) + 1e-8)` after NS. |
+| **LOTUS column norm** (§3.2) | Always ON | `bp.norm(dim=0)`, `bq.norm(dim=0)` — prevents exponential buffer growth → NaN. |
 | **top_k** (MoE) | `1` | 1 of N experts per token. −35% routed FFN FLOPs. |
 | **EMA** | `True` | `ema_decay=0.999`. 10-15% fewer steps to same loss. |
+| **SCT rank** | `128` | All profiles. SCT+Muon stable with LOTUS column norm (prevents buffer explosion → NS NaN). |
+| **LOTUS rank** | `128` | Match SCT rank — column L2 norm prevents unbounded growth. |
 | **Selective ckpt** | `every=2` | Halves activation memory at <5% step-time cost. |
-| **LCSB** | `True` (shpak/zubr/chyzh) | `backward_ratio=0.5`. −44% step, −25% mem, +80% tok/s. Off in test profiles. |
+| **LCSB** | `True` (all profiles) | `backward_ratio=0.5`. −44% step, −25% mem, +80% tok/s. |
 | **Decoupled LR** | `{attn:1.0, ffn:1.0, mtp:1.0, norm:1.0, embed:0.5, router:0.5}` | Embed/router get half LR. |
+| **SCT rank-8** | `True` (rank=8) | Spectral Compact Training — FFN compression ×4-8, same quality. |
+| **DropBP** | `True` (prob=0.3) | 30% layers skip backward — regularization, +speed. |
+| **Dispersion Loss** | `False` | Optional uniformity loss on embeddings — see opt-in table. |
+| **Progressive Freeze** | `True` | Freeze up to 75% layers in late training — +speed. |
+| **ASCII Curriculum** | `True` | 7-bit ASCII first 30% training, then full 8-bit. |
+| **Fused BitLinear** | `True` (eager mode) | Triton kernel replaces 10+ ops in one launch. Disabled under torch.compile (inductor fuses automatically). |
+| **Chunk Curriculum** | `True` | Context growth: 1/16→1/8→1/4→1/2→full (512→1024→2048→4096→8192). |
 
 ## REMOVED OPTIMIZERS (v8.5 cleanup)
 All dead branches deleted. The optimizer is now a single clean path:
@@ -102,6 +112,7 @@ All profiles in `configs/default.yaml` (validation, micro_test, quick_test, chyz
 |------|----------|-------|
 | Add new model layer | [model/](file:///home/sehaxe/busel-ai/model/AGENTS.md) | Must use `BitLinear_a4_8` or `H_BitLinear` (no raw `nn.Linear`) |
 | Modify training loop | [training/](file:///home/sehaxe/busel-ai/training/AGENTS.md) | Pretrain is `buselPretrainStage`; SFT/DPO/eval in `training/stages/` |
+| **Debug LOTUS NaN** | `training/optimizer.py` line 94 | Column norm fix (LOTUS §3.2): `bp/bq.norm(dim=0)` after momentum update — prevents buffer explosion |
 | Add CLI command | [tools/](file:///home/sehaxe/busel-ai/tools/AGENTS.md) | Typer `@app.command`; subprocess pattern, never `import train` |
 | Modify data loader | [data/AGENTS.md](file:///home/sehaxe/busel-ai/data/AGENTS.md) | Prefers Rust `ByteStreamer`; Python fallback exists |
 | Add a new modality | [multimodal/AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) | `@register("encoder", ...)`; return `list[int]` in `[0, 277)` |

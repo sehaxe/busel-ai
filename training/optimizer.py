@@ -1,4 +1,5 @@
 """busel optimizer — SF-NorMuon + GramNS + Muon+. Single path, no dead branches."""
+import os
 import torch
 import math
 from busel_registry import register
@@ -17,11 +18,12 @@ except ImportError:
 
 _NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
-def _newton_schulz_core(X, steps=5):
+def _newton_schulz_core(X, steps=3):
     a, b, c = _NS_COEFFS
+    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     scale = X.norm()
-    if scale < 1e-8:
-        return X  # ponytail: zero input → skip NS
+    if scale < 1e-8 or torch.isnan(scale) or torch.isinf(scale):
+        return X
     X = X / scale
     for _ in range(steps):
         G = X.mT @ X
@@ -30,7 +32,7 @@ def _newton_schulz_core(X, steps=5):
 
 # ponytail: compile once at first call, not every step
 _COMPILED_NS = None
-def _compiled_newton_schulz(X, steps=5):
+def _compiled_newton_schulz(X, steps=3):
     global _COMPILED_NS
     if _COMPILED_NS is None:
         try: _COMPILED_NS = torch.compile(_newton_schulz_core)
@@ -40,7 +42,7 @@ def _compiled_newton_schulz(X, steps=5):
 # ── Muon base + LOTUS + NorMuon ────────────────────────────────────────
 
 class _MuonBase(torch.optim.Optimizer):
-    def __init__(self, params, extra_defaults, lr=1e-3, weight_decay=0.1, momentum=0.95, ns_steps=5):
+    def __init__(self, params, extra_defaults, lr=1e-3, weight_decay=0.1, momentum=0.95, ns_steps=3):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, ns_steps=ns_steps)
         defaults.update(extra_defaults)
         super().__init__(params, defaults)
@@ -53,7 +55,8 @@ class _MuonBase(torch.optim.Optimizer):
         return buf
     def _apply_weight_decay(self, p, lr, wd, m_t, group): p.mul_(1.0 - lr * wd)
     def _orthogonalize(self, m_t, state, group, ns_steps):
-        if HAS_GRAM_NS and m_t.numel() > 1: return _NS(m_t)
+        m_t = torch.nan_to_num(m_t, nan=0.0, posinf=0.0, neginf=0.0)
+        if m_t.numel() <= 1: return m_t
         return _compiled_newton_schulz(m_t, steps=ns_steps)
 
     @torch.no_grad()
@@ -71,7 +74,9 @@ class _MuonBase(torch.optim.Optimizer):
                 O_t = self._orthogonalize(m_t, state, group, ns_steps)
                 O_t = O_t / (O_t.norm(dim=0, keepdim=True) + 1e-8)  # Muon+
                 A, B = p.shape[0], p.shape[1]
-                scale = 0.2 * math.sqrt(max(A, B))
+                # ponytail: SCT Stiefel — effective dim = min(d1,d2) if non-square
+                d_eff = min(A, B) if A != B else max(A, B)
+                scale = 0.2 * math.sqrt(d_eff)
                 p.add_(O_t.to(p.dtype), alpha=-lr * scale * lr_scale)
 
 
@@ -82,20 +87,30 @@ class LotusMuon(_MuonBase):
     def _has_momentum(self, state): return 'buf_p' in state
     def _init_momentum(self, p, state, group):
         d1, d2 = p.shape; r = min(group['rank'], d1, d2)
-        state['buf_p'] = torch.zeros(d1, r, dtype=torch.bfloat16, device=p.device)
-        state['buf_q'] = torch.zeros(d2, r, dtype=torch.bfloat16, device=p.device)
+        # ponytail: random orthonormal columns — covers directions isotropically from step 0
+        bp0 = torch.randn(d1, r, dtype=torch.float32, device=p.device) / (d1 ** 0.5)
+        bp0 = bp0 / (bp0.norm(dim=0, keepdim=True).clamp(min=1e-8))
+        bq0 = torch.randn(d2, r, dtype=torch.float32, device=p.device) / (d2 ** 0.5)
+        bq0 = bq0 / (bq0.norm(dim=0, keepdim=True).clamp(min=1e-8))
+        state['buf_p'] = bp0
+        state['buf_q'] = bq0
     def _update_momentum(self, p, state, grad, momentum):
         bp, bq = state['buf_p'], state['buf_q']
-        bp.mul_(momentum).add_(grad.to(bp.dtype) @ bq)
-        bq.mul_(momentum).add_(grad.to(bq.dtype).T @ bp)
+        old_bp = bp.clone()
+        bp.mul_(momentum).add_(grad.float() @ bq.float())
+        bq.mul_(momentum).add_(grad.float().T @ old_bp.float())
+        # ponytail: column L2 norm — prevents unbounded buffer growth (LOTUS §3.2)
+        bp_norm = bp.norm(dim=0, keepdim=True).clamp(min=1e-8)
+        bq_norm = bq.norm(dim=0, keepdim=True).clamp(min=1e-8)
+        bp.div_(bp_norm); bq.div_(bq_norm)
         return bp @ bq.T
     def _orthogonalize(self, m_t, state, group, ns_steps):
-        # ponytail: D7 — NS on bp/bq (d×r) separately instead of m_t (d×d). 64× cheaper at r=8.
         bp, bq = state['buf_p'], state['buf_q']
+        bp = torch.nan_to_num(bp, nan=0.0, posinf=0.0, neginf=0.0)
+        bq = torch.nan_to_num(bq, nan=0.0, posinf=0.0, neginf=0.0)
         if bp.norm() < 1e-8 or bq.norm() < 1e-8:
-            return m_t  # ponytail: zero momentum → skip NS
-        if HAS_GRAM_NS and bp.numel() > 1:
-            return _NS(bp) @ _NS(bq).T
+            return m_t
+        # ponytail: gram_newton_schulz package produces NaN on SCT matrices; use fallback
         return _compiled_newton_schulz(bp, steps=ns_steps) @ _compiled_newton_schulz(bq, steps=ns_steps).T
 
 
@@ -113,8 +128,9 @@ class NorLotusMuon(LotusMuon):
 # ── Schedule-Free wrapper ───────────────────────────────────────────────
 
 class _ScheduleFreeWrapper:
-    def __init__(self, base_optimizer, beta=0.9, gamma_factor=2.0):
+    def __init__(self, base_optimizer, beta=0.9, gamma_factor=0.5):
         self.base_optimizer = base_optimizer; self.beta = beta; self.gamma_factor = gamma_factor; self._state = {}
+        self._on_after_step = None  # callback: fn(params) called after optimizer.step(), before z_new
     @property
     def param_groups(self): return self.base_optimizer.param_groups
     def zero_grad(self, set_to_none=True): self.base_optimizer.zero_grad(set_to_none=set_to_none)
@@ -128,6 +144,8 @@ class _ScheduleFreeWrapper:
             if s is None: self._state[p] = {'x': p.data.clone(), 'z': p.data.clone(), 't': 0}
             p.data.copy_(self._state[p]['z'])
         self.base_optimizer.step()
+        if self._on_after_step is not None:
+            self._on_after_step(params)
         for g in self.base_optimizer.param_groups: g['lr'] = g['lr'] / self.gamma_factor
         for p in params:
             if p.grad is None: continue
@@ -146,13 +164,14 @@ class _ScheduleFreeWrapper:
 @register("optimizer", "hybrid_muon_adamw")
 class buselOptimizerEngine:
     _MUON_EXCLUDE = ("router", "embed")
-    _LR_GROUPS = ("attn", "ffn", "mtp", "norm", "embed", "router")
+    _LR_GROUPS = ("attn", "ffn", "mtp", "norm", "embed", "router", "spectral")
 
     @staticmethod
     def _classify_param(name):
         n = name.lower()
         if "router" in n: return "router"
         if "embed" in n: return "embed"
+        if n.endswith(".u") or n.endswith(".v") or n.endswith(".s"): return "spectral"
         if "norm" in n: return "norm"
         if "mtp" in n: return "mtp"
         if "ffn" in n or "blackboard" in n: return "ffn"
@@ -160,28 +179,37 @@ class buselOptimizerEngine:
         if "moe" in n: return "ffn"
         return "attn"
 
-    def __init__(self, *modules, lr_muon=0.002, lr_adamw=0.0002, lotus_rank=8, sf_beta=0.9, sf_gamma_factor=2.0):
+    def __init__(self, *modules, lr_muon=0.002, lr_adamw=0.0002, lotus_rank=8, sf_beta=0.9, sf_gamma_factor=0.5, lr_multipliers=None):
         muon_params, adamw_params = [], []
+        _adam_only = os.environ.get("BUSEL_ADAM_ONLY", "0") == "1"
         for module in modules:
             for name, param in module.named_parameters():
                 if not param.requires_grad: continue
-                if param.ndim == 2 and all(t not in name for t in self._MUON_EXCLUDE):
+                if not _adam_only and param.ndim == 2 and all(t not in name for t in self._MUON_EXCLUDE) and min(param.shape) >= 16:
                     muon_params.append((name, param))
                 else: adamw_params.append((name, param))
 
         mults = {k: 1.0 for k in self._LR_GROUPS}
-        mults["embed"] = 0.5; mults["router"] = 0.5
+        mults["embed"] = 0.5; mults["router"] = 0.5; mults["spectral"] = 2.0
+        if lr_multipliers:
+            for k, v in lr_multipliers.items():
+                if k in mults:
+                    mults[k] = float(v)
 
         def _build_groups(items):
             groups = {k: [] for k in self._LR_GROUPS}
             for name, p in items: groups[self._classify_param(name)].append(p)
             return [{"params": v, "lr_mult": mults[k], "name": k} for k, v in groups.items() if v]
 
-        print(f"🪷 [SF-NorMuon]: NorMuon + LOTUS rank={lotus_rank} + Schedule-Free")
-        self.opt_muon = _ScheduleFreeWrapper(
-            NorLotusMuon(_build_groups(muon_params), lr=lr_muon, momentum=0.95, rank=lotus_rank, cautious_wd=True),
-            beta=sf_beta, gamma_factor=sf_gamma_factor
-        )
+        muon_groups = _build_groups(muon_params)
+        if muon_groups:
+            print(f"🪷 [SF-NorMuon]: NorMuon + LOTUS rank={lotus_rank} + Schedule-Free")
+            self.opt_muon = _ScheduleFreeWrapper(
+                NorLotusMuon(muon_groups, lr=lr_muon, momentum=0.95, rank=lotus_rank, cautious_wd=True),
+                beta=sf_beta, gamma_factor=sf_gamma_factor
+            )
+        else:
+            self.opt_muon = None
         
         # AdEMAMix8bit: 1.3× faster convergence than AdamW, same 8-bit memory
         try:
@@ -195,18 +223,40 @@ class buselOptimizerEngine:
         
         self.opt_adamw = _ScheduleFreeWrapper(adamw_opt, beta=sf_beta, gamma_factor=sf_gamma_factor)
 
-        muon_count = sum(p.numel() for g in self.opt_muon.base_optimizer.param_groups for p in g['params'])
+        muon_count = sum(p.numel() for g in self.opt_muon.base_optimizer.param_groups for p in g['params']) if self.opt_muon is not None else 0
         adamw_count = sum(p.numel() for g in self.opt_adamw.base_optimizer.param_groups for p in g['params'])
         total = muon_count + adamw_count
         print(f"⚙️  Hybrid optimiser routing: {muon_count:,} → sf_normuon ({100*muon_count/total:.1f}%), {adamw_count:,} → AdamW ({100*adamw_count/total:.1f}%)")
 
     def zero_grad(self, set_to_none=True):
-        self.opt_muon.zero_grad(set_to_none=set_to_none)
+        if self.opt_muon is not None:
+            self.opt_muon.zero_grad(set_to_none=set_to_none)
         self.opt_adamw.zero_grad(set_to_none=set_to_none)
 
-    def step(self):
-        self.opt_muon.step()
+    def step(self, model=None):
+        if model is not None:
+            from model.layers import retract_all
+            def _retract_spectral(params):
+                for m in model.modules():
+                    if m.__class__.__name__ == 'SpectralLinear':
+                        m.retract()
+            if self.opt_muon is not None:
+                self.opt_muon._on_after_step = _retract_spectral
+            self.opt_adamw._on_after_step = _retract_spectral
+        if self.opt_muon is not None:
+            self.opt_muon.step()
         self.opt_adamw.step()
+
+    def state_dict(self):
+        sd = {'adamw': self.opt_adamw.state_dict()}
+        if self.opt_muon is not None:
+            sd['muon'] = self.opt_muon.state_dict()
+        return sd
+
+    def load_state_dict(self, sd):
+        self.opt_adamw.load_state_dict(sd['adamw'])
+        if 'muon' in sd and self.opt_muon is not None:
+            self.opt_muon.load_state_dict(sd['muon'])
 
 # ── EMA ──────────────────────────────────────────────────────────────────
 
@@ -218,8 +268,8 @@ class EMA:
     @torch.no_grad()
     def update(self, model):
         self._step_count += 1
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point: self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+        for name, p in model.named_parameters():
+            if name in self.shadow: self.shadow[name].mul_(self.decay).add_(p.detach().float(), alpha=1.0 - self.decay)
 
     def state_dict(self):
         return {"decay": self.decay, "step": self._step_count, "shadow": self.shadow}
