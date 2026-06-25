@@ -1,8 +1,0 @@
-name: pretrain-only
-stages:
-  - name: pretrain
-    data_preset: shpak
-    checkpoint_out: checkpoints/busel_pretrain_FINAL.pt
-    params:
-      profile_name: shpak
-global_params: {}

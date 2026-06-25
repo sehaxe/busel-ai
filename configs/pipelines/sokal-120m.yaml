@@ -1,0 +1,17 @@
+name: sokal-120m
+stages:
+- name: pretrain
+  data_preset: sokal-120m
+  checkpoint_out: checkpoints/sokal-120m_pretrain_FINAL.pt
+  params:
+    profile_name: sokal-120m
+    no_compile: true
+    max_steps: auto
+- name: sft
+  data_preset: sokal-120m
+  checkpoint_out: checkpoints/sokal-120m_sft_FINAL.pt
+  params:
+    profile_name: sokal-120m
+    no_compile: true
+    max_steps: 200
+global_params: {}

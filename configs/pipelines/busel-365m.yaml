@@ -1,0 +1,17 @@
+name: busel-365m
+stages:
+- name: pretrain
+  data_preset: busel-365m
+  checkpoint_out: checkpoints/busel-365m_pretrain_FINAL.pt
+  params:
+    profile_name: busel-365m
+    no_compile: true
+    max_steps: auto
+- name: sft
+  data_preset: busel-365m
+  checkpoint_out: checkpoints/busel-365m_sft_FINAL.pt
+  params:
+    profile_name: busel-365m
+    no_compile: true
+    max_steps: 2071
+global_params: {}

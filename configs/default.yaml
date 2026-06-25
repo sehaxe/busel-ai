@@ -69,6 +69,7 @@ profiles:
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
+      target_tok_per_param: 80
       warmup_steps: "5%"
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002

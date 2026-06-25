@@ -1,0 +1,17 @@
+name: chizh-9m
+stages:
+- name: pretrain
+  data_preset: chizh-9m
+  checkpoint_out: checkpoints/chizh-9m_pretrain_FINAL.pt
+  params:
+    profile_name: chizh-9m
+    no_compile: true
+    max_steps: auto
+- name: sft
+  data_preset: chizh-9m
+  checkpoint_out: checkpoints/chizh-9m_sft_FINAL.pt
+  params:
+    profile_name: chizh-9m
+    no_compile: true
+    max_steps: 200
+global_params: {}

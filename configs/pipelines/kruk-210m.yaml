@@ -1,0 +1,17 @@
+name: kruk-210m
+stages:
+- name: pretrain
+  data_preset: kruk-210m
+  checkpoint_out: checkpoints/kruk-210m_pretrain_FINAL.pt
+  params:
+    profile_name: kruk-210m
+    no_compile: true
+    max_steps: auto
+- name: sft
+  data_preset: kruk-210m
+  checkpoint_out: checkpoints/kruk-210m_sft_FINAL.pt
+  params:
+    profile_name: kruk-210m
+    no_compile: true
+    max_steps: 1383
+global_params: {}
