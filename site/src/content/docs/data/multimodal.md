@@ -7,15 +7,11 @@ sidebar:
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-busel is a **byte-level** model. Most multimodal models have separate tokenizers for text, image, and audio; busel encodes *everything* — including images and PDFs — as a stream of integer tokens in the same 259-vocab (256 real bytes + 3 reserved markers). The same `BitLinear_a4_8` processes every modality, the same mAR mixes them, the same MTP-4 heads predict them. No per-modality code path, no projection bottleneck, no alignment loss.
+busel is a **byte-level** model. Most multimodal models have separate tokenizers for text, image, and audio; busel encodes *everything* — including images and PDFs — as a stream of integer tokens in the same 277-vocab (256 real bytes + 21 reserved markers). The same `BitLinear_a4_8` processes every modality, the same mAR mixes them, the same MTP-4 heads predict them. No per-modality code path, no projection bottleneck, no alignment loss.
 
-## The 3 reserved token IDs
+## The reserved token IDs
 
-| Token ID | Symbol | Meaning |
-|---:|---|---|
-| **256** | `__MEDIA_START__` | Start of a media payload (image / video / audio / PDF / docx) |
-| **257** | `__MEDIA_END__`   | End of a media payload |
-| **258** | `__DOC_SEP__`     | Cross-document boundary (= `b"\n\n"`) |
+Twenty-one tokens (256-276) handle multimodal markers, modality identifiers, and content metadata. See the [multimodal AGENTS.md](file:///home/sehaxe/busel-ai/multimodal/AGENTS.md) for the full 21-token breakdown.
 
 <Aside type="caution" title="Why tokens, not bytes">
 Python's `bytes` type cannot represent values ≥ 256 — `bytearray.append(256)` raises `ValueError`. So the multimodal stream is a `list[int]` (values 0-258) that `data.pipeline.collate_busel_batch` converts to an `int32` tensor. This is the only correct way to express the multimodal stream in Python.
@@ -71,10 +67,10 @@ For video, the difference is even more dramatic. OpenCV's `cv2.CAP_PROP_FRAME_CO
 from data.pipeline import buselOmnivoreTextExtractor
 
 ext = buselOmnivoreTextExtractor("data_train/multimodal/img_0.png", chunk_size=4096)
-chunk = ext.next_chunk()  # → list[int] with values in [0, 259)
+chunk = ext.next_chunk()  # → list[int] with values in [0, 277)
 ```
 
-The collate function `data.pipeline.collate_busel_batch` converts each chunk to an `int32` tensor. The downstream `StridedFastBLTPatcher` and the model see the same `int32` stream regardless of modality.
+The collate function `data.pipeline.collate_busel_batch` converts each chunk to an `int32` tensor. The downstream `ByteFlowPatcher` and the model see the same `int32` stream regardless of modality.
 
 ### Layout in `data_train/`
 

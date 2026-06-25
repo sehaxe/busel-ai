@@ -14,13 +14,13 @@ This page is a vertical walk-through of what happens during one step of `train.p
 <Steps>
 
 1. **Data fetch** — the [Rust byte streamer](file:///home/sehaxe/busel-ai/site/src/content/docs/data/pipeline.md) reads `B·S·P` bytes from `data_train/`, where `P=4` is the patch stride. Output: `(B, S)` int8 token ids.
-2. **Patching + embedding** — `StridedFastBLTPatcher` folds every 4 bytes into one patch, then `BitLinear_a4_8(259, d_model)` embeds to `(B, S, D)`.
+2. **Patching + embedding** — `ByteFlowPatcher` folds every 4 bytes into one patch, then `BitLinear_a4_8(277, d_model)` embeds to `(B, S, D)`.
 3. **mAR init** — the FIFO streams are zero-initialized (or restored from checkpoint).
 4. **24 × buselBlock** — each block: RMSNorm → [GDN-2 or MLA attention](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/attention.md) → RMSNorm → [MoE FFN](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/moe.md) → [mAR](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/mar.md) mix with prior 4 layers.
 5. **4 MTP heads** — `lm_head` (H_BitLinear) + 4 `BitLinear_a4_8` heads predict `t+1, t+2, t+3, t+4` from rolled-forward hidden states.
 6. **Loss** — `L_main + 0.5·L_2 + 0.25·L_3 + 0.125·L_4 + 0.01·L_aux + 0.001·L_z`.
 7. **Backward** — single `.backward()` through the whole thing, 1-bit STE handles everything.
-8. **Hybrid Muon step** — 2D projection params → Newton-Schulz ×5 + Muon momentum; everything else → AdamW.
+8. **SF-NorLotusMuon + FP8 AdamW step** — 2D projection params → SF-NorLotusMuon (Schedule-Free + NorMuon + LOTUS rank-8, Gram NS + Muon+ column norm); everything else → FP8 AdamW.
 9. **AutoPilot adjustments** — gradient clipping, AGC, weight decay, LR schedule, 3σ dampening.
 10. **Log + checkpoint** — `JSONFormatter` writes to `checkpoints/busel.log.jsonl`; `buselAutoPilot` decides if this is a checkpoint step.
 
@@ -45,7 +45,7 @@ The `train_loader` is an `IterableDataset` backed by [RustByteStreamDataset](fil
 x = self.patch_embed(batch.long())            # (B, S) → (B, S, D)
 ```
 
-The patcher is a stride-4 convolution; see [Patching](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/patching.md) for the byte→patch folding logic.
+The patcher uses adaptive pooling and boundary detection; see [Patching](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/patching.md) for the byte→patch folding logic.
 
 ### Stage 3: mAR init (first step only)
 
@@ -100,20 +100,20 @@ loss.backward()
 
 The BitLinear STE (`x + (round(x/Δ)·Δ - x).detach()` in forward) handles the gradient through the ternary weights. No mixed precision in the STE path; the activations stay in `bf16`/`fp16`.
 
-### Stage 8: Hybrid Muon step
+### Stage 8: SF-NorLotusMuon + FP8 AdamW step
 
-This is the most algorithmically interesting step. Each parameter goes through **either** LOTUS+Muon (rank-8 factorised Muon momentum, orthogonalized) **or** AdamW depending on its shape, then further subdivided by **layer type** for decoupled per-layer LR:
+This is the most algorithmically interesting step. Each parameter goes through **either** SF-NorLotusMuon (Schedule-Free + NorMuon + LOTUS rank-8, Gram NS orthogonalized + Muon+ column norm) **or** FP8 AdamW depending on its shape and name, then further subdivided by **layer type** for decoupled per-layer LR:
 
 ```python
 # training/optimizer.py
-@register("optimizer", "lotus_muon")
+@register("optimizer", "norlotus_muon")
 class buselOptimizerEngine:
     def step(self):
         for sub_group, opt in self.subgroups.items():
-            opt.step()  # Muon for attn/ffn, AdamW for norm/mtp/embed/router
+            opt.step()  # SF-NorLotusMuon for attn/ffn, FP8 AdamW for norm/mtp/embed/router
 ```
 
-The exact routing rule is in [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md). The short version: **2D projection params get LOTUS+Muon (rank-8 factorised, ~85× less optimizer state than full Muon), everything else gets AdamW, and the 6 layer-type sub-groups (attn / ffn / mtp / norm / embed / router) each get their own LR multiplier.**
+The exact routing rule is in [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md). The short version: **2D projection params get SF-NorLotusMuon (LOTUS rank-8, ~85× less optimizer state than full Muon), everything else gets FP8 AdamW, and the 6 layer-type sub-groups (attn / ffn / mtp / norm / embed / router) each get their own LR multiplier.**
 
 ### Stage 9: AutoPilot adjustments
 
@@ -150,9 +150,10 @@ The logger writes one JSON object per event to `checkpoints/busel.log.jsonl`. Se
 |---|---|---|---|---|
 | micro_test | 1k | 0.05s | 0.2s | 1.5s |
 | quick_test | 64k | 0.15s | 0.6s | 4.0s |
-| shpak | 524k | 0.5s | 1.8s | 12s |
-| zubr | 4.2M | 3.5s | 13s | 80s |
-| chyzh | 33M | 28s | 95s | 600s |
+| verabey-27m | 524k | 0.5s | 1.8s | 12s |
+| sokal-60m | 1.0M | 1.5s | 5s | 40s |
+| kruk-120m | 2.1M | 3.5s | 13s | 80s |
+| busel-200m | 8.4M | 14s | 55s | 300s |
 
 (Numbers measured with `compile-mode=default`, BF16 where supported, no recompute.)
 
@@ -160,22 +161,22 @@ The logger writes one JSON object per event to `checkpoints/busel.log.jsonl`. Se
 
 | Goal | What to do |
 |---|---|
-| Verify model is wired right | `uv run train.py --profile quick_test --steps 100` |
-| Profile a single step | `uv run python cli.py profile --profile shpak` |
-| Real training run | `uv run python cli.py autopilot --profile shpak` |
-| Resume from checkpoint | `uv run train.py --profile shpak --resume checkpoints/ckpt_5000.pt` |
-| Run a smaller model on a 8GB GPU | `--profile shpak --ctx-len 1024 --grad-accum 8` |
+| Verify model is wired right | `uv run python cli.py pipeline --name pretrain-only --profile quick_test` |
+| Profile a single step | `uv run python cli.py profile --profile verabey-27m` |
+| Real training run | `uv run python cli.py autopilot --profile verabey-27m` |
+| Resume from checkpoint | `uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --resume checkpoints/ckpt_5000.pt` |
+| Run on 8GB GPU | `--profile verabey-27m --ctx-len 1024 --grad-accum 8` |
 
 ## Where to look in the code
 
 | Component | File | Notes |
 |---|---|---|
-| `train.py::main` | [train.py](file:///home/sehaxe/busel-ai/train.py) | The 10-stage loop |
+| `buselPretrainStage` | [training/stages/pretrain.py](file:///home/sehaxe/busel-ai/training/stages/pretrain.py) | The training loop |
 | `buselModel.forward` | [model/backbone.py](file:///home/sehaxe/busel-ai/model/backbone.py) | Stages 2-5 |
 | `buselOptimizerEngine.step` | [training/optimizer.py](file:///home/sehaxe/busel-ai/training/optimizer.py) | Stage 8 |
 | `buselAutoPilot.step` | [training/autopilot.py](file:///home/sehaxe/busel-ai/training/autopilot.py) | Stage 9 |
 | `JSONFormatter` | [busel_logging.py](file:///home/sehaxe/busel-ai/busel_logging.py) | Stage 10 logging |
-| `save_checkpoint` | [train.py](file:///home/sehaxe/busel-ai/train.py) | Stage 10 disk write |
+| `save_checkpoint` | [model/checkpoint.py](file:///home/sehaxe/busel-ai/model/checkpoint.py) | Stage 10 disk write |
 
 ## See also
 

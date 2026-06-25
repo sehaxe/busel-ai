@@ -1,6 +1,6 @@
 ---
 title: "Config (buselConfig) & profiles"
-description: "The buselConfig dataclass, the 6 profiles (shpak, zubr, chyzh, micro_test, quick_test, default), per-profile hyperparameters, and the validator."
+description: "The buselConfig dataclass, the 12 profiles (chizh-8m, verabey-27m, sokal-60m, kruk-120m, busel-200m, micro_test, quick_test, validation), per-profile hyperparameters, and the validator."
 sidebar:
   order: 7
 ---
@@ -23,13 +23,25 @@ class buselConfig:
     n_hyper: int = 4
     d_ff: int = 2048
     n_layers: int = 24
-    vocab_size: int = 259
+    vocab_size: int = 277
     patch_stride: int = 4
     use_moe: bool = True
     n_shared: int = 2
     n_routed: int = 4
     top_k: int = 1
     d_c: int = 128
+    # Default-ON research features
+    use_sct: bool = True                 # SCT rank-8
+    sct_rank: int = 8
+    use_dropbp: bool = True              # DropBP
+    dropbp_prob: float = 0.3
+    use_rho_loss: bool = True            # RHO-Loss
+    use_dispersion_loss: bool = True     # Dispersion Loss
+    use_progressive_freeze: bool = True  # Progressive Freeze
+    use_ascii_curriculum: bool = True    # ASCII Curriculum
+    selective_backward: bool = True      # LCSB
+    backward_ratio: float = 0.5
+    use_fused_bitlinear: bool = True     # Fused BitLinear Triton
     # Training
     micro_batch_size: int = 16
     grad_accum: int = 1
@@ -67,22 +79,26 @@ class buselConfig:
 
 The full schema is in [busel_config.py](file:///home/sehaxe/busel-ai/busel_config.py). The above is the highlights.
 
-## The 6 profiles
+## The 12 profiles
 
 | Profile | N (params) | Purpose | Hardware |
 |---|---|---|---|
-| `micro_test` | 0.5M | CI / unit tests | Any |
-| `quick_test` | 2M | Smoke test, verify wiring | CPU OK |
-| `shpak` | 11M | Research, single 16GB GPU | RTX 5060 Ti / M2 Pro |
-| `zubr` | 30M | Mid-scale experiments | RTX 4090 / M3 Max |
-| `chyzh` | 165M | Largest pre-training profile | A100 / H100 |
-| `default` | (alias for shpak) | The standard profile | RTX 5060 Ti |
+| `validation` | 2M | Pipeline smoke test | Any |
+| `micro_test` | 2M | CI / unit tests | Any |
+| `quick_test` | 3M | Smoke test, verify wiring | CPU OK |
+| `chizh-8m` | 4M | Small-scale real training | Any GPU |
+| `verabey-27m` | 70M | Research, single 16GB GPU | RTX 5060 Ti / M2 Pro |
+| `sokal-60m` | 170M | Mid-scale experiments | RTX 4090 / M3 Max |
+| `kruk-120m` | 350M | Mid-scale pretraining | A100 / H100 |
+| `busel-200m` | 1B | Large-scale research | Multi-A100 |
 
-The naming comes from birds and Belarusian/Russian folklore:
+The naming comes from birds and Belarusian folklore:
 - **бусел** (busel) = stork
-- **шпак** (shpak) = starling
-- **зубр** (zubr) = European bison
-- **чиж** (chyzh) = Eurasian siskin (small finch)
+- **чиж** (chizh) = Eurasian siskin (small finch)
+- **верабей** (verabey) = sparrow
+- **сокал** (sokal) = falcon
+- **крук** (kruk) = raven
+- **бусел-1b** = stork at 1B scale
 
 ### `micro_test`
 
@@ -116,10 +132,10 @@ quick_test:
 
 **Use for:** smoke testing new code paths, debugging, verifying checkpointing/resume. Trains in ~5 minutes on CPU.
 
-### `shpak` (default for most users)
+### `verabey-27m` (default for most users)
 
 ```yaml
-shpak:
+verabey-27m:
   d_model: 512
   n_heads: 8
   n_hyper: 4
@@ -127,7 +143,7 @@ shpak:
   n_layers: 24
   micro_batch_size: 16
   ctx_len: 4096
-  ctx_warmup: [1024, 2048, 4096]
+  ctx_warmup: [512, 1024, 2048, 4096]
   ctx_warmup_steps: 2000
   use_moe: true
   n_shared: 2
@@ -138,78 +154,104 @@ shpak:
   lr: 0.002
   muon_lr: 0.02
   weight_decay: 0.01
-  max_steps: 12000
-  save_every: 1000
-  eval_every: 200
+  max_steps: 25000
+  save_every: 2500
+  eval_every: 500
+  # Default-ON: SCT, DropBP, RHO-Loss, Dispersion, ProgFreeze,
+  # ASCII Curriculum, LCSB, Fused BitLinear
 ```
 
 **Stats:**
-- 11.0M params (~12 MB checkpoint)
+- ~70M params (~14 MB checkpoint)
 - ~524k tokens/step
 - ~0.5s/step on RTX 5060 Ti, ~1.8s on M2 Pro
 - Fits in 16GB GPU at `compile-mode=default`
 
 **Use for:** research, blog posts, paper experiments, the "I want a real model" use case.
 
-### `zubr`
+### `sokal-60m`
 
 ```yaml
-zubr:
+sokal-60m:
   d_model: 768
   n_heads: 12
   n_hyper: 6
   d_ff: 3072
   n_layers: 28
   micro_batch_size: 8
-  ctx_len: 4096
-  ctx_warmup_steps: 4000
+  ctx_len: 8192
+  ctx_warmup: [1024, 2048, 4096, 8192]
+  ctx_warmup_steps: 3000
   use_moe: true
   n_shared: 2
   n_routed: 8
-  max_steps: 30000
-  save_every: 3000
+  max_steps: 40000
+  save_every: 4000
 ```
 
 **Stats:**
-- 30M params (~35 MB checkpoint)
-- ~4.2M tokens/step
-- ~3.5s/step on RTX 5060 Ti (need 24GB), ~13s on M3 Max
-- Requires 24GB GPU for `compile-mode=default`, 16GB for `reduce-overhead` with `grad_accum=4`
+- ~170M params (~35 MB checkpoint)
+- ~1.0M tokens/step
+- ~1.5s/step on RTX 5060 Ti, ~5s on M3 Max
+- Requires 24GB GPU for `compile-mode=default`
 
-**Use for:** mid-scale experiments, when shpak isn't quite enough but chyzh is overkill.
+**Use for:** mid-scale experiments, long-context training.
 
-### `chyzh`
+### `kruk-120m`
 
 ```yaml
-chyzh:
+kruk-120m:
   d_model: 1024
   n_heads: 16
   n_hyper: 8
   d_ff: 4096
   n_layers: 32
   micro_batch_size: 4
-  grad_accum: 4                       # effective batch 16
+  grad_accum: 4
   ctx_len: 8192
   ctx_warmup: [1024, 2048, 4096, 8192]
-  ctx_warmup_steps: 8000
+  ctx_warmup_steps: 4000
   use_moe: true
   n_shared: 2
   n_routed: 16
-  max_steps: 80000
+  max_steps: 60000
   save_every: 5000
 ```
 
 **Stats:**
-- 165M params (~180 MB checkpoint)
-- ~33M tokens/step
-- ~28s/step on A100, ~95s on M3 Max (with grad accum)
+- ~350M params (~70 MB checkpoint)
+- ~33M tokens/step (effective)
+- ~3.5s/step on A100
 - Requires 40GB+ GPU
 
-**Use for:** the largest profile. Chinchilla-optimal for ~12B training tokens.
+**Use for:** mid-scale pretraining, scaling law validation.
 
-### `default` (alias for shpak)
+### `busel-200m`
 
-Identical to `shpak` for backward compat.
+```yaml
+busel-200m:
+  d_model: 1536
+  n_heads: 24
+  n_hyper: 12
+  d_ff: 6144
+  n_layers: 40
+  micro_batch_size: 2
+  grad_accum: 8
+  ctx_len: 32768
+  ctx_warmup: [2048, 4096, 8192, 16384, 32768]
+  ctx_warmup_steps: 5000
+  use_moe: true
+  n_shared: 2
+  n_routed: 24
+  max_steps: 120000
+  save_every: 10000
+```
+
+**Stats:**
+- ~1B params (~200 MB checkpoint)
+- ~8.4M tokens/step
+- Multi-GPU required (80GB+)
+- Chinchilla-optimal for ~37B training tokens.
 
 ## Loading a profile
 
@@ -224,8 +266,8 @@ config = buselConfig.from_yaml("configs/default.yaml", profile="chyzh")
 CLI:
 
 ```bash
-uv run train.py --profile shpak
-uv run train.py --profile shpak --ctx-len 2048 --lr 0.001
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --ctx-len 2048 --lr 0.001
 ```
 
 CLI args override YAML values; YAML values override dataclass defaults.
@@ -241,8 +283,8 @@ def __post_init__(self):
     assert self.d_model % self.n_hyper == 0, \
         f"d_model ({self.d_model}) must be divisible by n_hyper ({self.n_hyper})"
     # vocab_size is FIXED
-    assert self.vocab_size == 259, \
-        f"vocab_size must be 259 (byte-level), got {self.vocab_size}"
+    assert self.vocab_size == 277, \
+        f"vocab_size must be 277 (byte-level), got {self.vocab_size}"
     # MoE constraints
     if self.use_moe:
         assert self.n_routed >= 2, "MoE needs at least 2 routed experts"
@@ -272,23 +314,24 @@ def effective_max_steps(self) -> int:
 
 `_chinchilla_solve()` computes the Chinchilla-optimal step count from the non-embedding param count and the per-step tokens. See [Curriculum](file:///home/sehaxe/busel-ai/site/src/content/docs/training/curriculum.md) for the math.
 
-## v5.8 opt-in research flags
+## Default-ON features (no opt-in required)
 
-Two new flags landed in v5.8. Both relate to **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh since v6.0). The Sparse-BitNet 6:8 flag was removed in the v6.2 cleanup (no CUDA speedup, unproven at busel scale). The 2-mode v6.x comparison script is `uv run python tests/v58_profile.py`.
+All features below are wired ON by default in `buselPretrainConfig`:
 
-| Flag | Section | Default | Effect on shpak 52.8M (batch=16 ctx=4096, 10 steps) |
-|---|---|---|---|
-| `selective_backward` | `model:` | `False` | When ON, activates LCSB (see `backward_ratio`). |
-| `backward_ratio` | `model:` | `1.0` | Used when `selective_backward=True`. Practical: 0.3-0.7. **−44 % step, −25 % mem, +80 % tok/s at 0.5.** |
-
-To flip LCSB (default ON in shpak/zubr/chyzh since v6.0):
-
-```yaml
-# configs/default.yaml — shpak profile
-model:
-  selective_backward: true
-  backward_ratio: 0.5
-```
+| Flag | Default | Effect |
+|---|---|---|
+| `use_sct` | `True` | SCT rank-8 — FFN weight compression ×4-8 |
+| `sct_rank` | `8` | SCT rank |
+| `use_dropbp` | `True` | DropBP — 30% layers skip backward |
+| `dropbp_prob` | `0.3` | DropBP probability |
+| `use_rho_loss` | `True` | RHO-Loss — gradient only for hard tokens |
+| `use_dispersion_loss` | `True` | Dispersion Loss — prevents embedding condensation |
+| `use_progressive_freeze` | `True` | Progressive Freeze — freeze up to 75% layers |
+| `use_ascii_curriculum` | `True` | ASCII Curriculum — 7-bit first 30% of training |
+| `selective_backward` | `True` | LCSB — selective per-layer backward |
+| `backward_ratio` | `0.5` | LCSB ratio — −44% step, −25% mem |
+| `use_fused_bitlinear` | `True` | Fused BitLinear Triton kernel (eager mode) |
+| `use_ema` | `True` | EMA of weights via Schedule-Free interpolation |
 
 ## How to add a new profile
 
@@ -315,7 +358,7 @@ That's it. The base dataclass defaults are inherited, and the YAML overrides onl
 Every field is a CLI flag. Dashes replace underscores:
 
 ```bash
-uv run train.py --profile shpak \
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m \
                 --d-model 768 \
                 --n-layers 30 \
                 --ctx-len 2048 \
@@ -324,7 +367,7 @@ uv run train.py --profile shpak \
                 --compile-mode reduce-overhead
 ```
 
-Run `uv run train.py --help` for the full list.
+Run `uv run python cli.py pipeline --help` for the full list.
 
 ## Common patterns
 
@@ -332,28 +375,28 @@ Run `uv run train.py --help` for the full list.
 
 ```bash
 # 8GB GPU: smaller batch, smaller ctx
-uv run train.py --profile shpak --micro-batch-size 4 --ctx-len 2048
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --micro-batch-size 4 --ctx-len 2048
 
 # 24GB GPU: larger batch, larger ctx
-uv run train.py --profile shpak --micro-batch-size 32 --ctx-len 8192
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --micro-batch-size 32 --ctx-len 8192
 ```
 
 ### Continue a run with a smaller LR (anneal)
 
 ```bash
 # Original run
-uv run train.py --profile shpak --max-steps 20000 --lr 0.002
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --max-steps 20000 --lr 0.002
 # Anneal: lower LR for last 20%
-uv run train.py --profile shpak --resume checkpoints/ckpt_16000.pt --max-steps 20000 --lr 0.0002
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --resume checkpoints/ckpt_16000.pt --max-steps 20000 --lr 0.0002
 ```
 
 ### Reproduce a paper experiment
 
 ```bash
 # Save the exact config
-uv run train.py --profile shpak --save-config my_run.yaml
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --save-config my_run.yaml
 # Reproduce later
-uv run train.py --config my_run.yaml
+uv run python cli.py pipeline --name pretrain-only --config my_run.yaml
 ```
 
 ## Where to look in the code

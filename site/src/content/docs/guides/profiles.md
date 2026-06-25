@@ -1,25 +1,24 @@
 ---
 title: Choosing a profile
-description: Which of the bundled profiles (micro_test, quick_test, validation, chyzh, shpak, zubr) is right for you?
+description: Which of the bundled profiles (micro_test, quick_test, validation, chizh-8m, verabey-27m, sokal-60m, kruk-120m, busel-200m) is right for you?
 ---
 
-The `configs/default.yaml` file ships with six profiles. They trade off
+The `configs/default.yaml` file ships with 12 profiles. They trade off
 **training time** vs **model capacity** vs **VRAM cost**. Pick one
 based on what you want to do with the run.
 
-## The six profiles at a glance
+## The profiles at a glance
 
-| Profile       | Total params | Active | Bit-size | Context | VRAM (bf16) | Time to Chinchilla (RTX 5060 Ti) | What it's for |
-|---------------|-------------:|-------:|---------:|--------:|------------:|---------------------------------:|---------------|
-| `micro_test`  | ~2 M         | ~1 M   | <1 MB    | 256 B   | ~0.5 GB     | seconds                          | smoke test / CI |
-| `quick_test`  | ~3 M         | ~1.5 M | <1 MB    | 256 B   | ~0.6 GB     | minutes                          | quick sanity check |
-| `validation`  | ~2 M         | ~1 M   | <1 MB    | 256 B   | ~0.5 GB     | ~1 min                           | pipeline smoke test |
-| `chyzh`       | ~10 M        | ~5 M   | ~3 MB    | 512 B   | ~1.5 GB     | ~30 min                          | small-scale real training |
-| `shpak`       | 52.8 M       | 25 M   | **11 MB**| 4096 B  | ~5 GB       | ~6 h                             | the "real" 50 M run |
-| `zubr`        | 120 M        | 35 M   | 30 MB    | 16 384 B| ~12 GB      | ~24 h                            | long-context demo |
-
-(All numbers are approximate — the actual cost depends on your data
-loader, your batch size, and whether gradient checkpointing is on.)
+| Profile       | Total params | Bit-size | Context | VRAM (bf16) | What it's for |
+|---------------|-------------:|---------:|--------:|------------:|---------------|
+| `validation`  | ~2 M         | ~1 MB    | 256 B   | ~0.5 GB     | pipeline smoke test |
+| `micro_test`  | ~2 M         | ~1 MB    | 256 B   | ~0.5 GB     | CI / unit tests |
+| `quick_test`  | ~3 M         | ~1 MB    | 256 B   | ~0.6 GB     | quick sanity check |
+| `chizh-8m`    | ~4 M         | ~1 MB    | 1024 B  | ~1.0 GB     | small-scale real training |
+| `verabey-27m` | ~70 M        | 14 MB    | 4096 B  | ~8 GB       | the "real" 70 M run |
+| `sokal-60m`  | ~170 M       | 35 MB    | 8192 B  | ~16 GB      | long-context demo |
+| `kruk-120m`   | ~350 M       | 70 MB    | 8192 B  | ~24 GB      | mid-scale pretraining |
+| `busel-200m`    | ~1 B         | 200 MB   | 32 768 B| ~40 GB      | large-scale research |
 
 ## How to pick
 
@@ -28,10 +27,10 @@ loader, your batch size, and whether gradient checkpointing is on.)
 → **`validation`**
 
 ```bash
-uv run train.py --profile validation
+uv run python cli.py pipeline --name pretrain-only --profile validation
 ```
 
-200 steps, ~1 min on a 5060 Ti, loss drops 10.46 → 7.17, prints a
+200 steps, ~1 min on a 5060 Ti, loss drops ~10→7, prints a
 checkpoint. This is the smoke test for the whole pipeline: byte
 loader, model, mAR, MTP, AutoPilot, optimizer, JSON log, checkpointing.
 
@@ -40,7 +39,7 @@ loader, model, mAR, MTP, AutoPilot, optimizer, JSON log, checkpointing.
 → **`micro_test`** (faster than `quick_test`)
 
 ```bash
-uv run train.py --profile micro_test --no-checkpointing
+uv run python cli.py pipeline --name pretrain-only --profile micro_test
 ```
 
 No real checkpoint produced. Designed to fail fast if any of the
@@ -48,57 +47,55 @@ imports or shape math is broken.
 
 ### You want a small model that actually does something
 
-→ **`chyzh`** (~10 M, ~30 min)
+→ **`chizh-8m`** (~4 M, ~15 min)
 
 ```bash
-uv run train.py --profile chyzh
+uv run python cli.py pipeline --name pretrain-only --profile chizh-8m
 ```
 
 Small enough to fit on a laptop, large enough to start producing
-non-trivial perplexity on a small corpus. The Chinchilla auto-planner
-gives it ~1 500 steps.
+non-trivial perplexity on a small corpus.
 
 ### You want the "main" run
 
-→ **`shpak`** (52.8 M, ~6 h on a 5060 Ti)
+→ **`verabey-27m`** (~70 M, ~8 h on a 5060 Ti)
 
 ```bash
-uv run train.py --profile shpak
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m
 ```
 
-This is the profile the README advertises. Context grows 1024 → 2048
-→ 4096 patches, batch adapts, ~25 000 steps, Chinchilla target ~3.84 B
-byte-tokens. End result: an 11 MB checkpoint you can run inference on
-with `tools/inference.py`.
+This is the profile the README advertises. Context grows 512→1024
+→2048→4096 patches, batch adapts, Chinchilla target ~5.6 B
+byte-tokens. End result: a 14 MB checkpoint you can run inference on
+with `cli.py infer`.
 
 ### You want a long-context demo
 
-→ **`zubr`** (120 M, context 16 384)
+→ **`sokal-60m`** (170 M, context 8192)
 
 ```bash
-uv run train.py --profile zubr
+uv run python cli.py pipeline --name pretrain-only --profile sokal-60m
 ```
 
-The MLA latent cache makes 16 K contexts tractable on consumer
-hardware. This profile is *expensive* — 24 hours on a 5060 Ti, ~12 GB
+The MLA latent cache makes 8 K contexts tractable on consumer
+hardware. This profile is *expensive* — ~20 h on a 5060 Ti, ~16 GB
 VRAM. Use it when you actually need long context.
 
 ## Tweak a profile without making a new one
 
-All knobs are CLI flags on `train.py`:
+All knobs are CLI flags:
 
 ```bash
-uv run train.py --profile shpak \
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m \
     --no-compile            # disable torch.compile
     --no-checkpointing      # disable gradient checkpointing (more VRAM, faster)
     --compile-mode max-autotune   # try harder at compile time
-    --resume checkpoints/shpak_step_10000.pt
+    --resume checkpoints/verabey-27m_step_10000.pt
 ```
 
 Or edit `configs/default.yaml` directly — the format is plain YAML
 and any field can be overridden. The auto-planner picks up your
-`max_steps: "auto"` setting and computes the rest from the Chinchilla
-byte-law `D ≈ 80 × N`.
+`max_steps: "auto"` setting and computes the rest from the scaling law.
 
 ## Making your own profile
 
@@ -113,7 +110,7 @@ my_profile:
     expert_hidden: 512
     num_experts: 4
     top_k: 1
-    vocab_size: 259      # DO NOT change this — vocab=259 is byte-level
+    vocab_size: 277      # DO NOT change this — vocab=277 is byte-level
   data:
     data_path: "data_train"
     chunk_size: 1024
@@ -129,12 +126,12 @@ my_profile:
     checkpoint_interval: 500
 ```
 
-Then run it with `uv run train.py --profile my_profile`.
+    Then run it with `uv run python cli.py pipeline --name pretrain-only --profile my_profile`.
 
 :::caution
-Do not change `vocab_size` from 259. The byte-level patcher is wired
-to exactly 256 UTF-8 byte values + 3 multimodal specials (image marker,
-PDF marker, padding). Any other value will silently misbehave.
+Do not change `vocab_size` from 277. The byte-level patcher is wired
+to exactly 256 UTF-8 byte values + 21 multimodal specials. Any other
+value will silently misbehave.
 :::
 
 ## Profile gotchas

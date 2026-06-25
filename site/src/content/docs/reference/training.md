@@ -1,6 +1,6 @@
 ---
 title: "Training classes"
-description: "API reference for buselOptimizerEngine (Hybrid Muon + AdamW), buselAutoPilot (AGC, 3σ dampening), buselLossEngine (cross-entropy + MTP + MoE), and buselCurriculum."
+description: "API reference for buselOptimizerEngine (SF-NorLotusMuon + FP8 AdamW), buselAutoPilot (AGC, 3σ dampening), buselLossEngine (cross-entropy + MTP + MoE), and buselCurriculum."
 sidebar:
   order: 2
 ---
@@ -9,22 +9,18 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 This page is the API reference for the `training/` package. Every class listed here is **registered** in the busel plugin system, so you can swap any of them with `@register("kind", "name")` decorators — see [Registry](file:///home/sehaxe/busel-ai/site/src/content/docs/reference/registry.md).
 
-## `buselOptimizerEngine` — LOTUS+Muon + AdamW (default)
+## `buselOptimizerEngine` — SF-NorLotusMuon + FP8 AdamW (default)
 
 ```python
 # training/optimizer.py
-@register("optimizer", "lotus_muon")
+@register("optimizer", "norlotus_muon")
 class buselOptimizerEngine:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 0.002,             # AdamW base LR (per sub-group multiplier)
-        muon_lr: float = 0.02,         # Muon LR is 10× AdamW's by convention
-        momentum: float = 0.95,
-        ns_steps: int = 5,
-        weight_decay: float = 0.0,
-        adamw_betas: tuple = (0.9, 0.95),
-        adamw_eps: float = 1e-8,
+        lr: float = 0.002,             # FP8 AdamW base LR (per sub-group multiplier)
+        muon_lr: float = 0.02,         # SF-NorLotusMuon LR is 10× AdamW's by convention
+        momentum: float = 0.95,        # Handled by SF interpolation
         lotus_rank: int = 8,           # LOTUS rank-r factorisation
         lotus_lr_scale: float = 0.5,   # LOTUS effective LR scale
         lr_multipliers: dict | None = None,  # per sub-group multiplier
@@ -32,7 +28,7 @@ class buselOptimizerEngine:
         ...
 ```
 
-The hybrid optimizer. See [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md) for the algorithm details. The default `optimizer_type="lotus_muon"` is set in `buselPretrainConfig`. The pre-LOTUS pure-Muon variant is still selectable via `optimizer_type="muon"` (registers under `@register("optimizer", "hybrid_muon_adamw")`) for ablation.
+The hybrid optimizer. Uses SF-NorLotusMuon (Schedule-Free + NorMuon + LOTUS rank-8, Gram NS + Muon+ column norm) for 2D params and FP8 AdamW for everything else. See [Optimizer](file:///home/sehaxe/busel-ai/site/src/content/docs/training/optimizer.md) for the algorithm details. The default `optimizer_type="norlotus_muon"` is set in `buselPretrainConfig`.
 
 **Methods:**
 
@@ -54,7 +50,7 @@ def set_lr(self, lr: float, muon_lr: float | None = None) -> None:
     the per-subgroup multipliers are re-applied automatically."""
 ```
 
-**Usage in `train.py`:**
+**Usage in `buselPretrainStage`:**
 
 ```python
 optimizer = buselOptimizerEngine(
@@ -65,10 +61,6 @@ optimizer = buselOptimizerEngine(
     lotus_lr_scale=cfg.lotus_lr_scale,   # default 0.5
     lr_multipliers=cfg.lr_multipliers,   # default {attn:1, ffn:1, mtp:1, norm:1, embed:0.5, router:0.5}
 )
-# ... step ...
-loss.backward()
-optimizer.step()
-optimizer.zero_grad()
 ```
 
 ## `buselAutoPilot` — the cybernetic layer
@@ -246,15 +238,16 @@ def build_targets(input_ids: Tensor, mtp_depth: int = 4) -> Tensor:
 
 Pure function, no state. See [MTP-4](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/mtp.md) for why this matters.
 
-## `newton_schulz_5` — the orthogonalization
+## `StandardNewtonSchulz` — the orthogonalization
 
 ```python
-# training/optimizer.py
-def newton_schulz_5(X: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
-    """Approximate orthogonalization via Newton-Schulz iteration."""
+# gram_newton_schulz package (primary path)
+from gram_newton_schulz import StandardNewtonSchulz
 ```
 
-Used inside `buselOptimizerEngine.step()`. Not normally called directly, but exposed for tests and custom Muon implementations.
+Used inside `buselOptimizerEngine.step()`. Falls back to internal
+`_newton_schulz_core` (quintic, 5 iterations) if package unavailable.
+Not normally called directly, but exposed for tests and custom Muon implementations.
 
 ## `is_muon_param` — the routing rule
 
@@ -280,32 +273,9 @@ class buselAttnOnlyMuon(buselOptimizerEngine):
 
 ### Exponential Moving Average (EMA) of weights
 
-```python
-# training/optimizer.py
-@register("optimizer", "ema")
-class EMAState:
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
-        self.shadow = {n: p.detach().clone() for n, p in model.named_parameters()}
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        for n, p in model.named_parameters():
-            self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
-
-    def apply_shadow(self, model: nn.Module) -> dict:
-        """Swap model params for EMA shadow; return originals for restore."""
-        originals = {}
-        for n, p in model.named_parameters():
-            originals[n] = p.detach().clone()
-            p.data.copy_(self.shadow[n])
-        return originals
-```
-
 **On by default** (`use_ema=True`, `ema_decay=0.999` in `buselPretrainConfig`).
-The EMA shadow is updated every step. For evaluation / inference, use `apply_shadow` to swap in the EMA weights; for checkpoints, the EMA shadow is saved alongside the model state.
-
-**Cost:** every checkpoint grows by ~model_size in EMA shadow (fp32). For shpak (52.8 M params), that's ~211 MB extra per checkpoint. Worth it: EMA-smoothed weights typically train 10-15 % fewer steps to the same loss.
+The EMA shadow is updated every step via Schedule-Free interpolation.
+For evaluation / inference, the EMA-smoothed weights are used automatically.
 
 ### Selective activation checkpointing
 

@@ -107,7 +107,6 @@ def find_latest_checkpoint():
 
 def detect_device():
     if torch.cuda.is_available(): return "cuda"
-    if torch.backends.mps.is_available(): return "mps"
     return "cpu"
 
 
@@ -116,7 +115,7 @@ def load_model(cfg, checkpoint_path, device, compile_inference: bool = False):
     patcher = StridedFastBLTPatcher(d_model=cfg.d_model).to(device)
     model = buselModel(cfg).to(device)
 
-    target_dtype = torch.bfloat16 if device == "cuda" else (torch.float16 if device == "mps" else torch.float32)
+    target_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     for obj in [model, patcher]:
         for module in obj.modules():
             if "RMSNorm" in module.__class__.__name__:
@@ -215,8 +214,8 @@ def generate_stream(model, patcher, prompt, device,
     already_generated = set(prompt_bytes)
     undecoded_tail = bytearray()
     
-    autocast_dtype = torch.bfloat16 if device == "cuda" else (torch.float16 if device == "mps" else torch.float32)
-    autocast_enabled = device in ("cuda", "mps")
+    autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    autocast_enabled = device == "cuda"
     
     for _ in range(max_new_tokens):
         # 🎯 КРИТИЧЕСКИЙ ФИКС: Используем ВЕСЬ промпт, не обрезаем!

@@ -99,7 +99,8 @@ The busel project defines these `kind` namespaces:
 | Kind | Built-in names | What it controls |
 |---|---|---|
 | `attention` | `gdn2`, `mla` | Linear / full attention modules |
-| `optimizer` | `muon`, `hybrid_muon_adamw` | Optimizer implementations |
+| `optimizer` | `norlotus_muon`, `lotus_muon`, `hybrid_muon_adamw`, `fp8_adamw` | Optimizer implementations |
+| `stage` | `pretrain`, `sft`, `dpo`, `eval`, `grpo` | Pipeline stages |
 | `autopilot` | `v6` | AutoPilot versions |
 | `curriculum` | `doubling` | Sequence length warmup |
 | `loss` | `mtp` | Loss formulations |

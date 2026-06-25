@@ -9,7 +9,7 @@ export default defineConfig({
 		starlight({
 			title: 'Busel AI',
 			description:
-				'Sovereign 1.58-bit LLM with mAR residuals, hybrid GDN-2/MLA attention, byte-level patching, and MTP-4. Trains on consumer hardware.',
+				'Sovereign 1.58-bit LLM with mAR residuals, hybrid GDN-2/MLA/NSA attention, SCT compression, Fused BitLinear Triton kernel, byte-level patching, and MTP-4. Trains on consumer hardware.',
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/sehaxe/busel-ai' },
 			],
@@ -28,7 +28,7 @@ export default defineConfig({
 						{ slug: 'architecture/overview', label: 'Overview & design philosophy' },
 						{ slug: 'architecture/one-bit-weights', label: '1.58-bit weights (BitLinear + H_BitLinear)' },
 						{ slug: 'architecture/patching', label: 'Byte-level patching (FastBLT)' },
-						{ slug: 'architecture/attention', label: 'Hybrid attention (GDN-2 + MLA)' },
+						{ slug: 'architecture/attention', label: 'Hybrid attention (GDN-2 + MLA + NSA)' },
 						{ slug: 'architecture/mar', label: 'mAR — Manifold Constrained Attention Residuals' },
 						{ slug: 'architecture/moe', label: 'MoE with Blackboard Memory' },
 						{ slug: 'architecture/mtp', label: 'Multi-Token Prediction (MTP-4)' },
@@ -38,7 +38,7 @@ export default defineConfig({
 					label: 'Training',
 					items: [
 						{ slug: 'training/training-guide', label: 'How a training run works' },
-						{ slug: 'training/optimizer', label: 'Hybrid Muon + AdamW' },
+						{ slug: 'training/optimizer', label: 'SF-NorLotusMuon + FP8 AdamW' },
 						{ slug: 'training/autopilot', label: 'buselAutoPilot v6.0' },
 						{ slug: 'training/curriculum', label: 'Curriculum & Chinchilla' },
 						{ slug: 'training/checkpointing', label: 'Checkpointing & resume' },

@@ -21,6 +21,18 @@ def _sdpa(q, k, v, is_causal: bool = False):
     return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
 
+# ponytail: helper to isolate fla Triton kernels from dynamo tracing (SymNode crash)
+@torch.compiler.disable
+def _gdn2_kernel_call(q, k, v, g, b, w, alpha_a, use_chunk):
+    _gdn2_fn = chunk_gdn2 if (use_chunk and _HAS_CHUNK_GDN2) else fused_recurrent_gdn2
+    return _gdn2_fn(
+        q.float(), k.float(), v.float(), g.float(), b.float(), w.float(),
+        A_log=alpha_a.squeeze(-1),
+        use_gate_in_kernel=True,
+        use_qk_l2norm_in_kernel=True,
+    )[0]
+
+
 @register("attention", "gdn2")
 class BulbaGDN2SeRoPEBlock(nn.Module):
     def __init__(self, d_model=1536, n_heads=12):
@@ -39,11 +51,11 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         self.k_conv = nn.Conv1d(n_heads * self.d_k, n_heads * self.d_k, kernel_size=4, groups=n_heads * self.d_k, padding=0)
         self.v_conv = nn.Conv1d(n_heads * self.d_v, n_heads * self.d_v, kernel_size=4, groups=n_heads * self.d_v, padding=0)
         
-        self.b_proj = nn.Linear(d_model, n_heads * self.d_k)
-        self.w_proj = nn.Linear(d_model, n_heads * self.d_v)
+        self.b_proj = BitLinear_a4_8(d_model, n_heads * self.d_k)
+        self.w_proj = BitLinear_a4_8(d_model, n_heads * self.d_v)
         
         # ЛОГАРИФМИЧЕСКИЙ РАСПАД NVIDIA GDN-2 (Формула 12)
-        self.alpha_proj = nn.Linear(d_model, n_heads * self.d_k)
+        self.alpha_proj = BitLinear_a4_8(d_model, n_heads * self.d_k)
         # Обучаемый вектор масштаба логарифмического затухания, инициализируемый отрицательным числом
         self.alpha_a = nn.Parameter(torch.ones(n_heads, 1) * -3.0)
         
@@ -91,17 +103,12 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         
         q, k = self.apply_serope(T, q, k)
         
-        b = torch.sigmoid(self.b_proj(x)).view(B, T, self.n_heads, self.d_k)
-        w = torch.sigmoid(self.w_proj(x)).view(B, T, self.n_heads, self.d_v)
+        b = torch.sigmoid(self.b_proj(x)).view(B, T, self.n_heads, self.d_k) * 2.0  # [0,2] — Gated DeltaNet-2 negative eigenvalues
+        w = torch.sigmoid(self.w_proj(x)).view(B, T, self.n_heads, self.d_v)         # [0,1] — write gate unchanged
         g = self.alpha_proj(x).view(B, T, self.n_heads, self.d_k)
-        _gdn2_fn = chunk_gdn2 if (_HAS_CHUNK_GDN2 and self.training and T >= 1024) else fused_recurrent_gdn2
-        # ponytail: fp32 GDN-2 inputs prevent bf16 overflow at d_model≥640
-        out = _gdn2_fn(
-            q.float(), k.float(), v.float(), g.float(), b.float(), w.float(),
-            A_log=self.alpha_a.squeeze(-1),
-            use_gate_in_kernel=True,
-            use_qk_l2norm_in_kernel=True,
-        )[0].to(x.dtype)
+        out = _gdn2_kernel_call(q, k, v, g, b, w, 
+                                self.alpha_a.clamp(min=-10.0, max=0.0),  # prevent exp(alpha)→Inf
+                                self.training).to(x.dtype)
         out = out.view(B, T, -1)
             
         gate = torch.sigmoid(self.g_proj_up(self.g_proj_down(x)))
@@ -197,23 +204,43 @@ class BulbaNSAAttention(nn.Module):
         self.o_proj = H_BitLinear(d_model, d_model)
         self.out_norm = RMSNorm(d_model)
 
+    @torch.compiler.disable  # ponytail: fla parallel_nsa Triton kernel incompatible with dynamo trace
     def forward(self, x):
         nvtx_range_push("busel_NSA_Forward")
         B, T, C = x.shape
-        # NSA API differs: output drops B dim, requires per-batch call
         from fla.ops.nsa import parallel_nsa
-        outs = []
-        for b in range(B):
-            xb = x[b:b+1]
-            q = self.q_proj(xb).view(1, T, self.n_heads, self.d_k)
-            k = self.k_proj(xb).view(1, T, 1, self.d_k)
-            v = self.v_proj(xb).view(1, T, 1, self.d_k)
-            g_cmp = self.g_cmp(xb).view(1, T, self.n_heads)
-            g_slc = self.g_slc(xb).view(1, T, self.n_heads)
-            g_swa = self.g_swa(xb).view(1, T, self.n_heads)
-            ctx = parallel_nsa(q, k, v, g_cmp=g_cmp, g_slc=g_slc, g_swa=g_swa, block_size=32)[0]
-            outs.append(ctx.reshape(1, T, -1))
-        context = torch.cat(outs, dim=0)
+        # ponytail: chunk large batches to avoid OOM in fla's parallel_nsa
+        _MAX_NSA_BATCH = 64
+        if B > _MAX_NSA_BATCH:
+            chunks = []
+            for i in range(0, B, _MAX_NSA_BATCH):
+                xc = x[i:i + _MAX_NSA_BATCH]
+                q = self.q_proj(xc).view(-1, T, self.n_heads, self.d_k)
+                k = self.k_proj(xc).view(-1, T, 1, self.d_k)
+                v = self.v_proj(xc).view(-1, T, 1, self.d_k)
+                g_cmp = self.g_cmp(xc).view(-1, T, self.n_heads)
+                g_slc = self.g_slc(xc).view(-1, T, self.n_heads)
+                g_swa = self.g_swa(xc).view(-1, T, self.n_heads)
+                ctx = parallel_nsa(q, k, v, g_cmp=g_cmp, g_slc=g_slc, g_swa=g_swa, block_size=32)
+                chunks.append(ctx.reshape(ctx.shape[0], T, -1))
+            context = torch.cat(chunks, dim=0)
+        else:
+            # ponytail: at extreme context (>128K), NSA selection branch collapses → use sliding window only
+            if T > 131072:
+                q = self.q_proj(x).view(B, T, self.n_heads, self.d_k)
+                k = self.k_proj(x).view(B, T, 1, self.d_k)
+                v = self.v_proj(x).view(B, T, 1, self.d_k)
+                # pure sliding window attention — O(1) memory, no selection overhead
+                context = parallel_nsa(q, k, v, block_size=32)
+            else:
+                q = self.q_proj(x).view(B, T, self.n_heads, self.d_k)
+                k = self.k_proj(x).view(B, T, 1, self.d_k)
+                v = self.v_proj(x).view(B, T, 1, self.d_k)
+                g_cmp = self.g_cmp(x).view(B, T, self.n_heads)
+                g_slc = self.g_slc(x).view(B, T, self.n_heads)
+                g_swa = self.g_swa(x).view(B, T, self.n_heads)
+                context = parallel_nsa(q, k, v, g_cmp=g_cmp, g_slc=g_slc, g_swa=g_swa, block_size=32)
+            context = context.reshape(B, T, -1)
         out = self.o_proj(self.out_norm(context))
         nvtx_range_pop()
         return out

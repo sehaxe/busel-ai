@@ -205,6 +205,7 @@ class buselPretrainStage:
         self.start_byte_offset: int = 0
         self.no_compile: bool = False
         self.compile_mode: str = "default"
+        self._tb_writer = None  # TensorBoard SummaryWriter
         self._oom_reductions: int = 0
         self._max_oom_reductions: int = 6
         self._last_chunk_block_step: int = -1000
@@ -435,24 +436,25 @@ class buselPretrainStage:
         if self.cfg.max_steps == "auto" or self.cfg.max_steps is None:
             global_batch = self.cfg.batch_size * self.cfg.grad_accum_steps
             # Tokens = raw bytes (not stride-4 patches). chunk_size is bytes per sequence.
-            # Chunk curriculum starts at chunk/4 → chunk/2 → chunk, so average effective
-            # chunk is ~(0.15×chunk/4 + 0.20×chunk/2 + 0.65×chunk) ≈ 0.79×chunk.
-            # Using chunk_size directly is slightly optimistic but prevents 4× overtraining.
-            # Effective tokens/step: batch auto-scales with chunk, so product is constant.
-            # Initial chunk = full // 8 (curriculum start). Batch auto-halves when chunk doubles.
-            initial_chunk = self.cfg.chunk_size // 8
+            # Chunk curriculum: batch auto-halves when chunk doubles, so tok/step is constant.
+            # Dataloader starts at chunk//16, tok/step = batch × ga × (chunk//16).
+            # Previous bug: used chunk//8 with un-halved batch → 2× overestimate.
+            initial_chunk = self.cfg.chunk_size // 16
             tokens_per_step = global_batch * initial_chunk
-            # Busel Scaling Laws: two-tier model
-            #   - Small models (<3B params): 37 tok/param (empirical, from 2.68M-param benchmark)
-            #   - Large models (≥3B params): 80 tok/param (BitNet scaling, matches Chinchilla for fp16)
-            # See README "Busel Scaling Laws" for full derivation.
-            _BUSEL_THRESHOLD = 3_000_000_000  # 3B params
-            _SMALL_TOKENS_PER_PARAM = 37
-            _LARGE_TOKENS_PER_PARAM = 80
-            if total_params >= _BUSEL_THRESHOLD:
-                tokens_per_param = _LARGE_TOKENS_PER_PARAM
+            # target_tok_per_param overrides scaling law; 0 = use defaults
+            if self.cfg.target_tok_per_param > 0:
+                tokens_per_param = self.cfg.target_tok_per_param
             else:
-                tokens_per_param = _SMALL_TOKENS_PER_PARAM
+                # Busel Scaling Laws: two-tier model
+                #   - Small models (<3B params): 37 tok/param (empirical)
+                #   - Large models (≥3B params): 80 tok/param (Chinchilla match)
+                _BUSEL_THRESHOLD = 3_000_000_000
+                _SMALL_TOKENS_PER_PARAM = 37
+                _LARGE_TOKENS_PER_PARAM = 80
+                if total_params >= _BUSEL_THRESHOLD:
+                    tokens_per_param = _LARGE_TOKENS_PER_PARAM
+                else:
+                    tokens_per_param = _SMALL_TOKENS_PER_PARAM
             busel_tokens = tokens_per_param * total_params
             self.cfg.max_steps = math.ceil(busel_tokens / tokens_per_step)
             log_event(
@@ -596,6 +598,16 @@ class buselPretrainStage:
             import termios, tty
             self._tty_old = termios.tcgetattr(self._tty)
             tty.setcbreak(self._tty)
+        except Exception:
+            pass
+
+        # ponytail: TensorBoard writer — writes alongside metrics.jsonl
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            import datetime
+            log_dir = f"checkpoints/tb_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self._tb_writer = SummaryWriter(log_dir=log_dir)
+            print(f"📊 TensorBoard: {log_dir}")
         except Exception:
             pass
 
@@ -829,6 +841,12 @@ class buselPretrainStage:
             lr=round(current_lr, 7),
             tokens_per_s=round(speed, 1),
         )
+
+        if self._tb_writer is not None:
+            self._tb_writer.add_scalar("loss", accumulated_loss / max(1, self.cfg.grad_accum_steps), step)
+            self._tb_writer.add_scalar("lr", current_lr, step)
+            self._tb_writer.add_scalar("speed", speed, step)
+
         return last_log_time, last_log_tokens, speed
 
     def run(self, state: StageState) -> StageState:
@@ -1254,6 +1272,9 @@ class buselPretrainStage:
             state.last_checkpoint_path = final_path
         except Exception as e:
             print(f"❌ Failed to save final checkpoint: {e}")
+
+        if self._tb_writer is not None:
+            self._tb_writer.close()
 
         return state
 

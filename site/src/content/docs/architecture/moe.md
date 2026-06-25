@@ -32,7 +32,7 @@ input x ∈ (B, S, D)
 | Symbol | Meaning | busel value |
 |---|---|---|
 | `n_shared` | Always-active experts | 2 |
-| `n_routed` | Router-selected experts | 4 (Shpak) / 8 (Zubr) / 16 (Chyzh) |
+| `n_routed` | Router-selected experts | 4 (verabey-27m) / 8 (sokal-60m) / 16 (kruk-120m) |
 | `top_k` | Experts per token | 1 |
 | `capacity_factor` | Max tokens per expert | 1.0 (no dropping) |
 | `aux_loss_coeff` | Load-balancing weight | 0.01 (linear warmup over 1k steps) |

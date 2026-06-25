@@ -1,13 +1,14 @@
 ---
-title: Hybrid attention (GDN-2 + MLA)
-description: 75% Gated DeltaNet-2 linear attention, 25% Multi-Head Latent Attention.
+title: Hybrid attention (GDN-2 + MLA + NSA)
+description: 75% Gated DeltaNet-2 linear attention, 25% Multi-Head Latent Attention, with Native Sparse Attention for dynamic sparsity.
 sidebar:
   order: 4
 ---
 
-busel uses **3 : 1 GDN-2 : MLA** as its attention mix. Three quarters
+busel uses **3 : 1 GDN-2 : (MLA + NSA)** as its attention mix. Three quarters
 of decoder layers are linear attention (GDN-2) and one quarter is
-"global" attention with a compressed KV cache (MLA). This page
+"global" attention with a compressed KV cache (MLA) and optional
+Native Sparse Attention (NSA) patterns. This page
 explains what each does and why the mix is what it is.
 
 ## The two attention families

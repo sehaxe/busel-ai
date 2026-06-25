@@ -56,20 +56,20 @@ class buselLossEngine:
 
     def compute_pretrain_loss(self, logits, targets, mtp_logits_list=None, mtp_targets_list=None):
         """
-        Вычисление основного лосса в низком разрешении (bfloat16 / float16).
-        Интегрирован расчет потерь для дополнительных предсказательных голов MTP-4.
+        Compute main loss for head t+1 (weight 1.0) + weighted MTP-N losses.
+        Pass logits=None to skip T1 and only compute MTP losses.
         """
-        targets_device = targets.to(logits.device).long()
+        loss = torch.tensor(0.0, device=(mtp_logits_list[0].device if mtp_logits_list else torch.device('cpu')))
         
-        # 1. Расчет основного лосса для головы t+1 (весовой коэффициент = 1.0)
-        # ponytail: LigerFusedCrossEntropy with z-loss — prevents logit explosion, fused kernel
-        if _LIGER_CE is not None and logits.device.type == "cuda":
-            ce_out = _LIGER_CE(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
-            loss = ce_out.loss + 0.001 * ce_out.z_loss
-        elif HAS_LIGER and logits.device.type == "cuda":
-            loss = liger_cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
-        else:
-            loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
+        if logits is not None:
+            targets_device = targets.to(logits.device).long()
+            if _LIGER_CE is not None and logits.device.type == "cuda":
+                ce_out = _LIGER_CE(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
+                loss = loss + ce_out.loss + 0.001 * ce_out.z_loss
+            elif HAS_LIGER and logits.device.type == "cuda":
+                loss = loss + liger_cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
+            else:
+                loss = loss + F.cross_entropy(logits.reshape(-1, self.vocab_size), targets_device.reshape(-1))
             
         # 2. 🎯 РАСЧЕТ И ВЗВЕШИВАНИЕ ПОТЕРЬ MTP-N:
         # Если переданы логиты и таргеты для дополнительных голов предсказания будущего
@@ -174,33 +174,3 @@ class buselLossEngine:
         z = F.normalize(e[idx], dim=-1)
         sq_dists = torch.cdist(z, z, p=2).pow(2)
         return weight * torch.log(torch.exp(-temperature * sq_dists).mean() + 1e-8)
-
-    @staticmethod
-    def compute_rho_loss(
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        keep_ratio: float = 0.5,
-    ) -> torch.Tensor:
-        """RHO-Loss: gradients only flow through the hardest tokens.
-        
-        Uses prediction confidence as difficulty proxy:
-        - High max(softmax) = easy token → gradient zeroed
-        - Low max(softmax) = hard token → gradient kept
-        
-        Top keep_ratio fraction of hard tokens contribute to loss.
-        Reduces effective tokens by (1-keep_ratio), speeding convergence.
-        """
-        with torch.no_grad():
-            probs = torch.softmax(logits, dim=-1)
-            difficulty = 1.0 - probs.max(dim=-1).values
-            k = max(1, int(difficulty.numel() * keep_ratio))
-            _, idx = torch.topk(difficulty.flatten(), k)
-            mask = torch.zeros(difficulty.numel(), device=logits.device)
-            mask[idx] = 1.0
-            mask = mask.reshape(difficulty.shape)
-        ce = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            targets.reshape(-1).long(),
-            reduction='none',
-        ).reshape(targets.shape)
-        return (ce * mask).sum() / mask.sum()

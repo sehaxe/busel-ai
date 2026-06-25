@@ -36,7 +36,7 @@ torch.save({
 | `rng_state` | `torch.get_rng_state()` — Python + CPU RNG |
 | `cuda_rng_state` | `torch.cuda.get_rng_state()` if CUDA — for exact reproduction |
 
-For Shpak (11M params) the full checkpoint is ~12-13 MB. For Zubr (~30M) it's ~33 MB. For Chyzh (~165M) it's ~180 MB.
+For verabey-27m (~70M params) the full checkpoint is ~15-16 MB. For sokal-60m (~170M) it's ~38 MB. For kruk-120m (~350M) it's ~75 MB.
 
 ## The 10MB corruption guard
 
@@ -59,16 +59,16 @@ The 10MB threshold catches:
 - **Optimizer-only saves** — accidentally saving just the model dict
 - **Download corruption** — `wget` partial files
 
-The threshold is calibrated so the smallest *valid* checkpoint (Shpak model + optimizer) is 12MB; a 10MB threshold catches all three failure modes with zero false positives.
+The threshold is calibrated so the smallest *valid* checkpoint (verabey-27m model + optimizer) is 15MB; a 10MB threshold catches all three failure modes with zero false positives.
 
-## SIGINT-safe save (`_strip_compile_prefix`)
+## SIGINT-safe save (`load_state_dict_safely`)
 
 `torch.compile` adds an `_orig_mod.` prefix to every parameter name in the state dict (for the `nn.Module` → `OptimizedModule` wrap). If you save a checkpoint from inside the compiled module and try to reload it into a non-compiled model, the keys don't match.
 
-The busel solution: **defer the save to a step boundary, then strip the prefix**:
+The busel solution: **defer the save to a step boundary, then use `load_state_dict_safely`**:
 
 ```python
-# train.py
+# training/stages/pretrain.py
 _emergency_save_pending = False
 
 def _sigint_handler(signum, frame):
@@ -86,18 +86,17 @@ if _emergency_save_pending and not torch._dynamo.is_compiling():
 
 The save check happens at the **top of every step**, outside any `torch.compile` region. This is the fix for the "Ctrl-C during compile crashes with FakeTensor" bug.
 
-The prefix-stripping helper:
+The prefix-stripping helper in `model/checkpoint.py`:
 
 ```python
-# train.py
-def _strip_compile_prefix(state_dict: dict) -> dict:
-    return {
-        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
-        for k, v in state_dict.items()
-    }
+# model/checkpoint.py
+def load_state_dict_safely(model, state_dict):
+    """Strips _orig_mod. prefix, unwraps OptimizedModule. The single source of
+    truth for all checkpoint loads."""
+    ...
 ```
 
-Used both on save (so the on-disk file is in the *uncompiled* format) and on resume (in case you're loading a file that was saved from a compiled model). Either direction is safe.
+Used both on save and on resume — a checkpoint saved from a compiled model loads safely into an eager model, and vice versa.
 
 <Aside type="caution" title="Never save from inside torch.compile">
 The compiled graph holds `FakeTensor` proxies for some intermediates. Calling `torch.save()` on a `FakeTensor` raises `RuntimeError: Cannot save tensors with fake tensor dtype`. The SIGINT handler must defer, not act.
@@ -107,10 +106,10 @@ The compiled graph holds `FakeTensor` proxies for some intermediates. Calling `t
 
 ```bash
 # Auto-detect the latest checkpoint
-uv run train.py --profile shpak --resume auto
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --resume auto
 
 # Explicit checkpoint
-uv run train.py --profile shpak --resume checkpoints/ckpt_5000.pt
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --resume checkpoints/ckpt_5000.pt
 ```
 
 On resume, `train.py`:
@@ -124,7 +123,7 @@ On resume, `train.py`:
 If the profile doesn't match, you get a clear error:
 
 ```
-ValueError: Checkpoint was saved with profile='shpak' but you're trying to resume as 'zubr'.
+ValueError: Checkpoint was saved with profile='verabey-27m' but you're trying to resume as 'sokal-60m'.
 Either change --profile to match, or use --force-resume to override (WARNING: this will
 not load optimizer state correctly).
 ```
@@ -147,19 +146,19 @@ By default, only `ckpt_{N}.pt` and `ckpt_latest.pt`. Emergency and best checkpoi
 
 ```bash
 # Enable emergency save on SIGINT
-uv run train.py --profile shpak --save-on-sigint
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --save-on-sigint
 
 # Enable best-val tracking
-uv run train.py --profile shpak --track-best-val
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --track-best-val
 ```
 
 The defaults avoid wasting disk on long runs where you only care about the periodic checkpoints.
 
 ## Disk space planning
 
-A Shpak run with 12k steps, saving every 1.2k steps, gives you 10 periodic checkpoints × 13MB = 130MB. Zubr is 10 × 35MB = 350MB. Chyzh is 10 × 180MB = 1.8GB.
+A verabey-27m run with 25k steps, saving every 2.5k steps, gives you 10 periodic checkpoints × 15MB = 150MB. sokal-60m is 10 × 40MB = 400MB. kruk-120m is 10 × 75MB = 750MB.
 
-busel auto-prunes by default: keep the most recent 5 checkpoints plus the best-val, delete the rest. This keeps disk usage at ~70MB for Shpak indefinitely.
+busel auto-prunes by default: keep the most recent 5 checkpoints plus the best-val, delete the rest. This keeps disk usage at ~75MB for verabey-27m indefinitely.
 
 ```python
 # train.py
@@ -184,9 +183,9 @@ This is a *warning*, not an error. The rare case is a partial save that survived
 
 | Component | File | Notes |
 |---|---|---|
-| `save_checkpoint()` | [train.py](file:///home/sehaxe/busel-ai/train.py) | The atomic writer |
-| `_strip_compile_prefix()` | [train.py](file:///home/sehaxe/busel-ai/train.py) | The `_orig_mod.` stripper |
-| SIGINT handler | [train.py](file:///home/sehaxe/busel-ai/train.py) | Flag-setter, not action-taker |
+| `save_checkpoint()` | [training/stages/pretrain.py](file:///home/sehaxe/busel-ai/training/stages/pretrain.py) | The atomic writer |
+| `load_state_dict_safely()` | [model/checkpoint.py](file:///home/sehaxe/busel-ai/model/checkpoint.py) | The `_orig_mod.` stripper |
+| SIGINT handler | [training/stages/pretrain.py](file:///home/sehaxe/busel-ai/training/stages/pretrain.py) | Flag-setter, not action-taker |
 | `MIN_CHECKPOINT_BYTES` | [tools/inference.py](file:///home/sehaxe/busel-ai/tools/inference.py) | The 10MB guard |
 | `resume_latest()` | [train.py](file:///home/sehaxe/busel-ai/train.py) | Auto-detect latest periodic |
 | `test_checkpoint_10mb_guard` | [tests/test_checkpoint.py](file:///home/sehaxe/busel-ai/tests/test_checkpoint.py) | Compliance: rejects <10MB |

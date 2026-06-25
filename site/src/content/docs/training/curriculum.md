@@ -27,12 +27,13 @@ def next_ctx_len(step: int, current_len: int, target_len: int, doubler_every: in
 The default doubling cadence is every 2000 steps:
 
 | Step range | Context length | Profile |
-|---|---|---|
-| 0 → 2000 | 1024 | shpak, zubr, chyzh |
-| 2000 → 4000 | 2048 | shpak, zubr, chyzh |
-| 4000+ | 4096 | shpak, zubr, chyzh |
+|---|---|---:|
+| 0 → 2000 | 512 | verabey-27m |
+| 2000 → 4000 | 1024 | verabey-27m |
+| 4000 → 6000 | 2048 | verabey-27m |
+| 6000+ | 4096 | verabey-27m |
 
-micro_test and quick_test skip the curriculum and stay at 512 / 1024.
+micro_test and quick_test skip the curriculum and stay at 256 / 512.
 
 ### Why doubling, not linear?
 
@@ -47,17 +48,17 @@ Doubling gives the model 2000 steps at each context length, which is enough to r
 
 ```yaml
 # configs/default.yaml
-shpak:
+verabey-27m:
   ctx_len: 4096
-  ctx_warmup: [1024, 2048, 4096]    # 2000 steps each
+  ctx_warmup: [512, 1024, 2048, 4096]    # 2000 steps each
 
-zubr:
-  ctx_len: 4096
-  ctx_warmup: [1024, 2048, 4096]    # 4000 steps each (slower doubling)
-
-chyzh:
+sokal-60m:
   ctx_len: 8192
-  ctx_warmup: [1024, 2048, 4096, 8192]  # 8000 steps each
+  ctx_warmup: [1024, 2048, 4096, 8192]    # 3000 steps each (slower doubling)
+
+kruk-120m:
+  ctx_len: 8192
+  ctx_warmup: [1024, 2048, 4096, 8192]    # 4000 steps each
 ```
 
 Override with `--ctx-warmup 1024,2048,4096,8192 --ctx-warmup-steps 4000` on the CLI.
@@ -78,13 +79,13 @@ Where:
 - `S` = effective sequence length (after curriculum, average over the run)
 - `D` = tokens seen during training
 
-### Worked example: Shpak on RTX 5060 Ti
+### Worked example: verabey-27m on RTX 5060 Ti
 
 ```
-N = 11.0M params, of which ~9.6M are non-embedding
+N = 70M params, of which ~60M are non-embedding
 B = 16, S = 4096 (target)
-D_optimal = 80 · 9.6M = 768M tokens
-max_steps = 768M / (16 · 4096) = 11_718 steps
+D_optimal = 37 · 60M = 2.2B tokens (37 tok/param for small models)
+max_steps = 2.2B / (16 · 4096) = 33_670 steps
 warmup_steps = min(1000, max_steps // 10) = 1_000
 ```
 
@@ -113,14 +114,10 @@ For shorter runs (sanity check), `D = 20·N` works but expect higher loss. Below
 
 ```bash
 # Auto-planned run
-uv run train.py --profile shpak --max-steps auto
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --max-steps auto
 
 # Manual override
-uv run train.py --profile shpak --max-steps 20000 --warmup-steps 500
-
-# Disable Chinchilla, use the profile's default
-uv run train.py --profile shpak
-# (shpak profile has max_steps=12000 hard-coded in default.yaml)
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --max-steps 20000 --warmup-steps 500
 ```
 
 The `buselConfig` validator runs at startup:
@@ -164,7 +161,7 @@ In all three, `train.py` will warn you that you're skipping the curriculum and a
 | `_chinchilla_solve()` | [busel_config.py](file:///home/sehaxe/busel-ai/busel_config.py) | `D=80N` solver |
 | `effective_max_steps` | [busel_config.py](file:///home/sehaxe/busel-ai/busel_config.py) | The `auto` resolver |
 | `buselAutoPilot._curriculum_lr` | [training/autopilot.py](file:///home/sehaxe/busel-ai/training/autopilot.py) | Holds LR constant during ctx transitions |
-| `test_chinchilla_solve_shpak` | [tests/test_curriculum.py](file:///home/sehaxe/busel-ai/tests/test_curriculum.py) | Compliance: 11M params → 11_718 steps |
+| `test_chinchilla_solve` | [tests/test_config.py](file:///home/sehaxe/busel-ai/tests/test_config.py) | Compliance: 70M params → ~33k steps |
 | `test_ctx_warmup_doubling` | [tests/test_curriculum.py](file:///home/sehaxe/busel-ai/tests/test_curriculum.py) | Compliance: ctx_len doubles every N steps |
 
 ## See also

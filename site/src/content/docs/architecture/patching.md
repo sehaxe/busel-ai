@@ -1,12 +1,13 @@
 ---
-title: Byte-level patching (Gated FastBLT)
-description: How 4 raw bytes become one model patch — and why we don't use BPE.
+title: Byte-level patching (ByteFlow)
+description: How 4 raw bytes become one model patch — adaptive pooling, boundary detection, and why we don't use BPE.
 sidebar:
   order: 3
 ---
 
 busel has no tokenizer. The model consumes raw UTF-8 bytes and the
-`StridedFastBLTPatcher` compresses 4 bytes into one patch. This
+`ByteFlowPatcher` compresses 4 bytes into one patch via adaptive
+pooling and boundary detection. This
 page explains the patcher, the multimodal marker scheme, and why
 the project refuses to add BPE.
 
@@ -16,7 +17,7 @@ A traditional BPE model has 32 000–200 000 tokens in its vocabulary.
 For a 50 M-param model, **30–40 % of the parameters are in the
 embedding matrix alone** — used once at the input, never again. The
 BitNet team call this the *"embedding tax"*. Byte-level models
-have a 259-token vocabulary and pay no such tax.
+have a 277-token vocabulary and pay no such tax.
 
 The cost is a 4× longer input sequence: an English sentence that
 BPE encodes as 30 tokens becomes 120 bytes. The patcher compresses
@@ -25,10 +26,10 @@ context density while keeping the *vocabulary* tiny.
 
 ## The patcher
 
-`StridedFastBLTPatcher` in `model/patching.py`:
+`ByteFlowPatcher` in `model/patching.py`:
 
 ```python
-StridedFastBLTPatcher(stride=4, d_model=384)
+ByteFlowPatcher(stride=4, d_model=384)
 ```
 
 The forward pass:
@@ -36,7 +37,7 @@ The forward pass:
 ```text
   raw bytes  (B, T) uint8
       │
-      │  nn.Embedding(259, d_byte)  ← learnable byte embedding
+      │  nn.Embedding(277, d_byte)  ← learnable byte embedding
       ▼
   embedded  (B, T, d_byte)
       │
@@ -55,14 +56,14 @@ The forward pass:
   patches  (B, T/4, d_model)
 ```
 
-### Why a 1D conv with kernel=5?
+### Why adaptive pooling + boundary detection?
 
-`kernel=5, stride=4` means each patch sees itself plus 4 bytes of
-left context (the receptive field). The `padding=3, groups=d_byte`
-is a *causal* padding (left-only) implemented as `F.pad(x, (3, 0))`
-before the conv. This gives every patch a 5-byte view of its
-left context, with no leakage from the right (the next patch's
-bytes).
+`stride=4` with adaptive pooling means the patcher dynamically pools
+bytes based on local entropy — low-entropy regions (repeated bytes,
+whitespace runs) are pooled more aggressively; high-entropy regions
+(boundaries between tokens, punctuation) are preserved. Boundary
+detection identifies byte transitions that likely mark word or
+token edges, giving the model explicit positional cues.
 
 The stride `4` is the byte-to-patch compression ratio. It is
 **hard-coded**; changing it requires re-deriving the MTP-4 target
@@ -81,30 +82,16 @@ learns to ignore " ".
 
 ## The multimodal markers
 
-Three "special" byte values mark non-text content in the byte
-stream:
-
-| Byte value | Meaning                                                       |
-|-----------:|---------------------------------------------------------------|
-| `256`      | Followed by 3 072 bytes = a 32×32×3 RGB image                 |
-| `257`      | Followed by 8 bytes = a uint64 length prefix for a PDF page  |
-| `258`      | Padding (zero-pad short chunks to `chunk_size`)               |
-
-The image encoding is the work of `buselOmnivoreTextExtractor`
-in `data/pipeline.py`: PIL loads the image, resizes to
-`32×32×3 = 3 072` bytes, the byte `256` is prepended as a marker.
-The model sees images as a special byte pattern in the same stream
-as text.
-
-PDFs go through Docling (if installed) → Markdown → bytes. They
-are treated as ordinary text; the PDF page markers are mostly
-informational at the data-loader level.
+Twenty-one "special" byte values (tokens 256-276) mark non-text content in the byte
+stream. These include media start/end markers, modality identifiers, and
+content metadata. See [Multimodal encoding](/busel-ai/data/multimodal/)
+for the full 21-token special vocab breakdown.
 
 ## Why no BPE
 
 Three reasons:
 
-1. **Parameter efficiency.** A 256-token embedding matrix for
+1. **Parameter efficiency.** A 277-token embedding matrix for
    50 M params is 0.2 % of the model. A 32 000-token embedding
    would be 25 %.
 2. **Robustness to noise.** BPE on out-of-vocabulary words falls
@@ -122,9 +109,9 @@ tool for million-token contexts.
 
 ## The hard constraint
 
-`vocab_size` is exactly `259` everywhere it appears. The
+`vocab_size` is exactly `277` everywhere it appears. The
 embedding, the MTP head, the loss engine, the data loader — all
-of them assume 256 byte values + 3 multimodal specials. Changing
+of them assume 256 byte values + 21 multimodal specials. Changing
 this number is an anti-pattern; the model will silently misbehave
 if you do.
 
@@ -132,7 +119,7 @@ if you do.
 
 | Symbol                         | File                  | Role                          |
 |--------------------------------|-----------------------|-------------------------------|
-| `StridedFastBLTPatcher`        | `model/patching.py`   | The whole patcher             |
+| `ByteFlowPatcher`              | `model/patching.py`   | The whole patcher             |
 | `build_targets`                | `train.py`            | Aligns MTP targets to stride  |
 | `buselOmnivoreTextExtractor`   | `data/pipeline.py`    | Image + PDF + JSON + parquet  |
 | `RustByteStreamDataset`        | `data/pipeline.py`    | Mmap'd byte stream iterator   |

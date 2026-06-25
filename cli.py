@@ -66,7 +66,7 @@ app.command(name="profile", help="📊 Run the ultra-stable step-by-step perform
 def chat(
     checkpoint: str = typer.Option(None, "--checkpoint", "-c", help="Path to .pt checkpoint (auto-detects latest if omitted)"),
     profile: str = typer.Option(None, "--profile", "-p", help="Force profile from configs/default.yaml"),
-    device: str = typer.Option(None, "--device", "-d", help="Force device: cuda / mps / cpu"),
+    device: str = typer.Option(None, "--device", "-d", help="Force device: cuda / cpu"),
 ):
     import subprocess
     import sys

@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-busel's data pipeline is the **highest-throughput component in the project**. It has to be: at Shpak scale (16 × 4096 tokens/step), the data loader delivers 65k tokens per step; at Chyzh, 33M. The pipeline is built around a Rust `mmap`'d byte streamer with a pure-Python fallback so the project works on machines where the Rust extension hasn't been built.
+busel's data pipeline is the **highest-throughput component in the project**. It has to be: at verabey-27m scale (16 × 4096 tokens/step), the data loader delivers 65k tokens per step; at busel-200m, 8.4M. The pipeline is built around a Rust `mmap`'d byte streamer with a pure-Python fallback so the project works on machines where the Rust extension hasn't been built.
 
 ## The architecture, in one diagram
 
@@ -89,7 +89,7 @@ This is the entire streamer. The properties:
 | Pre-faulting | None | `madvise(MADV_WILLNEED)` |
 | Multi-process safety | Requires locks | Atomic cursor, lock-free |
 
-The 8× throughput is the difference between being data-bound and being compute-bound. At Shpak's 65k tokens/step, the data loader returns in ~7μs vs ~70μs for the standard path.
+The 8× throughput is the difference between being data-bound and being compute-bound. At verabey-27m's 65k tokens/step, the data loader returns in ~7μs vs ~70μs for the standard path.
 
 ## Building the Rust extension
 
@@ -127,7 +127,7 @@ class PythonByteStreamer:
             return chunk
 ```
 
-The `threading.Lock` makes multi-worker `DataLoader`s safe. The `read()` call does copy (no mmap), but Python's I/O is fast enough for our 1-9 GB/s needs at Shpak scale. You will see a measurable slowdown at Zubr and Chyzh.
+The `threading.Lock` makes multi-worker `DataLoader`s safe. The `read()` call does copy (no mmap), but Python's I/O is fast enough for our needs at verabey-27m scale. You will see a measurable slowdown at sokal-60m and larger.
 
 The fallback is a *purely* Python implementation — no `mmap` module, no numpy, no `ctypes`. It works on any Python 3.10+ install.
 
@@ -164,7 +164,7 @@ class buselOmnivoreTextExtractor:
         return f.read_bytes()                      # best-effort UTF-8 fallback
 ```
 
-The `b"\n\n"` separator is important — it gives the model a document boundary token to learn. The 259-token vocab reserves byte 256 (the 9th bit, beyond valid UTF-8) for `__DOC_SEP__`.
+The `b"\n\n"` separator is important — it gives the model a document boundary token to learn. The 277-token vocab reserves special tokens for document boundaries and multimodal markers.
 
 ## The IterableDataset wrapper
 
@@ -203,11 +203,11 @@ The `rewind()` call handles end-of-file: when the streamer hits the end, it loop
 | Multi-worker fan-out | GIL-bound | Lock-free atomics | 4-6× |
 | Memory (10GB corpus) | 10GB × num_workers | 10GB total | 1× per worker |
 
-At Shpak scale, both paths are GPU-bound (data loader returns in <1ms). At Chyzh, the Rust path is required — the Python fallback is 2-3× slower than the GPU compute.
+At verabey-27m scale, both paths are GPU-bound (data loader returns in <1ms). At kruk-120m, the Rust path is required — the Python fallback is 2-3× slower than the GPU compute.
 
 ## Disk layout
 
-After `python cli.py download-all --preset shpak`:
+After `python cli.py download-all --preset verabey-27m`:
 
 ```
 data_train/

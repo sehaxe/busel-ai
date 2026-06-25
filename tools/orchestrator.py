@@ -29,7 +29,7 @@ def print_tui_header():
 
 class _DefaultProfilerArgs:
     """Default profiler args used by profile() and autopilot()."""
-    backend = "auto"
+    backend = "custom"   # ponytail: custom (manual timing) — torch.profiler eats GBs of RAM for trace
     trace = "checkpoints/busel_profiler_trace.json"
     optimizer_type = "lotus_muon"
     lotus_rank = 8
@@ -38,10 +38,10 @@ class _DefaultProfilerArgs:
     no_grad_ckpt = False
     selective_backward = False
     backward_ratio = 0.5
-    steps = 10
+    steps = 3             # ponytail: 3 steps enough to catch VRAM/RNG bugs, 10 steps waste RAM
 
 
-def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps) -> str:
+def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps, no_compile=False) -> str:
     """Build a temp pipeline YAML (pretrain-only + overrides); return the temp dir path."""
     import tempfile
 
@@ -57,6 +57,8 @@ def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps) -> str:
         stage["params"]["max_steps"] = max_steps
     if warmup_steps is not None:
         stage["params"]["warmup_steps"] = warmup_steps
+    if no_compile:
+        stage["params"]["no_compile"] = True
     if resume:
         stage["resume"] = resume
     tmpdir = tempfile.mkdtemp(prefix="busel_shim_")
@@ -69,20 +71,20 @@ def _build_shim_yaml(profile: str, resume: str, max_steps, warmup_steps) -> str:
 def train_single_profile(args_list):
     """Translate legacy train.py CLI args into a pipeline run.
 
-    Supported: --profile, --resume, --max-steps, --warmup-steps.
-    Other flags (--no-compile, --compile-mode, --no-checkpointing, --seed) are dropped
-    because the pipeline runner owns those knobs (see configs/pipelines/*.yaml).
+    Supported: --profile, --resume, --max-steps, --warmup-steps, --no-compile.
+    Other flags are dropped.
     """
     import argparse
     import shutil
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--profile", "-p", default="sovereign_3d")
+    p.add_argument("--profile", "-p", default="busel-200m")
     p.add_argument("--resume", "-r", default=None)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=None)
+    p.add_argument("--no-compile", action="store_true", default=False)
     args, _unknown = p.parse_known_args(args_list)
 
-    tmpdir = _build_shim_yaml(args.profile, args.resume, args.max_steps, args.warmup_steps)
+    tmpdir = _build_shim_yaml(args.profile, args.resume, args.max_steps, args.warmup_steps, no_compile=args.no_compile)
     try:
         pipeline(name="shim", start_stage=None, config_dir=tmpdir)
         return 0
@@ -93,14 +95,10 @@ def train_single_profile(args_list):
 
 
 def autopilot(
-    profile_name: str = typer.Option("sovereign_5h", "--profile", "-p", help="Profile: sovereign_test | sovereign_5h | sovereign_12h | sovereign_24h | sovereign_3d")
+    profile_name: str = typer.Option("verabey-70m", "--profile", "-p", help="Profile: chizh-8m | verabey-27m | sokal-60m | kruk-120m | busel-200m")
 ):
     print_tui_header()
     load_env()
-
-    want_monitoring = typer.confirm("📊 Do you want to enable local logging & TensorBoard monitoring?", default=True)
-    if want_monitoring:
-        typer.echo(typer.style("📈 Monitoring activated. Run 'tensorboard --logdir=checkpoints' to view logs.\n", fg=typer.colors.GREEN))
 
     if not os.path.exists(DATA_DIR) or len(os.listdir(DATA_DIR)) == 0:
         typer.echo(typer.style("📁 Directory 'data_train' is empty. Starting automatic download...", fg=typer.colors.YELLOW, bold=True))
@@ -111,27 +109,25 @@ def autopilot(
     else:
         typer.echo(typer.style("📁 Training data found. Skipping download.", fg=typer.colors.GREEN))
 
-    typer.echo(typer.style("\n📊 Launching hardware express-profiler for MPS/CUDA testing...", fg=typer.colors.CYAN, bold=True))
-    try:
-        from tests.profiler_run import run_profiler as _run_profiler
-        _run_profiler(_DefaultProfilerArgs)
-    except Exception as _prof_err:
-        typer.echo(typer.style(f"❌ Hardware test failed: {type(_prof_err).__name__}: {_prof_err}", fg=typer.colors.RED, bold=True))
-        raise typer.Exit(code=1)
-
     typer.echo("=" * 80)
 
-    typer.echo(typer.style(f"🔥 AUTOPILOT: Launching main training loop [{profile_name.upper()}]...", fg=typer.colors.GREEN, bold=True))
+    typer.echo(typer.style(f"🔥 AUTOPILOT: Launching training [{profile_name.upper()}]...", fg=typer.colors.GREEN, bold=True))
     train_single_profile(["--profile", profile_name])
 
 
 def train(
-        profile_name: str = typer.Option("sovereign_5h", "--profile", "-p", help="Profile: sovereign_test | sovereign_5h | sovereign_12h | sovereign_24h | sovereign_3d"),
-    resume: str = typer.Option(None, "--resume", "-r", help="Path to checkpoint for resuming")
+        profile_name: str = typer.Option("verabey-70m", "--profile", "-p", help="Profile"),
+    resume: str = typer.Option(None, "--resume", "-r", help="Path to checkpoint"),
+    max_steps: int = typer.Option(None, "--max-steps", help="Override training steps"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="Disable torch.compile"),
 ):
     args = ["--profile", profile_name]
     if resume:
         args.extend(["--resume", resume])
+    if max_steps is not None:
+        args.extend(["--max-steps", str(max_steps)])
+    if no_compile:
+        args.extend(["--no-compile"])
     train_single_profile(args)
 
 
@@ -221,7 +217,7 @@ def pipeline(
         merged_params = {**pipeline_cfg.global_params, **stage_spec.params}
         if stage_spec.checkpoint_out and "checkpoint_out" not in merged_params:
             merged_params["checkpoint_out"] = stage_spec.checkpoint_out
-        profile_name = merged_params.pop("profile_name", stage_spec.data_preset or "sovereign_3d")
+        profile_name = merged_params.pop("profile_name", stage_spec.data_preset or "busel-200m")
         profile_dict = _default_profiles.get(profile_name)
         if profile_dict is None:
             raise ValueError(f"Profile {profile_name!r} not in configs/default.yaml")
@@ -265,8 +261,8 @@ def pipeline(
     typer.echo(typer.style(f"\nPipeline {pipeline_cfg.name} complete — {len(pipeline_cfg.stages)} stages succeeded.", fg=typer.colors.GREEN, bold=True))
 
 
-PROFILE_LADDER = ["sovereign_5h", "sovereign_12h", "sovereign_24h", "sovereign_3d"]
-PROFILE_PARAMS = {"sovereign_5h": 70_000_000, "sovereign_12h": 170_000_000, "sovereign_24h": 350_000_000, "sovereign_3d": 1_000_000_000}
+PROFILE_LADDER = ["verabey-67m", "sokal-120m", "kruk-210m", "busel-365m"]
+PROFILE_PARAMS = {"verabey-67m": 67000000, "sokal-120m": 120000000, "kruk-210m": 210000000, "busel-365m": 365000000}
 # Two-tier Busel Scaling: <3B params → 37 tok/param, ≥3B → 80 tok/param
 _BUSEL_THRESHOLD = 3_000_000_000
 BUSEL_SCALING = {
@@ -379,7 +375,7 @@ def _print_escalation_plan(plan: dict) -> None:
 
 
 def escalate(
-    target: str = typer.Option("sovereign_3d", "--target", "-t", help="Target: sovereign_1h | sovereign_12h | sovereign_24h | sovereign_3d"),
+    target: str = typer.Option("busel-200m", "--target", "-t", help="Target: verabey-27m | sokal-60m | kruk-120m | busel-200m"),
     max_steps: int | None = typer.Option(None, "--max-steps", help="Cap total training across all stages (default: train to Busel scaling optimal)"),
     vram_gb: float = typer.Option(16.0, "--vram", help="Available VRAM in GB (clamps batch_size)"),
     recompile: bool = typer.Option(False, "--recompile", help="Wipe Inductor cache before compiling (default: reuse cache)"),

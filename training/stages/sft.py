@@ -100,8 +100,6 @@ def _enforce_stability(seed: int = 42) -> None:
 def _detect_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -272,7 +270,7 @@ class buselSFTStage:
             autocast_dtype = torch.bfloat16
         else:
             autocast_dtype = torch.float16
-        autocast_enabled = self.device in ("cuda", "mps")
+        autocast_enabled = self.device == "cuda"
 
         current_chunk_size = self.cfg.chunk_size // 4
         current_batch_size = self.cfg.batch_size

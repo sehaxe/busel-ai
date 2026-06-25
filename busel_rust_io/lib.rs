@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::types::PyModuleMethods;
 use std::fs::File;
+use std::io;
 use memmap2::Mmap;
 
 // ponytail: ternary packing 5:8 — 5 ternary values {-1,0,1} in 1 byte (3^5=243<256). 20× weight compression.
@@ -49,6 +50,12 @@ impl ByteStreamer {
     fn new(file_path: String, chunk_size: usize, start_offset: usize) -> PyResult<Self> {
         let file = File::open(file_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        // ponytail: MADV_SEQUENTIAL — kernel auto-prefetches ahead, frees behind.
+        // Prevents 22GB page cache from OOM-killing on 16GB RAM without thrashing.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL);
+        }
         Ok(ByteStreamer { mmap, _file: file, position: start_offset, chunk_size })
     }
 
@@ -56,6 +63,8 @@ impl ByteStreamer {
         if self.position >= self.mmap.len() { return None; }
         let end = std::cmp::min(self.position + self.chunk_size, self.mmap.len());
         let mut chunk = self.mmap[self.position..end].to_vec();
+        // ponytail: let OS manage page cache — MADV_DONTNEED thrashing was causing RAM churn.
+        // 22GB data on 15GB RAM: OS evicts LRU pages naturally under memory pressure.
         if chunk.len() < self.chunk_size { chunk.resize(self.chunk_size, 0u8); }
         self.position = end;
         Some(chunk)

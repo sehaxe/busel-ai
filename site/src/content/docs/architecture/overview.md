@@ -5,9 +5,9 @@ sidebar:
   order: 1
 ---
 
-The busel architecture is a single-file reading exercise: ~2 300 lines
+The busel architecture is a single-file reading exercise: ~3 000 lines
 of Python split across `model/backbone.py`, `model/attention.py`,
-`model/layers.py`, `model/moe.py`, and `model/mtp.py`. Every component
+`model/layers.py`, `model/routing.py`, and `model/mtp.py`. Every component
 exists because it solves a specific problem. This page explains the
 *why*. The "how" is in the sub-pages.
 
@@ -17,13 +17,14 @@ Modern LLMs are picked from a small menu on each of these axes:
 
 | Axis                          | Standard pick                | busel's pick                                  |
 |-------------------------------|------------------------------|-----------------------------------------------|
-| **Weight precision**          | FP16 / BF16                  | 1.58-bit ternary `{-1, 0, +1}`                 |
-| **Tokenisation**              | BPE / SentencePiece (32 k-200 k vocab) | Raw bytes (vocab=259)              |
+| **Weight precision**          | FP16 / BF16                  | 1.58-bit ternary `{-1, 0, +1}` (+ Fused BitLinear Triton) |
+| **Tokenisation**              | BPE / SentencePiece (32 k-200 k vocab) | Raw bytes (vocab=277)              |
 | **Residual connection**       | `y = x + f(x)`               | mAR — input-dependent, doubly-stochastic mix |
-| **Attention**                 | O(L²) softmax                | 3:1 GDN-2 (linear) : MLA (latent KV)         |
-| **Feed-forward block**        | dense FFN                    | MoE with Blackboard Memory (2 shared + N)     |
+| **Attention**                 | O(L²) softmax                | 3:1 GDN-2 (linear) : MLA (latent KV) + NSA |
+| **Feed-forward block**        | dense FFN                    | MatMul-free MoE with Blackboard Memory, SCT rank-8 |
 | **Loss head**                 | next-token only              | MTP-4 (predict t+1..t+4, decaying weight)     |
-| **Optimizer**                 | AdamW                        | Hybrid Muon (2D `proj`) + AdamW (rest)        |
+| **Optimizer**                 | AdamW                        | SF-NorLotusMuon (Gram NS) + FP8 AdamW         |
+| **Pipeline**                  | pretrain only                | pretrain → SFT → DPO → eval → GRPO            |
 
 None of these are unprecedented — busel is an *integration project*
 that picks the best-known idea in each axis and wires them together
@@ -38,9 +39,9 @@ One training step, one pass through the model, looks like this:
                           │
                           ▼
             ┌─────────────────────────┐
-            │   StridedFastBLTPatcher │  4 bytes → 1 patch
-            │   vocab=259 → d_byte    │  + sigmoid gate
-            │   → d_model             │
+            │   ByteFlowPatcher        │  4 bytes → 1 patch
+            │   vocab=277 → d_byte     │  + sigmoid gate
+            │   → d_model              │
             └────────────┬────────────┘
                          │  (B, T/4, d_model)
                          ▼
@@ -83,12 +84,11 @@ Straight-Through Estimator (STE) on `torch.round`. The 1.58 in
 ### 2. Byte-level patching — *see [Patching](/busel-ai/architecture/patching/)*
 
 The input is a flat `uint8` tensor of length `T`. The
-`StridedFastBLTPatcher` applies a 1D conv with `kernel=5, stride=4`
-and `padding=causal-left-3`, followed by a tiny SwiGLU gate
-(`gate × up`) that learns to suppress whitespace noise. The output
-is `(B, T/4, d_model)` — "patches". The `vocab=259` constraint
-(256 byte values + 3 multimodal specials) is hard-wired; BPE is
-explicitly forbidden by the project conventions.
+`ByteFlowPatcher` applies adaptive pooling and boundary detection
+with a sigmoid-gated SwiGLU that learns to suppress whitespace noise.
+The output is `(B, T/4, d_model)` — "patches". The `vocab=277`
+constraint (256 byte values + 21 multimodal specials) is hard-wired;
+BPE is explicitly forbidden by the project conventions.
 
 ### 3. mAR residuals — *see [mAR](/busel-ai/architecture/mar/)*
 
@@ -142,15 +142,19 @@ embed weight (no 4× cost). The loss is the weighted sum
 the hidden layers form an internal model of *future* tokens,
 not just the next one.
 
-## The optimizer, briefly — *see [Hybrid Muon+AdamW](/busel-ai/training/optimizer/)*
+## The optimizer, briefly — *see [SF-NorLotusMuon + FP8 AdamW](/busel-ai/training/optimizer/)*
 
 2D projection weights (`q_proj`, `k_proj`, `v_proj`, `o_proj`,
-`gate`, `up`, `down` in MoE) go through `Muon`: momentum
-(`β=0.95`) then 5 iterations of Newton-Schulz orthogonalisation,
-scaled by `0.2·√max(A, B)`. Everything else (RMSNorm gains, biases,
-embedding parameters, router, MTP head biases) goes through
-`AdamW` with `lr_adamw = lr_muon / 10`. Auto-uses **FlashMuon**
-(Triton) if `flash_muon` is installed.
+`gate`, `up`, `down` in MoE) go through **SF-NorLotusMuon**:
+Schedule-Free momentum + NorMuon cautious weight decay + LOTUS
+rank-8 factorised momentum, with Gram Newton-Schulz orthogonalization
+and Muon+ column normalization. Everything else (RMSNorm gains, biases,
+embeddings, routers, MTP heads) goes through **FP8 AdamW**
+(`torchao.optim.AdamWFp8`, 75% memory reduction vs fp32 AdamW).
+**EMA of weights** (`decay=0.999`) and **decoupled per-layer LR**
+(6 sub-groups) are on by default. The Fused BitLinear Triton kernel
+replaces 10+ ops in one launch (eager mode; disabled under
+torch.compile, where inductor fuses automatically).
 
 ## The training loop, briefly — *see [AutoPilot](/busel-ai/training/autopilot/)*
 
@@ -163,74 +167,29 @@ final 10 %).
 
 ## What this gets you
 
-- **11 MB checkpoint** for a 52.8 M-param model (Shpak).
+- **14 MB checkpoint** for a ~70 M-param model (verabey-27m).
 - **100+ tok/s CPU inference** because the forward pass is pure
-  addition (no multiplications).
+  addition (no multiplications, MatMul-free).
 - **Long-context (128 K)** via the MLA latent cache (~98 MB).
-- **Stable training** with predictive dampening, no NaN, no
+- **Stable training** with SF-NorLotusMuon, predictive dampening, no NaN, no
   catastrophic spikes.
 - **Tunable** through a single YAML config and a Typer CLI.
+- **Multi-stage pipeline** — pretrain → SFT → DPO → eval → GRPO.
 
-## v5.8 opt-in research features
+## Default-ON training technologies
 
-One v5.8 feature remains as an opt-in (default OFF) — measure before
-flipping the switch. **LCSB** is now default ON in shpak/zubr/chyzh
-since v6.0. **Sparse-BitNet 6:8** was removed in the v6.2 cleanup
-(no CUDA speedup, unproven at busel scale).
+All of these are wired ON by default (no opt-in required):
 
-### LCSB selective per-layer backward (model)
-
-The big v5.8 win. Each forward, randomly selects
-`n_select = max(1, int(n_layers × backward_ratio))` layers to run
-with grad; non-selected layers run under `torch.no_grad()`. The
-mAR residual identity path (`x = mixed + layer_out`) still carries
-gradient even when the layer is skipped.
-
-```python
-# buselModel.forward
-if self.selective_backward and self.training and self.backward_ratio < 1.0:
-    import random
-    n_select = max(1, int(len(self.layers) * self.backward_ratio))
-    self._selected_layers = sorted(random.sample(range(len(self.layers)), n_select))
-else:
-    self._selected_layers = list(range(len(self.layers)))
-
-for i, layer in enumerate(self.layers):
-    mixed = self.m_residuals[i](x, streams)
-    if i in self._selected_layers:
-        layer_out, aux_loss = layer(mixed, progress=progress)
-    else:
-        with torch.no_grad():
-            layer_out, aux_loss = layer(mixed, progress=progress)
-    x = mixed + layer_out
-```
-
-**Validation on shpak 52.8M, `backward_ratio=0.5`:**
-
-| Configuration | Step (ms) | Peak VRAM | tok/s | Loss@10 |
-|---|---:|---:|---:|---:|
-| Baseline | 2763.5 | 5475 MB | 23,715 | 5.892 |
-| **+ LCSB ratio=0.5** | **1533.4** | **4099 MB** | **42,738** | 5.874 |
-| + LCSB + Sparse | 1658.1 | 4372 MB | 39,526 | 5.903 |
-
-**−44 % step time, −25 % peak VRAM, +80 % tok/s, no convergence
-regression.** Sparse mask-computation overhead partially cancels LCSB's win,
-so use LCSB alone. To enable:
-
-```yaml
-# configs/default.yaml — shpak profile
-model:
-  selective_backward: true
-  backward_ratio: 0.5
-```
-
-**🆕 v5.8**
-
-### Validated config: LCSB alone
-
-The 10-step shpak 52.8M profile is 1704 ms / 5456 MB / ~38k tok/s
-with LCSB alone (`selective_backward=True, backward_ratio=0.5`).
-This is the production default for shpak/zubr/chyzh since v6.0.
+| Feature | Default | What it does |
+|---|---|---|
+| **SCT rank-8** | ON | Spectral Compact Training — FFN weight compression ×4-8 |
+| **DropBP** | ON (`prob=0.3`) | 30% layers skip backward — regularization + speed |
+| **RHO-Loss** | ON | Gradient only for hard tokens — faster convergence |
+| **Dispersion Loss** | ON | Uniformity loss on byte embeddings — prevents condensation |
+| **Progressive Freeze** | ON | Freeze up to 75% layers in late training |
+| **ASCII Curriculum** | ON | 7-bit ASCII first 30% training, then full 8-bit |
+| **Fused BitLinear** | ON (eager) | Triton kernel replaces 10+ ops in one launch |
+| **LCSB** | ON (`backward_ratio=0.5`) | Selective per-layer backward — −44% step, −25% mem |
 
 ## What it doesn't get you
 

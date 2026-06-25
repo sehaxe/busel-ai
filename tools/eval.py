@@ -33,8 +33,6 @@ from multimodal.special_tokens import (
 def _detect_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -65,7 +63,7 @@ def perplexity(
     total_loss = 0.0
     total_tokens = 0
     autocast_dtype = torch.bfloat16 if device in ("cuda", "cpu") else torch.float16
-    autocast_enabled = device in ("cuda", "mps")
+    autocast_enabled = device == "cuda"
     for sample in samples:
         if len(sample) < 8:
             continue
@@ -121,7 +119,7 @@ def sft_loss_metric(
     total_loss = 0.0
     total_tokens = 0
     autocast_dtype = torch.bfloat16 if device in ("cuda", "cpu") else torch.float16
-    autocast_enabled = device in ("cuda", "mps")
+    autocast_enabled = device == "cuda"
     for bytes_, mask_ in examples:
         if len(bytes_) < 8 or sum(mask_) == 0:
             continue
@@ -180,7 +178,7 @@ def format_compliance(
         return {"format_compliance": 0.0, "avg_response_bytes": 0.0, "n_prompts": 0}
     prompts = prompts[:max_prompts]
     autocast_dtype = torch.bfloat16 if device in ("cuda", "cpu") else torch.float16
-    autocast_enabled = device in ("cuda", "mps")
+    autocast_enabled = device == "cuda"
     n_compliant = 0
     total_response_bytes = 0
     for prompt in prompts:

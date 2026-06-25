@@ -77,25 +77,25 @@ A drop-in replacement for `nn.LayerNorm` that doesn't subtract the mean. The mat
 
 The `weight` parameter is a `float` (fp32 internally even on bf16 model). Goes to **AdamW** in the optimizer, not Muon (it's 1D).
 
-## `StridedFastBLTPatcher` — byte-to-patch
+## `ByteFlowPatcher` — byte-to-patch
 
 ```python
-class StridedFastBLTPatcher(nn.Module):
-    def __init__(self, d_model: int, patch_stride: int = 4, vocab_size: int = 259):
+class ByteFlowPatcher(nn.Module):
+    def __init__(self, d_model: int, patch_stride: int = 4, vocab_size: int = 277):
         self.patch_stride = patch_stride              # 4 in busel
         self.proj = BitLinear_a4_8(vocab_size * patch_stride, d_model)
 ```
 
-Folds every `patch_stride=4` bytes into one patch via a single BitLinear. The 256-byte vocab × 4 stride = 1024 possible 4-byte combinations, projected to `d_model`. See [Patching](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/patching.md) for the full breakdown.
+Folds every `patch_stride=4` bytes into one patch via adaptive pooling
+and boundary detection, then projects to `d_model`. The 277-byte vocab
+(256 bytes + 21 specials) × 4 stride = 1108 possible combinations,
+projected to `d_model`. See [Patching](file:///home/sehaxe/busel-ai/site/src/content/docs/architecture/patching.md) for the full breakdown.
 
 **Forward:**
 ```python
 def forward(self, x: Tensor) -> Tensor:
     """x: (B, S, patch_stride) uint8 → (B, S, d_model) bf16/fp16"""
-    B, S, P = x.shape
-    one_hot = F.one_hot(x.long(), num_classes=self.vocab_size).float()  # (B, S, P, V)
-    flat = one_hot.view(B, S, P * self.vocab_size)
-    return self.proj(flat)
+    # Adaptive pooling + boundary detection → flat projection
 ```
 
 ## `GDN2Attention` — gated linear attention
@@ -147,7 +147,10 @@ class buselBlock(nn.Module):
         self.mar   = ManifoldConstrainedAttnRes(d_model)         # the residual mixer
 ```
 
-The 3:1 attention mix is enforced at the block level:
+The 3:1 attention mix is enforced at the block level, with NSA
+(Native Sparse Attention) providing dynamic sparsity patterns on MLA
+layers. SCT rank-8 compresses FFN weights 4-8×. The MatMul-free FFN
+uses ternary weights to replace all multiplications with additions:
 
 ```python
 # model/backbone.py
@@ -205,7 +208,7 @@ The 256 × 64 ring buffer holding the last 4 layer outputs. `.push(x)` rotates t
 ```python
 class buselModel(nn.Module):
     def __init__(self, config: buselConfig):
-        self.patch_embed = StridedFastBLTPatcher(config.d_model, vocab_size=259)
+        self.patch_embed = ByteFlowPatcher(config.d_model, vocab_size=277)
         self.blocks = nn.ModuleList([buselBlock(...) for _ in range(config.n_layers)])
         self.norm_final = RMSNorm(config.d_model)
         self.lm_head = H_BitLinear(config.d_model, config.vocab_size)
@@ -231,7 +234,7 @@ The `forward` returns both the main next-token logits and the 4 MTP logits. The 
 | `BitLinear_a4_8` | [model/layers.py](file:///home/sehaxe/busel-ai/model/layers.py) | The 1.58-bit linear |
 | `H_BitLinear` | [model/layers.py](file:///home/sehaxe/busel-ai/model/layers.py) | For o_proj only |
 | `RMSNorm` | [model/layers.py](file:///home/sehaxe/busel-ai/model/layers.py) | The only norm |
-| `StridedFastBLTPatcher` | [model/patching.py](file:///home/sehaxe/busel-ai/model/patching.py) | Byte-to-patch |
+| `ByteFlowPatcher` | [model/patching.py](file:///home/sehaxe/busel-ai/model/patching.py) | Byte-to-patch |
 | `GDN2Attention` | [model/attention.py](file:///home/sehaxe/busel-ai/model/attention.py) | Linear attention |
 | `MLAAttention` | [model/attention.py](file:///home/sehaxe/busel-ai/model/attention.py) | Full attention |
 | `buselBlock` | [model/backbone.py](file:///home/sehaxe/busel-ai/model/backbone.py) | One transformer block |

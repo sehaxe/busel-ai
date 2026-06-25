@@ -2,7 +2,7 @@
 title: Busel AI
 description: Sovereign 1.58-bit LLM — architecture, training, and wiki.
 hero:
-  tagline: Sovereign, token-free 1.58-bit LLM with mAR residuals, hybrid GDN-2/MLA attention, and MTP-4. Designed for high-performance training on consumer hardware.
+  tagline: Sovereign, token-free 1.58-bit LLM with mAR residuals, hybrid GDN-2/MLA/NSA attention, SCT compression, MatMul-free FFN, Fused BitLinear Triton kernel, and MTP-4. Designed for high-performance training on consumer hardware.
   actions:
     - text: Get Started
       link: /busel-ai/guides/getting-started/
@@ -23,7 +23,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Busel (Бусел, from Belarusian *бусел* — stork) is a from-scratch
 implementation of a 1.58-bit LLM. It is small enough to read in an
-afternoon (~2 300 LoC of Python + ~140 LoC of Rust), runs on a single
+afternoon (~3 000 LoC of Python + ~140 LoC of Rust), runs on a single
 RTX 5060 Ti or Apple Silicon Mac, and includes a custom architecture that
 combines several recent research ideas in one place.
 
@@ -40,23 +40,26 @@ combines several recent research ideas in one place.
     Combines [Kimi AttnRes](https://arxiv.org/abs/2603.15031) and
     [DeepSeek mHC](https://arxiv.org/abs/2512.24880).
   </Card>
-  <Card title="3:1 GDN-2 / MLA" icon="setting">
+  <Card title="3:1 GDN-2 / MLA / NSA" icon="setting">
     75 % of layers are linear (GDN-2, O(1) cache), 25 % are MLA
-    (latent KV, `d_c=128`). A 128 K-token context fits in ~98 MB of cache.
+    (latent KV, `d_c=128`). NSA (Native Sparse Attention) provides
+    dynamic sparse attention patterns. A 128 K-token context fits
+    in ~98 MB of cache. SCT rank-8 compresses FFN weights 4-8×.
   </Card>
   <Card title="Byte-level (no BPE)" icon="star">
-    Vocabulary of 259 tokens. The same byte stream carries text, code,
-    JSON, images, and PDFs. The Gated FastBLT patcher compresses
-    4 bytes → 1 patch.
+    Vocabulary of 277 tokens. The same byte stream carries text, code,
+    JSON, images, and PDFs. The ByteFlow patcher compresses
+    4 bytes → 1 patch with adaptive pooling and boundary detection.
   </Card>
-  <Card title="LOTUS+Muon + AdamW" icon="rocket">
-    2D weights go through LOTUS+Muon (rank-8 factorised Muon, ~85× less
-    optimizer state); the rest goes through AdamW. Params are
-    sub-grouped by layer type (attn / ffn / mtp / norm / embed / router)
-    for decoupled LR multipliers. **EMA of weights**, **Top-1 MoE**,
-    and **selective activation checkpointing** are on by default. The
-    AutoPilot v6.0 handles spike recovery, adaptive clipping, and
-    dynamic weight decay.
+  <Card title="SF-NorLotusMuon + FP8 AdamW" icon="rocket">
+    2D weights go through SF-NorLotusMuon (Schedule-Free + NorMuon +
+    LOTUS rank-8 factorised Muon, ~85× less optimizer state) with Gram
+    Newton-Schulz orthogonalization; the rest goes through FP8 AdamW
+    (`torchao.optim.AdamWFp8`, 75% memory reduction). Fused BitLinear
+    Triton kernel in eager mode replaces 10+ ops in one launch. SCT
+    rank-8, DropBP, RHO-Loss, Dispersion Loss, Progressive Freeze, and
+    ASCII Curriculum are all ON by default. AutoPilot v6.0 handles
+    spike recovery, adaptive clipping, and dynamic weight decay.
   </Card>
   <Card title="Plug-in registry" icon="puzzle">
     Adding a new attention or optimizer? Decorate it with
@@ -102,16 +105,18 @@ combines several recent research ideas in one place.
 
 ## Quick numbers
 
-| Profile  | Total params | Active | Bit-size | Context |
-|----------|-------------:|-------:|---------:|--------:|
-| chyzh    | ~10 M        | ~5 M   | —        | 512 B   |
-| **shpak**| **52.8 M**   | 25 M   | **11 MB**| 4096 B  |
-| zubr     | 120 M        | 35 M   | 30 MB    | 16 384 B|
+| Profile       | Total params | Bit-size | Context  |
+|---------------|-------------:|---------:|---------:|
+| chizh-8m      | ~4 M         | ~1 MB    | 1024 B   |
+| verabey-27m   | ~70 M        | 14 MB    | 4096 B   |
+| sokal-60m    | ~170 M       | 35 MB    | 8192 B   |
+| kruk-120m     | ~350 M       | 70 MB    | 8192 B   |
+| busel-200m      | ~1 B         | 200 MB   | 32 768 B |
 
 | Mode (RTX 5060 Ti, val profile) | tok/s |
 |---------------------------------|------:|
-| Eager                           | 189 576 |
-| `torch.compile` (default)       | **578 255** (3.05×) |
+| Eager (Fused BitLinear Triton)  | 215 000 |
+| `torch.compile` (default)       | **578 255** (2.7×) |
 
 See [Quick tour](/busel-ai/guides/quick-tour/) for the full numbers and
 the [Performance section](/busel-ai/performance/compile-modes/) for the

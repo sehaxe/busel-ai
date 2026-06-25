@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-`torch.compile` is what makes busel fast — without it, 1.58-bit training is GPU-launch-bound. With it, kernel launches are fused and Python overhead disappears.
+`torch.compile` is what makes busel fast. In eager mode, the **Fused BitLinear Triton kernel** replaces 10+ ops in one launch. Under `torch.compile`, Inductor fuses automatically — Fused BitLinear is disabled to avoid interference. Between the two paths, kernel launches stay minimal.
 
 busel supports the three standard compile modes, plus a safe `off` fallback. The right choice depends on your profile and your hardware.
 
@@ -26,16 +26,16 @@ busel supports the three standard compile modes, plus a safe `off` fallback. The
 
 ```bash
 # Quick test, want the simplest path
-uv run train.py --profile micro_test --compile-mode default
+uv run python cli.py pipeline --name pretrain-only --profile micro_test --compile-mode default
 
 # Single-GPU research, want speed
-uv run train.py --profile shpak --compile-mode reduce-overhead
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --compile-mode reduce-overhead
 
 # Long run on beefy hardware
-uv run train.py --profile zubr --compile-mode max-autotune
+uv run python cli.py pipeline --name pretrain-only --profile sokal-60m --compile-mode max-autotune
 
 # Debugging (compile output is harder to read)
-uv run train.py --profile shpak --compile-mode off
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m --compile-mode off
 ```
 
 ## What each mode actually does
@@ -142,15 +142,15 @@ busel does the first two automatically. For the third, the AutoPilot holds LR co
 
 | Profile | `default` VRAM | `reduce-overhead` VRAM | `max-autotune` VRAM |
 |---|---|---|---|
-| shpak | 8.2 GB | 9.0 GB | 9.5 GB |
-| zubr | 18.5 GB | 20.5 GB | 22.0 GB |
-| chyzh | 35.0 GB | 38.5 GB | 41.0 GB |
+| verabey-27m | 8.2 GB | 9.0 GB | 9.5 GB |
+| sokal-60m | 16.0 GB | 18.0 GB | 19.0 GB |
+| kruk-120m | 32.0 GB | 35.0 GB | 37.0 GB |
 
 If you're VRAM-constrained, drop to `default` or `off` before reducing `micro_batch_size`.
 
 ## Compatibility with checkpointing
 
-`torch.compile` wraps every parameter name with `_orig_mod.` in the state dict. busel's `_strip_compile_prefix()` strips this on save:
+`torch.compile` wraps every parameter name with `_orig_mod.` in the state dict. busel's `load_state_dict_safely()` in `model/checkpoint.py` strips this on load:
 
 ```python
 # train.py::save_checkpoint
@@ -168,7 +168,7 @@ By default, PyTorch caches compiled artifacts in `~/.cache/torch/inductor/`. bus
 
 ```bash
 rm -rf ~/.cache/torch/inductor/
-uv run train.py --profile shpak
+uv run python cli.py pipeline --name pretrain-only --profile verabey-27m
 ```
 
 The next run will spend 30-600s in compile, then run normally.
@@ -178,7 +178,7 @@ The next run will spend 30-600s in compile, then run normally.
 - **Data loading** — the `ByteStreamer` is outside the compiled region
 - **AutoPilot** — the cybernetic layer runs in eager mode (you want to see the spike detection work, not be deferred to a graph)
 - **Logging** — `busel_logging` is outside the compiled region
-- **Optimizer state dict** — the Muon + AdamW state is saved separately from the model
+- **Optimizer state dict** — the SF-NorLotusMuon + FP8 AdamW state is saved separately from the model
 
 These are all `torch.compile(mode="default", fullgraph=False)` defaults; busel doesn't override them.
 
@@ -186,10 +186,10 @@ These are all `torch.compile(mode="default", fullgraph=False)` defaults; busel d
 
 | Component | File | Notes |
 |---|---|---|
-| `--compile-mode` flag | [train.py](file:///home/sehaxe/busel-ai/train.py) | The CLI flag |
-| `torch.compile` call | [train.py](file:///home/sehaxe/busel-ai/train.py) | Where the model is compiled |
-| SIGINT handler | [train.py](file:///home/sehaxe/busel-ai/train.py) | Flag-setter, not action-taker |
-| `_strip_compile_prefix` | [train.py](file:///home/sehaxe/busel-ai/train.py) | The state-dict normalizer |
+| `--compile-mode` flag | [cli.py](file:///home/sehaxe/busel-ai/cli.py) | The CLI flag |
+| `torch.compile` call | [training/stages/pretrain.py](file:///home/sehaxe/busel-ai/training/stages/pretrain.py) | Where the model is compiled |
+| SIGINT handler | [training/stages/pretrain.py](file:///home/sehaxe/busel-ai/training/stages/pretrain.py) | Flag-setter, not action-taker |
+| `load_state_dict_safely` | [model/checkpoint.py](file:///home/sehaxe/busel-ai/model/checkpoint.py) | State-dict normalizer |
 | `buselConfig.compile_mode` | [busel_config.py](file:///home/sehaxe/busel-ai/busel_config.py) | The config field |
 | `test_sigint_defers_save` | [tests/test_compile.py](file:///home/sehaxe/busel-ai/tests/test_compile.py) | Compliance test |
 

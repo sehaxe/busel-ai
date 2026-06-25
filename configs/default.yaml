@@ -6,68 +6,67 @@ global:
 
 profiles:
   # ═══════════════════════════════════════════════════════════════════
-  # sovereign_test — мини-тест (4M params, все фичи, ~3 мин)
+  # chizh-8m — мини-тест (~9M SCT-32)
   # ═══════════════════════════════════════════════════════════════════
-  sovereign_test:
+  chizh-9m:
     model:
-      d_model: 128
-      n_layers: 2
-      n_heads: 4
-      expert_hidden: 256
+      d_model: 384
+      n_layers: 4
+      n_heads: 6
+      expert_hidden: 768
       num_experts: 4
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 12
-      selective_backward: true
-      backward_ratio: 0.5
-      nsa_n_heads: 16          # fallback to MLA при d_model<256
+      num_mtp_heads: 4
+      selective_backward: false
+      backward_ratio: 1.0
     data:
       data_path: "data_train"
-      chunk_size: 256
-      batch_size: 128
+      chunk_size: 4096        # мин 512 байт для патчей
+      batch_size: 4096         # макс throughput для scaling laws
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
-      max_steps: 200
-      warmup_steps: 10
+      max_steps: 500
+      warmup_steps: "5%"
       min_lr_ratio: 0.3
-      learning_rate_muon: 0.003
-      learning_rate_adamw: 0.0003
+      learning_rate_muon: 0.001
+      learning_rate_adamw: 0.00005
       weight_decay: 0.1
-      grad_accum_steps: 2
-      mod_capacity: 0.5
+      grad_accum_steps: 4
+      mod_capacity: 0.5        # ponytail: temp — test MoD router fix
       mod_interval: 1
-      use_dispersion_loss: true
-      use_rho_loss: true
-      lr_schedule: "wsd"
-      wsd_decay_frac: 0.1
-      sct_rank: 8
-      use_dropbp: true
+      use_dispersion_loss: false
+      use_rho_loss: false
+      use_ascii_curriculum: true
+      lr_schedule: "cosine"
+      sct_rank: 32            # минимум по SCT paper для 1.7B → масштабируем вниз
     perf:
-      keep_last_n: 3
-      grad_ckpt_every: 3
+      keep_last_n: 1
+      grad_ckpt_every: 2
 
   # ═══════════════════════════════════════════════════════════════════
-  # sovereign_5h — ~5 часов (~70M params) — минимальный чат-бот
+  # verabey-27m — чат-бот (~67M SCT-128)
   # ═══════════════════════════════════════════════════════════════════
-  sovereign_5h:
+  verabey-67m:
     model:
       d_model: 512
       n_layers: 8
       n_heads: 8
       expert_hidden: 1024
-      num_experts: 6
+      num_experts: 8          # 8 экспертов → лучше специализация
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 8
+      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
       selective_backward: true
-      backward_ratio: 0.5
-      nsa_n_heads: 16          # d_k=512/16=32 ✓
+      backward_ratio: 0.3
+      use_differential_attention: true  # Diff MLA — острее NSA на коротких патчах
+      nsa_n_heads: 1                     # принудительно MLA (1%16≠0)
     data:
       data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 256
+      chunk_size: 8192        # 8K контекст, curriculum 1024→2K→4K→8K
+      batch_size: 3072          # авто: 3072→1536→768→384 — ~5GB VRAM peak
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
@@ -76,24 +75,27 @@ profiles:
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 1       # no accumulation — full batch per step
-      mod_capacity: 1.0       # MoD off — 58M too small, hurts training
-      mod_interval: 1
-      use_dropbp: false       # DropBP off — 58M too small, hurts training
-      use_dispersion_loss: true
-      use_rho_loss: true
+      grad_accum_steps: 4
+      mod_capacity: 0.5        # MoD: регуляризация улучшает качество
+      mod_interval: 2
+      use_chunk_curriculum: true
+      use_dropbp: false
+      use_dispersion_loss: false
+      use_rho_loss: false  # ponytail: RHO-Loss → NaN
+      use_ascii_curriculum: true
+      use_fused_training: false
+      sct_rank: 128             # SCT rank — arXiv:2604.00733 sweet spot: 11.7× best PPL
       lr_schedule: "wsd"
       wsd_decay_frac: 0.1
-      sct_rank: 8
     perf:
+      grad_ckpt_every: 1       # checkpoint each layer — safety при chunk 8192×1536
       keep_last_n: 3
-      dynamic_compile: false   # меньше Python overhead между слоями
-      grad_ckpt_every: 4    # batch=288 хватает VRAM → меньше рекомпьюта
+      dynamic_compile: false
 
   # ═══════════════════════════════════════════════════════════════════
-  # sovereign_12h — ~12 часов (~170M params, 37 tok/param → 6.3B tokens)
+  # sokal-120m — на ночь (~120M SCT-128, ~8 часов)
   # ═══════════════════════════════════════════════════════════════════
-  sovereign_12h:
+  sokal-120m:
     model:
       d_model: 768
       n_layers: 8
@@ -103,40 +105,40 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 10
+      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
       selective_backward: true
       backward_ratio: 0.5
       nsa_n_heads: 16
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 96
+      batch_size: 1536
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
-      warmup_steps: "auto"
+      warmup_steps: "5%"
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 2
+      grad_accum_steps: 4
       mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: true
-      use_rho_loss: true
+      use_rho_loss: false  # ponytail: RHO-Loss → NaN
       use_ascii_curriculum: true
       lr_schedule: "wsd"
       wsd_decay_frac: 0.1
-      sct_rank: 8
+      sct_rank: 128
       use_dropbp: true
     perf:
       keep_last_n: 4
       grad_ckpt_every: 3
 
   # ═══════════════════════════════════════════════════════════════════
-  # sovereign_24h — ~24 часа (~350M params, 37 tok/param → 13B tokens)
+  # kruk-210m — сильная модель (~210M SCT-128)
   # ═══════════════════════════════════════════════════════════════════
-  sovereign_24h:
+  kruk-210m:
     model:
       d_model: 768
       n_layers: 16
@@ -146,7 +148,7 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 12
+      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
       selective_backward: true
       backward_ratio: 0.5
       progressive_freeze: true
@@ -154,33 +156,36 @@ profiles:
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 64
+      batch_size: 768
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
-      max_steps: "auto"
-      warmup_steps: "auto"
+      max_steps: auto
+      target_tok_per_param: 80  # overrides scaling law 37 → 80 tok/param
+      warmup_steps: "5%"
       min_lr_ratio: 0.3
-      learning_rate_muon: 0.002
-      learning_rate_adamw: 0.0002
+      learning_rate_muon: 0.0015  # LR-finder: stable up to 0.01 on clean model; 0.0015 with all features
+      learning_rate_adamw: 0.00015
       weight_decay: 0.1
-      grad_accum_steps: 2
+      grad_accum_steps: 4
       mod_capacity: 0.5
       mod_interval: 1
-      use_dispersion_loss: true
-      use_rho_loss: true
+      use_dispersion_loss: false
+      use_rho_loss: false  # ponytail: NaN at step~177; diagnostic 200 steps clean without
       use_ascii_curriculum: true
-      lr_schedule: "wsd"
+      lr_schedule: "cosine"
       wsd_decay_frac: 0.1
-      sct_rank: 8
+      sct_rank: 128
+      lotus_rank: 128  # match SCT rank — LR-finder stable at 0.01 with this
       use_dropbp: true
+      debug: false  # true = NaN checks + weight diag; false = max training speed
     perf:
       keep_last_n: 5
       grad_ckpt_every: 3
 
   # ═══════════════════════════════════════════════════════════════════
-  # sovereign_3d — ~3 дня (~1B params, 37 tok/param → 37B tokens)
+  # busel-365m — флагман (~365M SCT-128)
   # ═══════════════════════════════════════════════════════════════════
-  sovereign_3d:
+  busel-365m:
     model:
       d_model: 1024
       n_layers: 18
@@ -190,7 +195,7 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 12
+      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
       selective_backward: true
       backward_ratio: 0.5
       progressive_freeze: true
@@ -198,7 +203,7 @@ profiles:
     data:
       data_path: "data_train"
       chunk_size: 4096
-      batch_size: 28
+      batch_size: 448
       mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
     training:
       max_steps: "auto"
@@ -207,15 +212,15 @@ profiles:
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 2
+      grad_accum_steps: 4
       mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: true
-      use_rho_loss: true
+      use_rho_loss: false  # ponytail: RHO-Loss → NaN
       use_ascii_curriculum: true
       lr_schedule: "wsd"
       wsd_decay_frac: 0.1
-      sct_rank: 8
+      sct_rank: 128
       use_dropbp: true
     perf:
       keep_last_n: 5

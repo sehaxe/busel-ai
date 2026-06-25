@@ -12,3 +12,4 @@ path = "lib.rs"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 memmap2 = "0.9"
 rayon = "1.8"
+libc = "0.2"

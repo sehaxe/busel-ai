@@ -1,6 +1,6 @@
 """busel pretrain config — single source of truth. Only size + hyperparameters."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from training.stages.base import _apply_model_profile
 
@@ -35,26 +35,27 @@ class buselPretrainConfig:
     # MoE depth
     mod_capacity: float = 1.0  # MoD: 0.5 = 50% tokens through FFN
     mod_interval: int = 2      # apply MoD every N layers
+    debug: bool = False        # enable NaN checks, weight diag, grad norm scans
     
     # Features (always ON — busel defaults)
     use_chunk_curriculum: bool = True
     selective_backward: bool = True
     backward_ratio: float = 0.5
-    use_differential_attention: bool = True
+    use_differential_attention: bool = False
     use_dispersion_loss: bool = True
     dispersion_weight: float = 0.1
     dispersion_temperature: float = 2.0
-    use_tequila: bool = True
+    use_tequila: bool = False
     tequila_lambda: float = 0.001
-    use_rho_loss: bool = True
+    use_rho_loss: bool = False  # ponytail: disabled — NaN with SCT+Muon+grad_accum
     rho_keep_ratio: float = 0.5
-    # D5: Progressive layer freezing. OFF by default (enable for large models)
-    progressive_freeze: bool = False
-    freeze_threshold: float = 0.5  # progress fraction to start freezing
-    # D6: Byte-level ASCII curriculum. OFF by default (enable for 1B+)
-    use_ascii_curriculum: bool = False
-    sct_rank: int = 0  # SCT: 0 = off, 8 = rank for Spectral Linear in FFN
-    use_dropbp: bool = False
+    progressive_freeze: bool = True
+    freeze_threshold: float = 0.5
+    use_ascii_curriculum: bool = True
+    sct_rank: int = 128  # SCT rank — arXiv:2604.00733 sweet spot: 11.7× compression, best PPL
+    use_matmul_free: bool = False  # ponytail: off — SCT gives better quality. Enable for max speed.
+    use_fused_training: bool = False  # off — hysteresis disabled by fused, causes divergence
+    use_dropbp: bool = True
     dropbp_prob: float = 0.3
     
     # Optimizer (always SF-NorMuon)
@@ -63,10 +64,11 @@ class buselPretrainConfig:
     lotus_rank: int = 8
     lr_multipliers: dict | None = None
     min_lr_ratio: float = 0.1
-    lr_schedule: str = "cosine"
+    lr_schedule: str = "wsd"
     wsd_decay_frac: float = 0.1
+    target_tok_per_param: int = 0  # 0 = use scaling law (37 small / 80 large); >0 overrides
     grad_clip: float = 2.0
-    checkpoint_interval: int = 100
+    checkpoint_steps: list[int] = field(default_factory=list)  # explicit steps to save; empty = none
     use_yarn: bool = False
     yarn_scale: float = 32.0
     yarn_start_frac: float = 0.92
@@ -74,8 +76,8 @@ class buselPretrainConfig:
     
     # Perf
     inductor_cache_dir: str = "~/.cache/busel/inductor"
-    inductor_cache_clean: bool = False
-    inductor_cache_max_gb: float = 0.0
+    inductor_cache_clean: bool = False  # persist cache across runs
+    inductor_cache_max_gb: float = 4.0
     keep_last_n: int = 5
     dynamic_compile: bool = True
     grad_ckpt_every: int = 2  # gradient checkpointing: 2 = every other layer
@@ -116,6 +118,9 @@ class buselPretrainConfig:
         cfg.freeze_threshold = float(t.get("freeze_threshold", cfg.freeze_threshold))
         cfg.use_ascii_curriculum = bool(t.get("use_ascii_curriculum", cfg.use_ascii_curriculum))
         cfg.sct_rank = int(t.get("sct_rank", cfg.sct_rank))
+        cfg.lotus_rank = int(t.get("lotus_rank", cfg.lotus_rank))
+        cfg.use_matmul_free = bool(t.get("use_matmul_free", cfg.use_matmul_free))
+        cfg.use_fused_training = bool(t.get("use_fused_training", cfg.use_fused_training))
         cfg.use_dropbp = bool(t.get("use_dropbp", cfg.use_dropbp))
         cfg.dropbp_prob = float(t.get("dropbp_prob", cfg.dropbp_prob))
         cfg.lr_multipliers = t.get("lr_multipliers", cfg.lr_multipliers)
@@ -125,7 +130,11 @@ class buselPretrainConfig:
         cfg.lr_schedule = str(t.get("lr_schedule", cfg.lr_schedule))
         cfg.wsd_decay_frac = float(t.get("wsd_decay_frac", cfg.wsd_decay_frac))
         cfg.grad_clip = float(t.get("grad_clip", cfg.grad_clip))
-        cfg.checkpoint_interval = int(t.get("checkpoint_interval", cfg.checkpoint_interval))
+        cfg.debug = bool(t.get("debug", cfg.debug))
+        cfg.target_tok_per_param = int(t.get("target_tok_per_param", cfg.target_tok_per_param))
+        cs = t.get("checkpoint_steps", None)
+        if cs is not None:
+            cfg.checkpoint_steps = [int(s) for s in cs]
         yn = profile_dict.get("yarn", {})
         cfg.use_yarn = bool(yn.get("enabled", cfg.use_yarn))
         cfg.yarn_scale = float(yn.get("target_scale", cfg.yarn_scale))

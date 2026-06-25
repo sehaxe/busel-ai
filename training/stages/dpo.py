@@ -91,8 +91,6 @@ def _enforce_stability(seed: int = 42) -> None:
 def _detect_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -225,7 +223,7 @@ class buselDPOStage:
             raise RuntimeError("setup() must be called before run()")
 
         autocast_dtype = torch.bfloat16 if self.device in ("cuda", "cpu") else torch.float16
-        autocast_enabled = self.device in ("cuda", "mps")
+        autocast_enabled = self.device == "cuda"
         chunk_size = self.cfg.chunk_size // 4
         beta = self.cfg.dpo_beta
 

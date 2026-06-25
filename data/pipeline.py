@@ -286,10 +286,8 @@ def get_busel_dataloader(data_path, chunk_size, batch_size, start_file_idx=0, st
     dataset = RustByteStreamDataset(data_path, chunk_size, start_file_idx, start_byte_offset, mix_weights=mix_weights)
     use_pin = torch.cuda.is_available()
     if num_workers is None:
-        if platform.system() == "Linux" and torch.cuda.is_available():
-            num_workers = min(4, os.cpu_count() or 1)
-        else:
-            num_workers = 0
+        # ponytail: mmap is zero-CPU — workers add RAM overhead with no benefit
+        num_workers = 0
 
     collate_fn = collate_packed_batch if use_packing else collate_busel_batch
     return DataLoader(

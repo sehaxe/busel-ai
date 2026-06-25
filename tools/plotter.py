@@ -50,7 +50,8 @@ def _compute_dashboard_stats(steps, losses, speeds, vrams, cumulative_tokens):
     }
 
 
-def generate_report_plot(log_path="checkpoints/metrics.jsonl", output_path="checkpoints/training_report.png"):
+def generate_report_plot(log_path="checkpoints/metrics.jsonl", output_path="checkpoints/training_report.png",
+                         tokens_per_step: int = 262144):
     """Parse JSONL metrics log and render a 3-panel flat Google Material chart."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -60,7 +61,6 @@ def generate_report_plot(log_path="checkpoints/metrics.jsonl", output_path="chec
         return False
     steps, losses, aux_losses, speeds, lrs, vrams = metrics
 
-    tokens_per_step = 2048
     cumulative_tokens = steps * tokens_per_step
 
     loss_smoothed = _ema(losses, alpha=0.2)
@@ -152,9 +152,9 @@ def generate_report_plot(log_path="checkpoints/metrics.jsonl", output_path="chec
 
     columns = [
         (0.16, "MINIMUM LOSS",    f"{stats['min_loss_val']:.4f}",      "#1A73E8", f"at Step {stats['min_loss_step']}"),
-        (0.38, "COMPUTE SPEED",   f"{stats['avg_speed_val']:.1f} tok/s", "#34A853", "MacBook Air / MPS"),
+        (0.38, "COMPUTE SPEED",   f"{stats['avg_speed_val']:.1f} tok/s", "#34A853", "CUDA"),
         (0.62, "CUMULATIVE VOLUME", f"{stats['total_tokens_val'] / 1e3:.1f} Ktok", "#12B5CB", "Byte Tokens Processed"),
-        (0.84, "PEAK MEMORY",     f"{stats['max_vram_val']:.1f} MB",   "#9333EA", "Allocated on MPS"),
+        (0.84, "PEAK MEMORY",     f"{stats['max_vram_val']:.1f} MB",   "#9333EA", "CUDA"),
     ]
     for x, label, value, color, sublabel in columns:
         fig.text(x, 0.955, label, fontsize=7.5, color="#5F6368", fontweight="bold", ha="center")

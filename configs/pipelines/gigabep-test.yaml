@@ -1,0 +1,11 @@
+name: gigabep-test
+stages:
+  - name: pretrain
+    data_preset: shpak
+    checkpoint_out: checkpoints/busel_gigabep_test.pt
+    params:
+      profile_name: gigabep
+      max_steps: 10
+      warmup_steps: 2
+      chunk_size: 1024      # 256 tok/seq → ~3GB VRAM instead of 12GB
+global_params: {}

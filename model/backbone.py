@@ -54,7 +54,9 @@ class ManifoldConstrainedAttnRes(nn.Module):
 
         identity_bias = torch.zeros(n_hyper, n_hyper)
         for i in range(n_hyper):
-            identity_bias[i, i] = 5.0
+            identity_bias[i, i] = 1.0  # ponytail: D10 — 1.0 instead of 5.0 to allow q@k^T gradient through mAR
+        # Add small random noise to break symmetry between streams and enable gradient flow
+        identity_bias = identity_bias + torch.randn(n_hyper, n_hyper) * 0.1
         self.register_buffer("identity_bias", identity_bias)
 
         self.temperature = nn.Parameter(torch.ones(1))
@@ -122,7 +124,7 @@ class ManifoldConstrainedAttnRes(nn.Module):
 
 
 class buselDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, layer_idx=0, mod_interval=2, nsa_n_heads=16, sct_rank=0):
+    def __init__(self, d_model, n_heads, expert_hidden, num_experts, is_global=False, capacity_factor=1.0, top_k=2, use_differential=False, layer_idx=0, mod_interval=2, nsa_n_heads=16, sct_rank=0, use_matmul_free=False):
         super().__init__()
         self.mod_router = MoDSequenceRouter(d_model, capacity_factor=capacity_factor)
         self.layer_idx = layer_idx
@@ -133,31 +135,34 @@ class buselDecoderLayer(nn.Module):
             self.attn = MultiHeadLatentAttention(d_model, n_heads, use_differential=use_differential)
         else:
             self.attn = BulbaGDN2SeRoPEBlock(d_model, n_heads)
-        self.moe = BulbaTernaryTitanMoE(d_model, expert_hidden, num_experts=num_experts, top_k=top_k, sct_rank=sct_rank)
+        self.moe = BulbaTernaryTitanMoE(d_model, expert_hidden, num_experts=num_experts, top_k=top_k, sct_rank=sct_rank, use_matmul_free=use_matmul_free)
         self.attn_norm = RMSNorm(d_model)
         self.moe_norm = RMSNorm(d_model)
 
     def forward(self, x, progress=0.0):
-        # ponytail: only apply MoD every mod_interval layers to avoid token starvation
         do_mod = self.mod_router.capacity_factor < 1.0 and (self.layer_idx % self.mod_interval == 0)
         if not do_mod:
             attn_out = self.attn(self.attn_norm(x))
             moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
             return moe_out, aux_loss
         B, T, C = x.shape
-        mask, logits, mod_aux = self.mod_router(x)
+        mask, logits, topk_idx, mod_aux = self.mod_router(x)
         k = max(2, int(T * self.mod_router.capacity_factor))
-        if k >= T:  # ponytail: guard against degenerate routing (<2 tokens)
+        if k >= T:
             attn_out = self.attn(self.attn_norm(x))
             moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
             return moe_out, aux_loss + mod_aux
-        active_tokens = x[mask].view(B, k, C)
+        # ponytail: integer indexing instead of boolean mask — torch.compile friendly
+        batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, k)  # (B, k)
+        active_tokens = x[batch_idx, topk_idx]  # (B, k, C)
         attn_out = self.attn(self.attn_norm(active_tokens))
         moe_out, aux_loss = self.moe(self.moe_norm(attn_out), progress=progress)
-        gated_out = moe_out * torch.sigmoid(logits[mask]).view(B, k, 1)
-        # Non-selected tokens output zero → x_new = mixed + 0 = mixed (identity via residual).
+        # ponytail: detach logits in gate — prevents double-gradient feedback
+        # (topk backward + sigmoid backward both push logits → ±∞ over ~170 steps).
+        # Router still learns via topk gradient + aux loss; gate still works.
+        gated_out = moe_out * torch.sigmoid(logits.detach()[batch_idx, topk_idx]).unsqueeze(-1)
         out = torch.zeros_like(x)
-        out[mask] = gated_out.view(-1, C).to(out.dtype)
+        out[batch_idx, topk_idx] = gated_out.to(out.dtype)
         return out, aux_loss + mod_aux
 
 
@@ -223,10 +228,11 @@ class buselModel(nn.Module):
         mod_interval = int(getattr(config, "mod_interval", 2))
         nsa_n_heads = int(getattr(config, "nsa_n_heads", 16))
         use_differential = bool(getattr(config, "use_differential_attention", False))
+        use_matmul_free = bool(getattr(config, "use_matmul_free", False))
         sct_rank = int(getattr(config, "sct_rank", 0))
         self.layers = nn.ModuleList()
         for l in range(config.n_layers):
-            # 7:1 GDN-2:NSA ratio (MiniMax M3). ≥1 global layer guaranteed.
+            # 7:1 GDN-2:global ratio. Global layer auto-picks Diff MLA (short) or NSA (long).
             is_global = (l == config.n_layers - 1) or ((l + 1) % 8 == 0)
             self.layers.append(buselDecoderLayer(
                 config.d_model, config.n_heads, config.expert_hidden,
@@ -236,6 +242,7 @@ class buselModel(nn.Module):
                 layer_idx=l, mod_interval=mod_interval,
                 nsa_n_heads=nsa_n_heads,
                 sct_rank=sct_rank,
+                use_matmul_free=use_matmul_free,
             ))
 
         self.m_residuals = nn.ModuleList([
@@ -272,7 +279,7 @@ class buselModel(nn.Module):
 
     def forward(self, x, next_token_ids=None, progress=0.0):
         nvtx_range_push("buselModel_Forward")
-        progress = round(float(progress), 1)  # quantize for torch.compile stability
+        progress = round(float(progress), 1)
         streams = x.unsqueeze(0).expand(self.n_hyper, *x.shape).contiguous()
         total_aux_loss = 0.0
         ckpt_every = self.checkpoint_every if self.use_gradient_checkpointing else 1
@@ -281,7 +288,7 @@ class buselModel(nn.Module):
         if self.selective_backward and self.training and self.backward_ratio < 1.0:
             n_layers = len(self.layers)
             n_select = max(1, int(n_layers * self.backward_ratio))
-            self._selected_layers = list(range(n_layers - n_select, n_layers))
+            self._selected_layers = random.sample(range(n_layers), n_select)
         else:
             self._selected_layers = list(range(len(self.layers)))
 
@@ -312,8 +319,8 @@ class buselModel(nn.Module):
                 layer_out, aux_loss = layer(mixed, progress=progress)
 
             x = mixed + layer_out
-            # ponytail: clamp extreme values to prevent bf16 overflow at scale
-            if self.training: x = torch.clamp(x, -100.0, 100.0)
+            # ponytail: grad-safe activation scaling — tanh limits extremes without killing gradient
+            if self.training: x = 100.0 * torch.tanh(x / 100.0)
             total_aux_loss += aux_loss
             streams = torch.cat([streams[1:], x.unsqueeze(0)], dim=0)
 

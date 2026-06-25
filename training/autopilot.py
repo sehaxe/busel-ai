@@ -31,16 +31,19 @@ class buselAutoPilot:
         self.warmup_steps = 0
 
     def before_step(self, model, step, max_steps):
-        if not any(p.grad is not None for p in model.parameters()):
+        # ponytail: cache param list — avoids model.parameters() iteration every step
+        if not hasattr(self, '_cached_params'):
+            self._cached_params = list(model.parameters())
+        if not any(p.grad is not None for p in self._cached_params):
             return 1.0
         
         if step < 50:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.grad_clip, foreach=True)
-            return self.grad_clip
+            torch.nn.utils.clip_grad_norm_(self._cached_params, max_norm=1.0, foreach=True)
+            return 1.0
 
         with torch.no_grad():
             current_grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in model.parameters() if p.grad is not None], 2.0
+                [p.grad for p in self._cached_params if p.grad is not None], 2.0
             ).item()
             if current_grad_norm != current_grad_norm:
                 return 1.0
@@ -57,17 +60,17 @@ class buselAutoPilot:
             
             if current_grad_norm > threshold:
                 scale_factor = mean_norm / (current_grad_norm + 1e-8)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=current_grad_norm * scale_factor, foreach=True)
+                torch.nn.utils.clip_grad_norm_(self._cached_params, max_norm=current_grad_norm * scale_factor, foreach=True)
                 print(f"\n⚡ [PREDICTIVE DAMPENING ACTIVATED]:")
                 print(f"   • Detected abnormal gradient norm surge: {current_grad_norm:.4f} (Threshold: {threshold:.4f})")
                 print(f"   • Preventively scaled gradients down by factor: {scale_factor:.4f} to bypass impending loss spike.")
 
         if len(self.grad_norm_history) >= 10:
             rolling_avg_grad = sum(self.grad_norm_history) / len(self.grad_norm_history)
-            clipping_threshold = min(2.0, max(0.3, rolling_avg_grad * 1.5))
+            clipping_threshold = min(1.0, max(0.5, rolling_avg_grad * 1.0))
         else:
             clipping_threshold = 1.0
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clipping_threshold, foreach=True)
+        torch.nn.utils.clip_grad_norm_(self._cached_params, max_norm=clipping_threshold, foreach=True)
         
         progress = 0.0 if max_steps == 0 else min(1.0, max(0.0, float(step) / float(max_steps)))
         if step < self.warmup_steps:
@@ -153,22 +156,3 @@ class buselAutoPilot:
             self.noise_scale *= self.noise_decay
             
         return new_lr_muon, self.noise_scale
-
-    def inject_noise(self, model):
-        if self.noise_scale < 1e-6:
-            return
-        with torch.no_grad():
-            ns = self.noise_scale
-            grads = [p.grad for p in model.parameters() if p.grad is not None]
-            if not grads:
-                return
-            # single randn for all grads, then scatter per-param
-            total_elems = sum(g.numel() for g in grads)
-            all_noise = torch.randn(total_elems, device=grads[0].device, dtype=grads[0].dtype)
-            offset = 0
-            for g in grads:
-                n = g.numel()
-                gn = g.view(-1).norm()
-                if gn > 1e-5:
-                    g.add_(all_noise[offset:offset + n].view_as(g), alpha=ns * gn)
-                offset += n

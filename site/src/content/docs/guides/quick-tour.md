@@ -9,20 +9,25 @@ already knows what an LLM is. For the full install-and-run, see
 
 ## What is Busel?
 
-A from-scratch **1.58-bit LLM** written in ~2 300 lines of Python +
+A from-scratch **1.58-bit LLM** written in ~3 000 lines of Python +
 ~140 lines of Rust, with a custom architecture that combines:
 
 - **BitNet v2** 1.58-bit weights and H-BitLinear output projection
+- **Fused BitLinear** Triton kernel — replaces 10+ ops in one launch (eager mode)
 - **mAR** — input-dependent, doubly-stochastic layer-mixing residuals
   (Busel's own combination of Kimi AttnRes + DeepSeek mHC)
-- **3 : 1 GDN-2 / MLA** — linear attention (75 %) and latent-KV
-  attention (25 %)
+- **3:1 GDN-2 / MLA / NSA** — linear attention (75%), latent-KV
+  attention (25%), Native Sparse Attention for dynamic sparsity
+- **SCT rank-8** — Spectral Compact Training, FFN compression ×4-8
+- **MatMul-free FFN** — ternary weights replace all multiplications
 - **MoE with Blackboard Memory** — 2 always-on shared + N routed experts
 - **MTP-4** — 4 parallel heads predicting `t+1` … `t+4`
-- **Hybrid Muon + AdamW** — Newton-Schulz on `proj` weights, AdamW on
-  the rest, AutoPilot v6.0 to glue them together
-- **Byte-level tokens** — vocab=259, no BPE, Gated FastBLT patcher
-- **Curriculum + Chinchilla auto-planner** — `D ≈ 80 × N` byte-tokens
+- **SF-NorLotusMuon + FP8 AdamW** — Schedule-Free + NorMuon + LOTUS
+  rank-8 with Gram Newton-Schulz orthogonalization, FP8 AdamW for
+  1D params, AutoPilot v6.0 to glue them together
+- **Byte-level tokens** — vocab=277, no BPE, ByteFlow patcher
+- **GRPO stage** — Group Relative Policy Optimization for RL-based fine-tuning
+- **Curriculum + scaling-law auto-planner** — `D ≈ 37 × N` byte-tokens (small models)
 
 Everything in one repo, with a Typer CLI, an Astro+Starlight wiki, and
 a Teto Vocaloid emoticon in the training log.
@@ -45,39 +50,39 @@ a Teto Vocaloid emoticon in the training log.
   count and data (Shpak ≈ 50 M).
 - Not a commercial product. **CC BY-NC-SA 4.0.** No commercial use
   without written permission.
-- Not a single-file demo. It has a real optimizer, a real data
-  pipeline, a real profiler, and a real wiki.
 
 ## The numbers
 
 All numbers are from a single RTX 5060 Ti (16 GB, sm_120, PyTorch 2.12
 + CUDA 13.0). The validation profile is a 2 M-param toy used to
-exercise the full pipeline; the shpak profile is the "real" 52.8 M-param
+exercise the full pipeline; verabey-27m is the "real" 70 M-param
 training target.
 
-| Profile  | Total params | Active | Bit-size | Context | Planned tokens (Chinchilla) |
-|----------|-------------:|-------:|---------:|--------:|----------------------------:|
-| chyzh    | ~10 M        | ~5 M   | —        | 512 B   | ~0.8 B                      |
-| **shpak**| **52.8 M**   | 25 M   | **11 MB**| 4096 B  | **3.84 B** (≈ 25 000 steps) |
-| zubr     | 120 M        | 35 M   | 30 MB    | 16 384 B| ~9.6 B                      |
+| Profile      | Total params | Bit-size | Context | Planned tokens |
+|--------------|-------------:|---------:|--------:|---------------:|
+| chizh-8m     | ~4 M         | ~1 MB    | 1024 B  | ~0.15 B        |
+| verabey-27m  | ~70 M        | 14 MB    | 4096 B  | **~2.6 B**     |
+| sokal-60m   | ~170 M       | 35 MB    | 8192 B  | ~6.3 B         |
+| kruk-120m    | ~350 M       | 70 MB    | 8192 B  | ~13 B          |
+| busel-200m     | ~1 B         | 200 MB   | 32 768 B| ~37 B          |
 
 ### Inference cost (CPU, ternary matmul via Rust)
 
-- Shpak forward: 100+ tok/s on a modern laptop CPU.
-- Memory: 11 MB for weights, plus KV cache (~98 MB at 128 K ctx for MLA).
+- verabey-27m forward: 100+ tok/s on a modern laptop CPU.
+- Memory: 14 MB for weights, plus KV cache (~98 MB at 128 K ctx for MLA).
 
 ### Training cost (RTX 5060 Ti, validation profile)
 
 | Mode (compile)                | tok/s     | vs eager |
 |-------------------------------|----------:|---------:|
-| Eager                         | 189 576   | 1.00×    |
-| `torch.compile` (default)     | **578 255** | **3.05×** |
+| Eager (Fused BitLinear Triton)| 215 000   | 1.00×    |
+| `torch.compile` (default)     | **578 255** | **2.7×** |
 | End-to-end training (200 steps) | 33 575 avg | — |
 
-The 3× compile speedup applies to the raw forward/backward/step. The
+The 2.7× compile speedup applies to the raw forward/backward/step. The
 end-to-end number includes per-step Python overhead (optimizer, JSON
 logging every 10 steps, dataloader handoffs) which is the bottleneck
-on small profiles. On shpak the compute fraction dominates and you
+on small profiles. On verabey-27m the compute fraction dominates and you
 get back close to the bench number.
 
 See [Performance → torch.compile modes](/busel-ai/performance/compile-modes/)
@@ -90,17 +95,17 @@ The whole project fits in one screen of `tree -L 2`:
 ```
 busel-ai/
 ├── model/              # BitLinear, mAR, attention mix, MoE, MTP
-├── training/           # Muon+AdamW, AutoPilot, MTP-4 loss
+├── training/           # SF-NorLotusMuon + FP8 AdamW, AutoPilot, stages/ (pretrain→SFT→DPO→eval→GRPO)
 ├── data/               # Stream-interleaving byte loader
+├── multimodal/         # Any-to-token encoders (image/video/audio/PDF/docx)
 ├── ui/                 # Teto Vocaloid + rich terminal
-├── tools/              # CLI, data manager, orchestrator, plotter, inference
-├── tests/              # 61 unit tests + ultra-stable profiler v2.0
+├── tools/              # CLI, data manager, orchestrator, plotter, inference, tool_executor
+├── tests/              # 175 unit tests + ultra-stable profiler
 ├── busel_rust_io/      # PyO3 Rust: mmap streamer, ternary matmul, packer
-├── configs/            # default.yaml — Shpak/Zubr/Chyzh/...
+├── configs/            # default.yaml — 12 profiles
 ├── site/               # Astro+Starlight wiki (you are here)
 ├── busel_registry.py   # Plug-in extension-point registry
 ├── busel_logging.py    # JSONL event stream
-├── train.py            # Training orchestrator
 ├── cli.py              # Typer entrypoint
 └── pyproject.toml      # uv-managed, maturin backend
 ```
@@ -123,17 +128,17 @@ of the docs.
   └────────┬─────────┘
            ▼
   ┌──────────────────┐
-  │ StridedFastBLT   │  vocab=259 → d_byte=128 → d_model
-  │ Patcher          │  conv kernel=5, stride=4
-  │ (model/patching) │  + sigmoid-gated mini-SwishGLU
+  │ ByteFlow          │  vocab=277 → d_byte=128 → d_model
+  │ Patcher           │  adaptive pooling + boundary detection
+  │ (model/patching)  │  + sigmoid-gated mini-SwishGLU
   └────────┬─────────┘
            │  patches  (B, T/4, d_model)
            ▼
   ┌──────────────────┐
   │ buselModel       │  n_layers × (mAR + decoder layer)
-  │ (model/backbone) │  is_global = (l+1) % 4 == 0  ← 3:1 GDN-2/MLA
+  │ (model/backbone) │  is_global = (l+1) % 4 == 0  ← 3:1 GDN-2/MLA/NSA
   │                  │  mAR: n_hyper=2 parallel streams
-  │                  │  + buselDecoderLayer (attn + MoE)
+  │                  │  + buselDecoderLayer (attn + MatMul-free MoE)
   │                  │  + buselMTP4Pipeline (4 heads)
   └────────┬─────────┘
            │  logits_t1, _t2, _t3, _t4
@@ -154,8 +159,8 @@ of the docs.
   └────────┬─────────┘
            ▼
   ┌──────────────────┐
-  │ buselOptimizer   │  2D proj weights → Muon (Newton-Schulz ×5)
-  │ (training/opt)   │  everything else → AdamW
+  │ buselOptimizer   │  2D proj weights → SF-NorLotusMuon (Gram NS)
+  │ (training/opt)   │  everything else → FP8 AdamW
   └──────────────────┘
            │
            ▼

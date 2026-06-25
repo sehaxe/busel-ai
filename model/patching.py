@@ -12,7 +12,7 @@ class StridedFastBLTPatcher(nn.Module):
         self.d_byte = d_byte
         self.stride = 4  # kept for MTP target alignment
         self.kernel_size = 5
-        self.n_patches = 16  # K = stride * 4, keep same output dim
+        self.n_patches = 16  # fixed output: 16 patches regardless of input length
 
         self.vocab_size = _vocab_size()
         self.embed_weight = nn.Parameter(torch.randn(self.vocab_size, d_byte) * 0.02)
@@ -21,7 +21,8 @@ class StridedFastBLTPatcher(nn.Module):
         self.gate_proj_up = nn.Linear(max(1, d_byte // 4), d_byte)
         
         self.boundary_conv = nn.Conv1d(d_byte, 1, kernel_size=3, padding=1)
-        self.patch_pool = nn.AdaptiveAvgPool1d(self.n_patches)
+        # ponytail: AdaptiveAvgPool1d hits sharedMemPerBlock limit on chunk ≥4K.
+        # Dynamic AvgPool1d with stride adaptation.
         self.conv = nn.Conv1d(d_byte, d_model, kernel_size=5, stride=1)
         self.norm = RMSNorm(d_model)
 
@@ -36,7 +37,10 @@ class StridedFastBLTPatcher(nn.Module):
         x_t = x.transpose(1, 2)
         scores = torch.sigmoid(self.boundary_conv(x_t))
         x_weighted = x_t * scores
-        x_pooled = self.patch_pool(x_weighted)
+        T = x_weighted.shape[-1]
+        ks = max(1, T // self.n_patches)
+        st = ks
+        x_pooled = F.avg_pool1d(x_weighted, kernel_size=ks, stride=st)
         x_padded = F.pad(x_pooled, (4, 0))
         patches = self.conv(x_padded).transpose(1, 2)
         
