@@ -811,8 +811,9 @@ class buselPretrainStage:
         else:
             eta_str = f"{int(eta_s)}s"
 
-        loss_color = 31 if accumulated_loss == 0 else (32 if step < 50 or accumulated_loss < getattr(self, '_prev_loss', float('inf')) else 33)
-        self._prev_loss = accumulated_loss
+        display_loss = accumulated_loss / max(1, self.cfg.grad_accum_steps)
+        loss_color = 31 if accumulated_loss == 0 else (32 if step < 50 or display_loss < getattr(self, '_prev_loss', float('inf')) else 33)
+        self._prev_loss = display_loss
         # ponytail: 20-char progress bar — negligible overhead (one string, every 10 steps)
         pct = step / max(1, self.cfg.max_steps)
         bar_w = 20
@@ -820,7 +821,7 @@ class buselPretrainStage:
         bar = "\033[36m" + "█" * filled + "\033[2m" + "░" * (bar_w - filled) + "\033[0m"
         print(
             f"\033[2m{step:5d}/{self.cfg.max_steps}\033[0m  {bar}  "
-            f"\033[1;{loss_color}mloss {accumulated_loss:6.2f}\033[0m | "
+            f"\033[1;{loss_color}mloss {display_loss:6.2f}\033[0m | "
             f"lr {current_lr:.5f}  \033[36m{speed:.0f} tok/s\033[0m  \033[2mETA {eta_str}\033[0m"
         )
 
