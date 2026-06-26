@@ -310,24 +310,24 @@ class buselDPOStage:
             current_lr, _ = self.autopilot.update_parameters(step, accumulated_loss, self.cfg.max_steps)
             self.opt_engine.step()
 
-            mean_loss = accumulated_loss / self.cfg.grad_accum_steps
+            total_loss = accumulated_loss
             mean_acc = accumulated_acc / self.cfg.grad_accum_steps
             if step % 10 == 0:
                 print(
                     f"[DPO] Step {step:05d}/{self.cfg.max_steps:05d} | "
-                    f"Loss: {mean_loss:.3f} | Acc: {mean_acc:.2%} | "
+                    f"Loss: {total_loss:.3f} | Acc: {mean_acc:.2%} | "
                     f"β: {beta:.2f} | LR: {current_lr:.6f} | Clip: {dynamic_clip:.2f}"
                 )
                 with open("checkpoints/metrics.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps({
-                        "stage": "dpo", "step": step, "loss": mean_loss,
+                        "stage": "dpo", "step": step, "loss": total_loss,
                         "accuracy": mean_acc, "lr": current_lr, "beta": beta,
                     }, ensure_ascii=False) + "\n")
-                log_event("dpo_step_complete", step=step, loss=round(mean_loss, 4),
+                log_event("dpo_step_complete", step=step, loss=round(total_loss, 4),
                           accuracy=round(mean_acc, 4), lr=round(current_lr, 7))
 
             state.step = step
-            state.metrics = {"loss": mean_loss, "accuracy": mean_acc, "lr": current_lr}
+            state.metrics = {"loss": total_loss, "accuracy": mean_acc, "lr": current_lr}
 
         return state
 

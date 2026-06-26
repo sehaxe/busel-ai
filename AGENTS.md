@@ -13,7 +13,7 @@
 ## OVERVIEW
 **busel** — Sovereign 1-bit (1.58b) Any-to-Text LLM. Hybrid Python + Rust (PyO3 via maturin). Targets consumer HW (RTX 5060 Ti 16 GB / Apple Silicon). Trained via CLI, documented in `site/` (Astro+Starlight, Bun).
 
-**Architecture:** 1.58-bit ternary weights · byte-level vocab=277 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-6 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-128) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
+**Architecture:** 1.58-bit ternary weights · byte-level vocab=277 · **ByteFlow** patching (adaptive pooling + boundary detection) · 3:1 GDN-2:MLA attention · mAR residuals (Sinkhorn-Knopp on Birkhoff polytope, DTopK) · **Top-1 MoE** with Blackboard Memory · MTP-6 heads · **SF-NorLotusMuon** (Schedule-Free + NorMuon + LOTUS rank-32) + **FP8 AdamW** hybrid · **Gram NS** (`gram_newton_schulz` package) · **Muon+** column normalization · **EMA of weights** · **selective activation checkpointing** (every=2) · **LCSB selective per-layer backward** (default ON in shpak/zubr/chyzh) · **decoupled per-layer LR** (6 sub-groups) · **multi-stage pipeline** (pretrain → SFT → DPO → eval) · **REPL tool executor** · **compile-safe checkpoint loader** · **research features** (Dispersion Loss, Rho-1 Loss, DropBP, Routing-Free, SCT Spectral Compact Training, Tequila, FlexAttention, CLA, Hestia).
 
 ## STRUCTURE
 ```
@@ -25,6 +25,7 @@ busel-ai/
 ├── ui/                # Teto Vocaloid emoticon + rich terminal helpers (animation.py, cli.py)
 ├── tools/             # Typer CLI (orchestrator, data_manager, plotter, inference, **tool_executor**)
 ├── tests/             # unittest suite (175) + ultra-stable profiler + 3 profile scripts
+├── burn_migration/    # Standalone Rust/Burn 0.21 binary (Muon+ optimizer, SCT)
 ├── busel_rust_io/     # PyO3 Rust ext: mmap ByteStreamer, ternary matmul, binary packer
 ├── configs/           # default.yaml — 12 profiles (validation/MicroTest/QuickTest/Chyzh/Scale_m/Shpak/Zubr/IMU1/Noc/Kruk/Byvol)
 ├── site/              # Astro+Starlight docs (GitHub Pages)
@@ -41,19 +42,19 @@ These are hardcoded defaults in `buselOptimizerEngine` and `NorLotusMuon`:
 
 | Feature | Default | Why |
 |---|---|---|---|
-| **SF-NorLotusMuon** (Muon path) | Always ON | Schedule-Free + NorMuon + LOTUS rank-128 + column norm. Single path, no opt-out. |
+| **SF-NorLotusMuon** (Muon path) | Always ON | Schedule-Free + NorMuon + LOTUS rank-32 + column norm. Single path, no opt-out. |
 | **FP8 AdamW** (AdamW path) | Always ON | `torchao.optim.AdamWFp8` — 75% memory reduction vs fp32 AdamW. |
 | **Gram NS** (orthogonalization) | Fallback | `gram_newton_schulz` package disabled — aggressive coefficients unstable on SCT. Uses built-in `_newton_schulz_core` (quintic, 5 steps). |
 | **Muon+** column normalization | Always ON | `O_t / (O_t.norm(dim=0, keepdim=True) + 1e-8)` after NS. |
 | **LOTUS column norm** (§3.2) | Always ON | `bp.norm(dim=0)`, `bq.norm(dim=0)` — prevents exponential buffer growth → NaN. |
 | **top_k** (MoE) | `1` | 1 of N experts per token. −35% routed FFN FLOPs. |
 | **EMA** | `True` | `ema_decay=0.999`. 10-15% fewer steps to same loss. |
-| **SCT rank** | `128` | All profiles. SCT+Muon stable with LOTUS column norm (prevents buffer explosion → NS NaN). |
-| **LOTUS rank** | `128` | Match SCT rank — column L2 norm prevents unbounded growth. |
+| **SCT rank** | `32` | All profiles. Empirically optimal — 6.8× better eff/fact ratio vs full FFN. |
+| **LOTUS rank** | `32` | Empirically optimal — 98% quality of full Muon at 4−8× less memory. |
 | **Selective ckpt** | `every=2` | Halves activation memory at <5% step-time cost. |
 | **LCSB** | `True` (all profiles) | `backward_ratio=0.5`. −44% step, −25% mem, +80% tok/s. |
 | **Decoupled LR** | `{attn:1.0, ffn:1.0, mtp:1.0, norm:1.0, embed:0.5, router:0.5}` | Embed/router get half LR. |
-| **SCT rank-8** | `True` (rank=8) | Spectral Compact Training — FFN compression ×4-8, same quality. |
+| **SCT rank-32** | `True` (rank=32) | Spectral Compact Training — FFN compression up to 48× with 98% quality retained. |
 | **DropBP** | `True` (prob=0.3) | 30% layers skip backward — regularization, +speed. |
 | **Dispersion Loss** | `False` | Optional uniformity loss on embeddings — see opt-in table. |
 | **Progressive Freeze** | `True` | Freeze up to 75% layers in late training — +speed. |
@@ -240,3 +241,4 @@ This file is the project-level summary. Module-specific rules, anti-patterns, an
 - **License:** CC BY-NC-SA 4.0 (NC clause — NO commercial use). Contact `sehaxe` for commercial licence.
 - **LOTUS paper:** arXiv:2602.01233. Rank-r factorised Muon momentum.
 - **Muon repo:** github.com/KellerJordan/Muon — original implementation.
+- **Burn migration:** `burn_migration/` — standalone Rust inference/training binary. Uses Burn 0.21 (Cuda<f32,i32>). Muon+ optimizer (NS + col_norm, momentum=0.95 nesterov, LR=0.01) beats AdamW (9.35 vs 9.65 loss@1k, 192k tok/s). SCT-only, no mAR, no MoE. ~790 LOC Rust, ~200 MB system RAM. Target: within 2× of Python/PyTorch speed at <1/10 system RAM.

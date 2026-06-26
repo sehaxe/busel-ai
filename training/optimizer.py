@@ -263,13 +263,13 @@ class buselOptimizerEngine:
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay; self._step_count = 0
-        self.shadow = {k: (v.detach().clone().float() if v.dtype.is_floating_point else v.detach().clone()) for k, v in model.state_dict().items()}
+        self.shadow = {k: (v.detach().clone().bfloat16() if v.dtype.is_floating_point else v.detach().clone()) for k, v in model.state_dict().items()}
 
     @torch.no_grad()
     def update(self, model):
         self._step_count += 1
         for name, p in model.named_parameters():
-            if name in self.shadow: self.shadow[name].mul_(self.decay).add_(p.detach().float(), alpha=1.0 - self.decay)
+            if name in self.shadow: self.shadow[name].mul_(self.decay).add_(p.detach().bfloat16(), alpha=1.0 - self.decay)
 
     def state_dict(self):
         return {"decay": self.decay, "step": self._step_count, "shadow": self.shadow}
@@ -278,4 +278,4 @@ class EMA:
         self.decay = sd.get("decay", self.decay)
         self._step_count = sd.get("step", 0)
         if "shadow" in sd:
-            self.shadow = sd["shadow"]
+            self.shadow = {k: (v.bfloat16() if v.dtype.is_floating_point else v) for k, v in sd["shadow"].items()}

@@ -236,3 +236,4 @@ def _apply_model_profile(cfg, m: dict) -> None:
     cfg.n_hyper = int(m.get("n_hyper", cfg.n_hyper))
     cfg.nsa_n_heads = int(m.get("nsa_n_heads", getattr(cfg, "nsa_n_heads", 16)))
     cfg.num_mtp_heads = int(m.get("num_mtp_heads", getattr(cfg, "num_mtp_heads", 3)))
+    cfg.n_patches = int(m.get("n_patches", getattr(cfg, "n_patches", 64)))

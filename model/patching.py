@@ -6,13 +6,13 @@ from model.layers import RMSNorm, nvtx_range_push, nvtx_range_pop
 from multimodal.special_tokens import vocab_size as _vocab_size
 
 class StridedFastBLTPatcher(nn.Module):
-    def __init__(self, d_model=768, d_byte=128):
+    def __init__(self, d_model=768, d_byte=128, n_patches=64):
         super().__init__()
         self.d_model = d_model
         self.d_byte = d_byte
         self.stride = 4  # kept for MTP target alignment
         self.kernel_size = 5
-        self.n_patches = 16  # fixed output: 16 patches regardless of input length
+        self.n_patches = n_patches
 
         self.vocab_size = _vocab_size()
         self.embed_weight = nn.Parameter(torch.randn(self.vocab_size, d_byte) * 0.02)

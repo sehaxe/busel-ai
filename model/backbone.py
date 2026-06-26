@@ -171,6 +171,10 @@ class buselMTPPipeline(nn.Module):
 
     Uses N-1 autoregressive steps (t+1 is direct from main_hidden_states).
     Each future head: detach → projection → embed_lookup(prev_token) → next head.
+
+    When `head_callback(idx, logits, targets)` is provided, extra heads' logits
+    are processed immediately and freed — only head 0 is retained. Saves ~74 MB
+    for 8 heads at BS=128, T=128.
     """
     def __init__(self, config):
         super().__init__()
@@ -185,26 +189,40 @@ class buselMTPPipeline(nn.Module):
     def _embed_lookup(self, token_ids):
         return self.embed_weight[token_ids.to(self.embed_weight.device)]
 
-    def forward(self, main_hidden_states, next_token_ids=None):
+    def forward(self, main_hidden_states, next_token_ids=None, head_callback=None):
         B, T, D = main_hidden_states.shape
         _h = lambda t: self.head(t)[..., :self.vocab_size]  # trim FP8 padding
 
-        # t+1: direct from main_hidden_states
+        # t+1: direct from main_hidden_states — always kept
         x = main_hidden_states.unsqueeze(2) + self.pos_embed[:1]
-        logits = [_h(x[:, :, 0])]
+        logits0 = _h(x[:, :, 0])
 
         if next_token_ids is None or any(t is None for t in next_token_ids):
-            # Fill remaining with None for API compatibility
-            logits.extend([None] * (self.n_mtp_heads - 1))
-            return tuple(logits)
+            # backward compat: full tuple when no callback
+            if head_callback is None:
+                return (logits0,) + (None,) * (self.n_mtp_heads - 1)
+            return (logits0, None)
 
+        mtp_accum = None
         h_d = main_hidden_states.detach()
         prev_h = h_d
+        logits = [logits0] if head_callback is None else None
         for i in range(1, self.n_mtp_heads):
             prev_h = self.projection(prev_h) + self._embed_lookup(next_token_ids[i - 1])
             h_pos = prev_h.unsqueeze(2) + self.pos_embed[i:i+1]
-            logits.append(_h(h_pos.squeeze(2)))
+            logits_i = _h(h_pos.squeeze(2))
+            if head_callback is not None:
+                loss_i = head_callback(i, logits_i, next_token_ids[i])
+                if mtp_accum is None:
+                    mtp_accum = loss_i
+                else:
+                    mtp_accum = mtp_accum + loss_i
+                # logits_i freed after loop iteration
+            else:
+                logits.append(logits_i)
 
+        if head_callback is not None:
+            return (logits0, mtp_accum)
         return tuple(logits)
 
 
@@ -277,7 +295,7 @@ class buselModel(nn.Module):
             if hasattr(layer.attn, 'rope_scale'):
                 layer.attn.rope_scale = scale
 
-    def forward(self, x, next_token_ids=None, progress=0.0):
+    def forward(self, x, next_token_ids=None, progress=0.0, head_callback=None):
         nvtx_range_push("buselModel_Forward")
         progress = round(float(progress), 1)
         streams = x.unsqueeze(0).expand(self.n_hyper, *x.shape).contiguous()
@@ -326,6 +344,6 @@ class buselModel(nn.Module):
 
         final_hidden = self.final_norm(x)
         self._last_hidden = final_hidden  # ponytail: exposed for EMA self-distillation (D3)
-        mtp_outputs = self.mtp_pipeline(final_hidden, next_token_ids)
+        mtp_outputs = self.mtp_pipeline(final_hidden, next_token_ids, head_callback=head_callback)
         nvtx_range_pop()
         return mtp_outputs, total_aux_loss

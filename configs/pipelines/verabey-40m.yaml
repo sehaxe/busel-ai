@@ -5,13 +5,13 @@ stages:
   checkpoint_out: checkpoints/verabey-40m_pretrain_FINAL.pt
   params:
     profile_name: verabey-40m
-    no_compile: true
+    no_compile: false
     max_steps: auto
 - name: sft
   data_preset: verabey-40m
   checkpoint_out: checkpoints/verabey-40m_sft_FINAL.pt
   params:
     profile_name: verabey-40m
-    no_compile: true
+    no_compile: false
     max_steps: 200
 global_params: {}

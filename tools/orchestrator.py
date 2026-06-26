@@ -234,6 +234,8 @@ def pipeline(
                 stage_params=merged_params,
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             typer.echo(typer.style(f"❌ Stage {stage_spec.name} setup() failed: {type(e).__name__}: {e}", fg=typer.colors.RED))
             log_event("stage_failed", stage=stage_spec.name, phase="setup", error=str(e))
             raise typer.Exit(code=1)
@@ -243,6 +245,8 @@ def pipeline(
         except SystemExit:
             raise
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             typer.echo(typer.style(f"❌ Stage {stage_spec.name} run() failed: {type(e).__name__}: {e}", fg=typer.colors.RED))
             log_event("stage_failed", stage=stage_spec.name, phase="run", error=str(e))
             raise typer.Exit(code=1)

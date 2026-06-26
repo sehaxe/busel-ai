@@ -1,0 +1,23 @@
+model:
+  d_model: 768
+  n_layers: 8
+  n_heads: 8
+  expert_hidden: 1536
+  num_experts: 6
+  top_k: 1
+  vocab_size: 326
+  num_mtp_heads: 3
+  n_patches: 32
+  sct_rank: 32
+training:
+  warmup_steps: 5%
+  learning_rate_muon: 0.002
+  weight_decay: 0.1
+  grad_accum_steps: 2
+  wsd_decay_frac: 0.1
+  lotus_rank: 32
+  max_steps: auto
+  target_tok_per_param: 80
+data:
+  batch_size: 2048
+  chunk_size: 16384

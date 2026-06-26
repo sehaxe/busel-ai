@@ -7,6 +7,7 @@ import os
 import json
 import random
 import platform
+from pathlib import Path
 from torch.utils.data import IterableDataset, DataLoader
 
 try:
@@ -286,8 +287,10 @@ def get_busel_dataloader(data_path, chunk_size, batch_size, start_file_idx=0, st
     dataset = RustByteStreamDataset(data_path, chunk_size, start_file_idx, start_byte_offset, mix_weights=mix_weights)
     use_pin = torch.cuda.is_available()
     if num_workers is None:
-        # ponytail: mmap is zero-CPU — workers add RAM overhead with no benefit
-        num_workers = 0
+        _files = list(Path(data_path).iterdir()) if Path(data_path).is_dir() else []
+        use_rust = HAS_RUST_IO and all(f.suffix not in ('.parquet', '.jsonl') for f in _files)
+        # ponytail: ByteStreamer is picklable PyO3 — 2 workers overlap data fetch with GPU compute
+        num_workers = min(2, os.cpu_count() or 1) if use_rust else 0
 
     collate_fn = collate_packed_batch if use_packing else collate_busel_batch
     return DataLoader(

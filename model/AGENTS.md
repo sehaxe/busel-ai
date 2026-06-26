@@ -79,6 +79,16 @@ model/
 - **NEVER** set `backward_ratio=0.0` with `selective_backward=True` — the layer loop would select 0 layers (clamped to `max(1, ...)`). Gradient still flows through the mAR residual identity path even when all layer forwards run under `no_grad`.
 - **NEVER** use `return X * scale` in `_newton_schulz_core` — the NS bugfix (v8.5) proved that rescaling by the Frobenius norm after orthogonalization blows up singular values (SV max from ~1.2 to ~73.5). Return `X` directly.
 
+## FUSED TRAINING PATH (2026-06-25)
+- **FusedBitLinearFunction** in `layers.py:253` — replaces chain of 4+ autograd nodes with one `torch.autograd.Function`. Saves only `x, w, gamma` (~0.15GB per layer at batch=1024) instead of ~8 intermediates (~0.6GB). Backward recomputes all intermediates via STE (§2.2 of BitNet a4.8 paper). Enabled by `_BITLINEAR_CONFIG["use_fused_training"] = True` (default).
+- ~4× less activation memory per BitLinear call. Frees VRAM for larger batch or wider model.
+- **Tequila backward fix:** `grad_output.sum(dim=(0, 1)).unsqueeze(1)` — was `sum(dim=0).unsqueeze(1)` causing shape mismatch (RuntimeError) on batched inputs. Now broadcasts correctly.
+
+## SPARSE-BITNET 6:8 (2026-06-25)
+- `_BITLINEAR_CONFIG["use_sparse_bitnet"]` flipped to `True` (was `False`). Per Sparse-BitNet paper (Zhang et al. 2025, Microsoft Research): magnitude-based 6:8 mask from master weights, dynamic per-step recomputation, Dual STE (gradients flow through masked weights), quant-then-mask order.
+- 6:8 = 75% density → ~25% fewer FLOPs on linear layers. Paper reports +0.17–0.32 PPL degradation at 0.5B–3B scale (near-zero for busel's sub-100M profiles). No sparse tensor cores needed; benefit is arithmetic FLOPs reduction.
+- Implementation: `w_flat.reshape(-1, 8)` → top-6 per block → mask applied after ternary quant. Matches Algorithm 2/WeightQuantMasked from paper.
+
 ## NOTES
 - **GDN-2 fallback:** If `fla.ops.gdn2` unavailable OR not CUDA, falls back to `stable_gdn2_recurrent_jit` (slow but correct)
 - **SeRoPE:** Real-imaginary pairing `[..., 0::2]` and `[..., 1::2]` for rotary embeddings

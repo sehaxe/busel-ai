@@ -7,30 +7,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fla.ops.gdn2 import fused_recurrent_gdn2
-try:
-    from fla.ops.gdn2 import chunk_gdn2
-    _HAS_CHUNK_GDN2 = True
-except ImportError:
-    _HAS_CHUNK_GDN2 = False
 from model.layers import BitLinear_a4_8, H_BitLinear, RMSNorm, nvtx_range_push, nvtx_range_pop
 from busel_registry import register
+
+# GDN-2 Triton kernel: NVIDIA chunk_gdn2 (Blackwell-stable) or PyTorch fallback
+try:
+    from model.gdn2_chunk import chunk_gdn2 as _chunk_gdn2
+    _GDN2_TRITON = True
+except Exception:
+    from model.gdn2 import gdn2_recurrent as _gdn2_recurrent
+    _GDN2_TRITON = False
 
 
 def _sdpa(q, k, v, is_causal: bool = False):
     return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-
-
-# ponytail: helper to isolate fla Triton kernels from dynamo tracing (SymNode crash)
-@torch.compiler.disable
-def _gdn2_kernel_call(q, k, v, g, b, w, alpha_a, use_chunk):
-    _gdn2_fn = chunk_gdn2 if (use_chunk and _HAS_CHUNK_GDN2) else fused_recurrent_gdn2
-    return _gdn2_fn(
-        q.float(), k.float(), v.float(), g.float(), b.float(), w.float(),
-        A_log=alpha_a.squeeze(-1),
-        use_gate_in_kernel=True,
-        use_qk_l2norm_in_kernel=True,
-    )[0]
 
 
 @register("attention", "gdn2")
@@ -106,9 +96,11 @@ class BulbaGDN2SeRoPEBlock(nn.Module):
         b = torch.sigmoid(self.b_proj(x)).view(B, T, self.n_heads, self.d_k) * 2.0  # [0,2] — Gated DeltaNet-2 negative eigenvalues
         w = torch.sigmoid(self.w_proj(x)).view(B, T, self.n_heads, self.d_v)         # [0,1] — write gate unchanged
         g = self.alpha_proj(x).view(B, T, self.n_heads, self.d_k)
-        out = _gdn2_kernel_call(q, k, v, g, b, w, 
-                                self.alpha_a.clamp(min=-10.0, max=0.0),  # prevent exp(alpha)→Inf
-                                self.training).to(x.dtype)
+        if _GDN2_TRITON:
+            out, _ = _chunk_gdn2(q.float(), k.float(), v.float(), g.float(), b.float(), w.float(),
+                use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, A_log=self.alpha_a)
+        else:
+            out = _gdn2_recurrent(q, k, v, g, b, w, self.alpha_a)
         out = out.view(B, T, -1)
             
         gate = torch.sigmoid(self.g_proj_up(self.g_proj_down(x)))

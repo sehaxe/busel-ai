@@ -1,0 +1,9 @@
+name: pretrain-only
+stages:
+- name: pretrain
+  data_preset: "@PROFILE@"
+  params:
+    profile_name: "@PROFILE@"
+    no_compile: true
+    max_steps: auto
+global_params: {}

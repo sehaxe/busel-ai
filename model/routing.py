@@ -30,9 +30,9 @@ class MoDSequenceRouter(nn.Module):
     def forward(self, x):
         if self.capacity_factor >= 1.0:
             return None, None, None, 0.0
-        x_detached = x.detach().float()
+        x_detached = x.detach()
         x_detached = torch.nan_to_num(x_detached, nan=0.0, posinf=1e4, neginf=-1e4)
-        logits = self.router(x_detached).squeeze(-1)
+        logits = self.router(x_detached).float().squeeze(-1)
         # ponytail: Gumbel noise for exploration — prevents router from
         # converging to same tokens (→ logit ceiling → zero gradient → NaN @ step 170)
         if self.training:
@@ -109,18 +109,18 @@ class BulbaTernaryTitanMoE(nn.Module):
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
         # Expert dispatch — ponytail: pre-sort tokens by expert for batched FFN calls
-        routed_output = torch.zeros_like(x_enriched)
         B, T, D = x_enriched.shape
-        flat_indices = topk_indices.reshape(-1)          # (B*T*top_k,)
+        n_total = B * T * self.top_k
+        flat_indices = topk_indices.reshape(-1)          # (n_total,)
         flat_tokens = x_enriched.unsqueeze(2).expand(-1, -1, self.top_k, -1).reshape(-1, D)
-        flat_weights = topk_weights.reshape(-1)           # (B*T*top_k,)
+        flat_weights = topk_weights.reshape(-1)           # (n_total,)
 
         sort_idx = flat_indices.argsort(stable=True)
         sorted_tokens = flat_tokens[sort_idx]
         sorted_weights = flat_weights[sort_idx]
-        sorted_indices = flat_indices[sort_idx]
 
         counts = torch.bincount(flat_indices, minlength=self.num_experts)
+        routed_output_flat = torch.zeros(n_total, D, device=x.device, dtype=x.dtype)
         offset = 0
         for i in range(self.num_experts):
             n = int(counts[i].item())
@@ -128,8 +128,9 @@ class BulbaTernaryTitanMoE(nn.Module):
                 batch = sorted_tokens[offset:offset + n]
                 out = self.routed_experts[i](batch)
                 w = sorted_weights[offset:offset + n].unsqueeze(-1)
-                routed_output.view(-1, D)[sort_idx[offset:offset + n]] = (out * w).to(routed_output.dtype)
+                routed_output_flat[sort_idx[offset:offset + n]] = (out * w).to(routed_output_flat.dtype)
                 offset += n
+        routed_output = routed_output_flat.reshape(B, T, self.top_k, D).sum(dim=2)
         
         # Load-balancing: Loss-Free bias delta (no aux loss — Wang et al. 2024)
         aux_loss = torch.tensor(0.0, device=x.device)

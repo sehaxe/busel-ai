@@ -15,8 +15,9 @@ class buselPretrainConfig:
     top_k: int = 1
     vocab_size: int = 326
     n_hyper: int = 2
-    num_mtp_heads: int = 3  # 4 heads (t+1..t+4). Set 1 for max speed.
+    num_mtp_heads: int = 3  # MTP-3: main + 2 extra. b1/b2/b3 — всё что внутри stride-4 окна. b4 = anchor следующего патча, тавтология.
     nsa_n_heads: int = 16  # NSA attention requires heads divisible by 16
+    n_patches: int = 64     # patches per sequence: 16=fast/compressed, 64=balanced, 256=rich
     
     # Data
     data_path: str = "data_train"
@@ -42,7 +43,7 @@ class buselPretrainConfig:
     selective_backward: bool = True
     backward_ratio: float = 0.5
     use_differential_attention: bool = False
-    use_dispersion_loss: bool = True
+    use_dispersion_loss: bool = False  # ponytail: −2-5% step time, −500 MB VRAM; enable per-profile if needed
     dispersion_weight: float = 0.1
     dispersion_temperature: float = 2.0
     use_tequila: bool = False
@@ -52,16 +53,16 @@ class buselPretrainConfig:
     progressive_freeze: bool = True
     freeze_threshold: float = 0.5
     use_ascii_curriculum: bool = True
-    sct_rank: int = 128  # SCT rank — arXiv:2604.00733 sweet spot: 11.7× compression, best PPL
+    sct_rank: int = 32  # empirically optimal — 6.8× better eff/fact ratio vs full FFN
     use_matmul_free: bool = False  # ponytail: off — SCT gives better quality. Enable for max speed.
-    use_fused_training: bool = False  # off — hysteresis disabled by fused, causes divergence
+    use_fused_training: bool = True  # fused autograd.Function — ~2000 MB peak VRAM saved. Disables hysteresis+SR-STE.
     use_dropbp: bool = True
     dropbp_prob: float = 0.3
     
     # Optimizer (always SF-NorMuon)
     use_ema: bool = True
     ema_decay: float = 0.999
-    lotus_rank: int = 8
+    lotus_rank: int = 32  # empirically optimal — 98% of full Muon quality at 4-8× less memory
     lr_multipliers: dict | None = None
     min_lr_ratio: float = 0.1
     lr_schedule: str = "wsd"
@@ -77,7 +78,7 @@ class buselPretrainConfig:
     # Perf
     inductor_cache_dir: str = "~/.cache/busel/inductor"
     inductor_cache_clean: bool = False  # persist cache across runs
-    inductor_cache_max_gb: float = 4.0
+    inductor_cache_max_gb: float = 0.25
     keep_last_n: int = 5
     dynamic_compile: bool = True
     grad_ckpt_every: int = 2  # gradient checkpointing: 2 = every other layer

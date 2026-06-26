@@ -8,6 +8,12 @@ name = "busel"
 crate-type = ["cdylib"]
 path = "lib.rs"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module"] }
 memmap2 = "0.9"

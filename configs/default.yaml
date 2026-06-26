@@ -1,13 +1,9 @@
 global:
-  project_name: "busel"
-  device: "cuda"
+  project_name: busel
+  device: cuda
   seed: 42
-  precision: "bf16"
-
+  precision: bf16
 profiles:
-  # ═══════════════════════════════════════════════════════════════════
-  # chizh-8m — мини-тест (~9M SCT-32)
-  # ═══════════════════════════════════════════════════════════════════
   chizh-9m:
     model:
       d_model: 384
@@ -18,36 +14,38 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 4
+      num_mtp_heads: 3               # MTP-3: только +1/+2/+3, b4 — anchor следующего
+      n_patches: 32
       selective_backward: false
       backward_ratio: 1.0
     data:
-      data_path: "data_train"
-      chunk_size: 4096        # мин 512 байт для патчей
-      batch_size: 4096         # макс throughput для scaling laws
-      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+      data_path: data_train
+      chunk_size: 16384
+      batch_size: 4096
+      mix_weights:
+        fineweb: 0.6
+        cosmopedia: 0.1
+        wiki: 0.3
     training:
       max_steps: 500
-      warmup_steps: "5%"
+      warmup_steps: 5%
       min_lr_ratio: 0.3
       learning_rate_muon: 0.001
-      learning_rate_adamw: 0.00005
+      learning_rate_adamw: 5.0e-05
       weight_decay: 0.1
-      grad_accum_steps: 4
-      mod_capacity: 0.5        # ponytail: temp — test MoD router fix
+      grad_accum_steps: 1
+      mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: false
       use_rho_loss: false
       use_ascii_curriculum: true
-      lr_schedule: "cosine"
-      sct_rank: 32            # минимум по SCT paper для 1.7B → масштабируем вниз
+      lr_schedule: cosine
+      sct_rank: 32
+      lotus_rank: 32
+      use_dropbp: true
     perf:
       keep_last_n: 1
       grad_ckpt_every: 2
-
-  # ═══════════════════════════════════════════════════════════════════
-  # verabey-40m — GPT-2-mini эквивалент (40M SCT-32, 128M эффект.)
-  # ═══════════════════════════════════════════════════════════════════
   verabey-40m:
     model:
       d_model: 512
@@ -58,40 +56,42 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 6
+      num_mtp_heads: 3               # MTP-3: b1/b2/b3 на сдвигах +1/+2/+3. b4 (shift+4) — anchor следующего патча, тавтология.
+      n_patches: 32
       selective_backward: true
-      backward_ratio: 0.5
+      backward_ratio: 0.5            # Оставляем 0.5. Это дает оптимальный баланс скорости (-44% времени шага) и качества
       nsa_n_heads: 16
+      progressive_freeze: true       # ВКЛЮЧЕНО. Постепенно замораживает до 75% слоев к концу обучения, стабилизируя веса и ускоряя финал
     data:
-      data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 4096         # 8192 OOM на 12 слоях GDN-2+SCT+MoE
-      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+      data_path: data_train
+      chunk_size: 16384
+      batch_size: 128              # 15GB RAM — консервативно
+      mix_weights:
+        fineweb: 0.6
+        cosmopedia: 0.1
+        wiki: 0.3
     training:
-      max_steps: "auto"
-      target_tok_per_param: 80
-      warmup_steps: "5%"
+      max_steps: auto
+      target_tok_per_param: 80       # Оптимальный объем токенов для быстрого и качественного обучения 40M модели
+      warmup_steps: 5%
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 4
+      grad_accum_steps: 5            # 160×5=800 — примерно как было 768, 5 микро-батчей вместо 6
       mod_capacity: 0.5
       mod_interval: 1
-      use_dispersion_loss: false
+      use_dispersion_loss: false     # ВЫКЛЮЧЕНО: −2-5% времени, −500 MB VRAM. Включить при финальной доводке.
       use_rho_loss: false
       use_ascii_curriculum: true
-      lr_schedule: "cosine"
+      lr_schedule: wsd               # Изменено с cosine на wsd (Warmup-Stable-Decay) для лучшей финальной сходимости
+      wsd_decay_frac: 0.1
       sct_rank: 32
-      lotus_rank: 8
+      lotus_rank: 32
       use_dropbp: true
     perf:
       keep_last_n: 3
-      grad_ckpt_every: 3
-
-  # ═══════════════════════════════════════════════════════════════════
-  # sokal-120m — на ночь (~120M SCT-128, ~8 часов)
-  # ═══════════════════════════════════════════════════════════════════
+      grad_ckpt_every: 1            # 2→1: чекпоинтим каждый слой, -~500 MB пикового VRAM. Даёт стабильность BS=160.
   sokal-120m:
     model:
       d_model: 768
@@ -102,39 +102,40 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
+      num_mtp_heads: 3               # MTP-3: только сдвиги +1/+2/+3, b4 — тавтология
+      n_patches: 32
       selective_backward: true
       backward_ratio: 0.5
       nsa_n_heads: 16
     data:
-      data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 1536
-      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+      data_path: data_train
+      chunk_size: 16384
+      batch_size: 2048
+      mix_weights:
+        fineweb: 0.6
+        cosmopedia: 0.1
+        wiki: 0.3
     training:
-      max_steps: "auto"
-      warmup_steps: "5%"
+      max_steps: auto
+      warmup_steps: 5%
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 4
+      grad_accum_steps: 2
       mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: true
-      use_rho_loss: false  # ponytail: RHO-Loss → NaN
+      use_rho_loss: false
       use_ascii_curriculum: true
-      lr_schedule: "wsd"
+      lr_schedule: wsd
       wsd_decay_frac: 0.1
-      sct_rank: 128
+      sct_rank: 32
       use_dropbp: true
+      lotus_rank: 32
     perf:
       keep_last_n: 4
       grad_ckpt_every: 3
-
-  # ═══════════════════════════════════════════════════════════════════
-  # kruk-210m — сильная модель (~210M SCT-128)
-  # ═══════════════════════════════════════════════════════════════════
   kruk-210m:
     model:
       d_model: 768
@@ -145,43 +146,43 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
+      num_mtp_heads: 3               # MTP-3
+      n_patches: 32
       selective_backward: true
       backward_ratio: 0.5
       progressive_freeze: true
       nsa_n_heads: 16
     data:
-      data_path: "data_train"
-      chunk_size: 4096
-      batch_size: 768
-      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+      data_path: data_train
+      chunk_size: 16384
+      batch_size: 1024
+      mix_weights:
+        fineweb: 0.6
+        cosmopedia: 0.1
+        wiki: 0.3
     training:
       max_steps: auto
-      target_tok_per_param: 80  # overrides scaling law 37 → 80 tok/param
-      warmup_steps: "5%"
+      target_tok_per_param: 80
+      warmup_steps: 5%
       min_lr_ratio: 0.3
-      learning_rate_muon: 0.0015  # LR-finder: stable up to 0.01 on clean model; 0.0015 with all features
+      learning_rate_muon: 0.0015
       learning_rate_adamw: 0.00015
       weight_decay: 0.1
-      grad_accum_steps: 4
+      grad_accum_steps: 2
       mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: false
-      use_rho_loss: false  # ponytail: NaN at step~177; diagnostic 200 steps clean without
+      use_rho_loss: false
       use_ascii_curriculum: true
-      lr_schedule: "cosine"
+      lr_schedule: cosine
       wsd_decay_frac: 0.1
-      sct_rank: 128
-      lotus_rank: 8  # proven default, 85% quality at 64× less memory
+      sct_rank: 32
+      lotus_rank: 32
       use_dropbp: true
-      debug: false  # true = NaN checks + weight diag; false = max training speed
+      debug: false
     perf:
       keep_last_n: 5
       grad_ckpt_every: 3
-
-  # ═══════════════════════════════════════════════════════════════════
-  # busel-365m — флагман (~365M SCT-128)
-  # ═══════════════════════════════════════════════════════════════════
   busel-365m:
     model:
       d_model: 1024
@@ -192,33 +193,38 @@ profiles:
       top_k: 1
       vocab_size: 326
       n_hyper: 2
-      num_mtp_heads: 6        # 6 голов — оптимально для байт-модели (t+24 байта)
+      num_mtp_heads: 3               # MTP-3
+      n_patches: 32
       selective_backward: true
       backward_ratio: 0.5
       progressive_freeze: true
       nsa_n_heads: 16
     data:
-      data_path: "data_train"
-      chunk_size: 4096
+      data_path: data_train
+      chunk_size: 16384
       batch_size: 448
-      mix_weights: {fineweb: 0.60, cosmopedia: 0.10, wiki: 0.30}
+      mix_weights:
+        fineweb: 0.6
+        cosmopedia: 0.1
+        wiki: 0.3
     training:
-      max_steps: "auto"
-      warmup_steps: "auto"
+      max_steps: auto
+      warmup_steps: auto
       min_lr_ratio: 0.3
       learning_rate_muon: 0.002
       learning_rate_adamw: 0.0002
       weight_decay: 0.1
-      grad_accum_steps: 4
+      grad_accum_steps: 2
       mod_capacity: 0.5
       mod_interval: 1
       use_dispersion_loss: true
-      use_rho_loss: false  # ponytail: RHO-Loss → NaN
+      use_rho_loss: false
       use_ascii_curriculum: true
-      lr_schedule: "wsd"
+      lr_schedule: wsd
       wsd_decay_frac: 0.1
-      sct_rank: 128
+      sct_rank: 32
       use_dropbp: true
+      lotus_rank: 32
     perf:
       keep_last_n: 5
       grad_ckpt_every: 3

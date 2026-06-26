@@ -10,21 +10,23 @@
 
 | Компонент | Реализация |
 |-----------|-----------|
-| **Веса** | 1.58-bit ternary (Stepped ReLU STE + SCT-128) |
+| **Веса** | 1.58-bit ternary + **6:8 Sparse-BitNet** (25% FLOPs, ≈0 loss) |
 | **Вокабуляр** | 326 байт (256 raw + 70 special) — без BPE |
-| **Активации** | INT8 (BitNet v2 spec) |
+| **Активации** | INT8 (BitNet v2 spec), **fused** training path (4× меньше памяти) |
 | **Внимание** | GDN-2 (3:1 ratio) + MLA (d_c=128) — 16 слоёв |
 | **MoE** | Top-1 с Blackboard Memory + MoD 0.5, 6 экспертов |
 | **Residuals** | Manifold-Constrained Attention Residuals (Sinkhorn-Knopp на Birkhoff polytope) |
 | **Предикция** | Multi-Token Prediction (6 голов — t+24 байта) |
-| **Оптимизатор** | SF-NorLotusMuon (LOTUS rank-128) + FP8 AdamW (torchao) |
+| **Оптимизатор** | SF-NorLotusMuon (LOTUS rank-32) + FP8 AdamW (torchao) |
 
 ### Технологии обучения (все ON по умолчанию)
 
 | Технология | Эффект |
 |-----------|--------|
-| **SCT rank-128** | Сжатие FFN в 6-8× без потери качества (arXiv:2604.00733) |
-| **LOTUS rank-128** | Muon-состояние ×40 меньше памяти, колоночная норм. |
+| **SCT rank-32** | Сжатие FFN в 6-8× без потери качества (arXiv:2604.00733) |
+| **LOTUS rank-32** | Muon-состояние ×40 меньше памяти, колоночная норм. |
+| **Fused BitLinear** | Единый autograd Function — 4× меньше активаций на слой |
+| **Sparse-BitNet 6:8** | 25% FLOPs на линейных слоях, ≈0 loss (MSR 2025) |
 | **DropBP** | 30% слоёв пропускаются в backward |
 | **LCSB** | 50% слоёв без градиента (-44% времени шага) |
 | **MoD 0.5** | 50% токенов пропускаются |
@@ -45,7 +47,7 @@
 | `kruk-210m` | 768×16 | 210M | 14 GB | 768×4 | ~24ч, мощный |
 | `busel-365m` | 1024×18 | 365M | 20+ GB | 256×4 | Флагман |
 
-Все профили: SCT rank-128, LOTUS rank-128, MoD 0.5, MTP-6, GDN-2:MLA=3:1.
+Все профили: SCT rank-32, LOTUS rank-32, Sparse-BitNet 6:8, fused training, MoD 0.5, MTP-6, GDN-2:MLA=3:1.
 
 ---
 

@@ -1,0 +1,24 @@
+[package]
+name = "busel-burn"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["cuda"]
+cuda = []
+
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[dependencies]
+burn = { version = "0.21", default-features = false, features = ["std", "cuda", "autodiff", "train", "tui"] }
+burn-cuda = { version = "0.21", default-features = false, features = ["std"] }
+memmap2 = "0.9"
+rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+

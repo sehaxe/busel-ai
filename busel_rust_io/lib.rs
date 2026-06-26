@@ -2,7 +2,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::types::PyModuleMethods;
 use std::fs::File;
-use std::io;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
+use std::thread;
 use memmap2::Mmap;
 
 // ponytail: ternary packing 5:8 — 5 ternary values {-1,0,1} in 1 byte (3^5=243<256). 20× weight compression.
@@ -113,9 +115,61 @@ fn get_cpu_count() -> PyResult<usize> {
     Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
+/// Background-reader byte streamer. 64KB stack thread, 1-chunk cap channel.
+/// NO madvise — the reader thread naturally keeps ~1 chunk ahead in page cache.
+/// MADV_SEQUENTIAL on a 9.7GB file with N files × N threads fills page cache → OOM.
+#[pyclass]
+struct PrefetchedByteStreamer {
+    rx: Mutex<Receiver<Vec<u8>>>,
+    position: usize,
+}
+
+#[pymethods]
+impl PrefetchedByteStreamer {
+    #[new]
+    fn new(file_path: String, chunk_size: usize, start_offset: usize) -> PyResult<Self> {
+        let file = File::open(&file_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let len = mmap.len();
+
+        thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut current = start_offset;
+                while current < len {
+                    let end = std::cmp::min(current + chunk_size, len);
+                    let mut chunk = mmap[current..end].to_vec();
+                    if chunk.len() < chunk_size {
+                        chunk.resize(chunk_size, 0u8);
+                    }
+                    current = end;
+                    if tx.send(chunk).is_err() { break; }
+                }
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("thread: {e}")))?;
+
+        // ponytail: keep file alive (macOS mmap invalidation)
+        let _ = file;
+
+        Ok(PrefetchedByteStreamer { rx: Mutex::new(rx), position: start_offset })
+    }
+
+    fn next_chunk(&mut self, _py: Python) -> Option<Vec<u8>> {
+        let chunk = self.rx.lock().ok()?.recv().ok()?;
+        self.position += chunk.len();
+        Some(chunk)
+    }
+
+    fn get_position(&self) -> usize {
+        self.position
+    }
+}
+
 #[pymodule]
 fn busel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ByteStreamer>()?;
+    m.add_class::<PrefetchedByteStreamer>()?;
     m.add_function(wrap_pyfunction!(pack_ternary_5_8, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_ternary_5_8, m)?)?;
     m.add_function(wrap_pyfunction!(ternary_matmul_cpu, m)?)?;

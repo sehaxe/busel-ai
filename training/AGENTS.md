@@ -36,7 +36,7 @@ training/
 | `_newton_schulz_core` | function | optimizer.py | Quintic NS iteration, 5 steps, transposed for tall matrices. **v8.5 bugfix:** removed the erroneous `return X * scale` rescaling that inflated singular values. |
 | `_compiled_newton_schulz` | function | optimizer.py | `@torch.compile(reduce-overhead)` on Linux+CUDA; eager fallback |
 | `_MuonBase` | base class | optimizer.py | **v8.5 refactored.** Base optimizer with momentum + NS orthogonalization + Muon+ column norm. Single `step()` loop. |
-| `LotusMuon` | Optimizer | optimizer.py | Rank-`lotus_rank` factorised Muon momentum. Reconstructs `m ≈ buf_p @ buf_q.T` on the fly before NS. **~85× less optimizer state** than full Muon at rank=8. |
+| `LotusMuon` | Optimizer | optimizer.py | Rank-`lotus_rank` factorised Muon momentum. Reconstructs `m ≈ buf_p @ buf_q.T` on the fly before NS. **~20× less optimizer state** than full Muon at rank=32. |
 | `NorLotusMuon` | Optimizer | optimizer.py | **Default Muon path.** Extends LotusMuon with `cautious_wd` (sign-aware weight decay masking). Always wrapped in `_ScheduleFreeWrapper`. |
 | `_ScheduleFreeWrapper` | wrapper | optimizer.py | Wraps any optimizer with SF-SGD (Defazio et al. 2024). Three internal states per param: x (Polyak avg), z (gradient state), y (interpolated forward). Always ON in `buselOptimizerEngine` via `sf_beta=0.9, sf_gamma_factor=2.0`. |
 | `buselOptimizerEngine` | class | optimizer.py | Splits params: 2D+!`router`+!`embed`→SF-NorLotusMuon; rest→FP8 AdamW. **6 sub-groups** for **decoupled per-layer LR multipliers**. SF always ON, FP8 AdamW always ON. |
@@ -64,7 +64,7 @@ training/
   - `"ffn"` / `"blackboard"` / `"moe"` → `ffn` group (mostly SF-NorLotusMuon; LR multiplier 1.0)
   - Attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `qkv`, `wk`, `wv`, `wq`) → `attn` group (SF-NorLotusMuon; LR multiplier 1.0); default fallback
   - LR multipliers: `{attn: 1.0, ffn: 1.0, mtp: 1.0, norm: 1.0, embed: 0.5, router: 0.5}` by default. Override via `buselPretrainConfig.lr_multipliers` or in the profile YAML.
-- **LOTUS rank (`lotus_rank`):** default 8. 6 = 60 % state, 8 = 85 %, 16 = ~95 % quality. Affects only SF-NorLotusMuon group.
+- **LOTUS rank (`lotus_rank`):** default 32. 16 = ~95 % quality, 32 = ~98 %, 64 = ~99.5 %. Affects only SF-NorLotusMuon group.
 - **LOTUS LR scale (`lotus_lr_scale`):** default 0.5. LOTUS effective LR = `lr_muon × lotus_lr_scale`. Compensates for the rank-r approximation.
 - **Muon momentum:** 0.95; NS steps: 5; weight_decay: dynamic (set by AutoPilot)
 - **FP8 AdamW weight_decay:** dynamic (set by AutoPilot on every step from `target_wd × wd_factor` curve). lr_adamw is 10× smaller than lr_muon.
@@ -107,7 +107,7 @@ training/
 - **`inject_noise`:** Gaussian `noise_scale × grad_norm` per param (only if `grad_norm > 1e-5`)
 - **Loss API contract:** `compute_pretrain_loss(self, logits, targets, mtp_logits_list=None, mtp_targets_list=None)` — MTP logits and targets are passed as **separate lists**. T1 has implicit 1.0, T2/T3/T4 use `[0.5, 0.25, 0.125]`.
 - **Liger fallback:** `importlib.util.find_spec("liger_kernel")` or try-except — auto-fallback to vanilla
-- **LOTUS rank memory (measured):** on Shpak (52.8 M params, 1024×1024 max weight), full Muon momentum = 2 MB; LOTUS rank-8 = 32 KB → **~64× per-param reduction, ~85× total**. Quality identical to full Muon.
+- **LOTUS rank memory (measured):** on Shpak (52.8 M params, 1024×1024 max weight), full Muon momentum = 2 MB; LOTUS rank-32 = 128 KB → **~16× per-param reduction, ~20× total**. Quality ~98% of full Muon.
 - **EMA cost (measured):** checkpoint size grows by ~model_size in EMA shadow (fp32). For shpak = ~211 MB per checkpoint. Eval-quality improvement: 10-15 % fewer steps to same loss.
 - **Decoupled LR empirical multipliers:** `{attn: 1.0, ffn: 1.0, mtp: 1.0, norm: 1.0, embed: 0.5, router: 0.5}`. The 0.5 on `embed` is critical — full-LR embed updates cause catastrophic forgetting in 1.58-bit. The 0.5 on `router` prevents router collapse.
 - **Stage framework phases:** pretrain → SFT → DPO → eval stages all implemented.

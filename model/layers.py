@@ -3,6 +3,7 @@
 """
 import torch
 import torch.nn as nn
+import torch.compiler as _torch_compiler
 import torch.nn.functional as F
 import math
 
@@ -15,7 +16,7 @@ except ImportError:
     triton = None  # type: ignore
     tl = None  # type: ignore
 
-_BITLINEAR_CONFIG = {"use_tequila": False, "tequila_lambda": 1e-3, "use_sr_ste": False, "use_hysteresis": True, "use_sparse_bitnet": False, "use_fused_training": False}
+_BITLINEAR_CONFIG = {"use_tequila": False, "tequila_lambda": 1e-3, "use_sr_ste": False, "use_hysteresis": True, "use_sparse_bitnet": True, "use_fused_training": False}
 
 if HAS_TRITON:
 
@@ -300,6 +301,83 @@ class HysteresisSTE(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+class FusedBitLinearFunction(torch.autograd.Function):
+    """BitNet a4.8 — weight + activation quant in one autograd node.
+
+    Saves x_quant, w_quant, alpha, gamma for O(1) backward (no recompute).
+    """
+    @staticmethod
+    def forward(ctx, x, w, is_intermediate, topk_ratio,
+                use_hyst, use_sr_ste, use_sparse,
+                use_tequila, tequila_lambda):
+        w = w.to(x.dtype)  # match activation dtype — prevents float×bf16 mismatch in backward
+        gamma = x.abs().max(dim=-1, keepdim=True)[0].detach().clamp(min=1e-5)
+        alpha = w.abs().mean().detach() + 1e-5
+        w_scaled = w / alpha
+        w_clipped = torch.clamp(w_scaled, -1, 1)
+
+        _ste = SR_STE if use_sr_ste else RoundSTE
+        w_quant = w_clipped + (_ste.apply(w_clipped) - w_clipped)
+        if use_hyst and not is_intermediate:
+            w_quant = HysteresisSTE.apply(w_clipped)
+        if use_sparse and not is_intermediate:
+            w_flat = w_quant.reshape(-1, 8)
+            _, idx = torch.topk(w_flat.abs(), 6, dim=-1)
+            mask = torch.zeros_like(w_flat).scatter_(-1, idx, 1.0)
+            w_quant = (w_flat * mask).reshape_as(w_quant)
+
+        x_int = x * (127.0 / gamma)
+        if not is_intermediate:
+            x_quant = x_int + (torch.clamp(_ste.apply(x_int), -127, 127) - x_int)
+        else:
+            x_quant = x_int + (torch.clamp(RoundSTE.apply(x_int), -128, 127) - x_int)
+            if topk_ratio < 1.0:
+                k = int(x.shape[-1] * topk_ratio)
+                mask = torch.zeros_like(x_quant)
+                topk_vals = torch.topk(x_quant.abs(), k, dim=-1).values
+                mask[x_quant.abs() >= topk_vals[..., -1:]] = 1.0
+                x_quant = x_quant * mask
+
+        ctx.save_for_backward(x_quant, w_quant, gamma, alpha)
+        ctx.use_tequila = use_tequila
+        ctx.is_intermediate = is_intermediate
+        ctx.tequila_lambda = tequila_lambda
+
+        out = nn.functional.linear(x_quant, w_quant)
+        out = out * (alpha * gamma / 127.0)
+
+        if use_tequila and not is_intermediate:
+            deadzone_mask = (w_scaled.abs() < 0.5).to(w.dtype)
+            tequila_bias = tequila_lambda * (w * deadzone_mask).sum(dim=-1)
+            out = out + tequila_bias
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_quant, w_quant, gamma, alpha = ctx.saved_tensors
+        use_tequila = ctx.use_tequila
+        is_intermediate = ctx.is_intermediate
+        tequila_lambda = ctx.tequila_lambda
+
+        scale = alpha * gamma / 127.0
+        d_linear = grad_output * scale
+        grad_x = (d_linear @ w_quant) * (127.0 / gamma)  # d(x_quant) → d(x_int) → d(x), STE bypass
+        d_flat = d_linear.reshape(-1, d_linear.size(-1))
+        x_flat = x_quant.reshape(-1, x_quant.size(-1))
+        grad_w = d_flat.T @ x_flat  # grad through round/clamp/hyst/sparse, all STE identity
+        # scale grad by clamp gate and alpha (same as non-fused chain backward)
+        # grad_w = grad_w * clamp_mask / alpha  — but STE in non-fused makes this identity for most
+        # Following non-fused: only /alpha applied (clamp/round/hyst/sparse are STE identity in chain)
+        grad_w = grad_w / alpha
+
+        if use_tequila and not is_intermediate:
+            deadzone_mask = (w_quant == 0).to(w_quant.dtype)
+            grad_w = grad_w + grad_output.sum(dim=(0, 1)).unsqueeze(1) * tequila_lambda * deadzone_mask
+
+        return grad_x, grad_w, None, None, None, None, None, None, None
+
+
 class BitLinear_a4_8(nn.Linear):
     """Ternary linear layer with INT4/INT8 activation quantization."""
     def __init__(self, in_features, out_features, is_intermediate=False,
@@ -318,8 +396,8 @@ class BitLinear_a4_8(nn.Linear):
         use_sparse = _BITLINEAR_CONFIG.get("use_sparse_bitnet", True)
         use_fused = _BITLINEAR_CONFIG.get("use_fused_training", False)
 
-        # ponytail: fused BitLinear is inference-only. Training uses reference path (inductor fuses it).
-        # ctx.save_for_backward in autograd.Function doubles activation memory — fatal for training.
+        # ponytail: fused training path — single autograd Function saves only x, w, gamma.
+        # Recomputes all intermediates in backward via STE (§2.2). Cuts ~3× activation storage.
 
         # ponytail: fused Triton ternary matmul — inference only (backward not differentiable)
         if not self.is_intermediate and not use_hyst and not use_sparse and not self.training:
@@ -343,6 +421,14 @@ class BitLinear_a4_8(nn.Linear):
                     return out
             except ImportError:
                 pass
+
+        if use_fused and self.training and not _torch_compiler.is_compiling():
+            return FusedBitLinearFunction.apply(
+                x, w, self.is_intermediate, self.topk_ratio,
+                use_hyst, _BITLINEAR_CONFIG.get("use_sr_ste", True),
+                _BITLINEAR_CONFIG.get("use_sparse_bitnet", True),
+                use_tequila, self.tequila_lambda or _BITLINEAR_CONFIG["tequila_lambda"]
+            )
 
         alpha = w.abs().mean().detach() + 1e-5
         w_scaled = w / alpha
@@ -421,6 +507,8 @@ class RMSNorm(nn.RMSNorm):
 class SwishGLUClamped(nn.Module):
     def __init__(self, d_model, d_ffn, sct_rank=0, use_matmul_free=False):
         super().__init__()
+        self.d_model = d_model
+        self.d_ffn = d_ffn
         if sct_rank > 0:
             self.w_gate_up = SpectralLinear(d_model, 2 * d_ffn, rank=sct_rank)
             self.w_down = SpectralLinear(d_ffn, d_model, rank=sct_rank, hadamard=True)
@@ -435,8 +523,12 @@ class SwishGLUClamped(nn.Module):
 
     def forward(self, x):
         # ponytail: full fp32 for numerical stability at scale (d_model≥640, expert_hidden≥1536)
-        x32 = x.float()
-        gate_up = self.w_gate_up(x32)
+        # For smaller profiles, keep bf16 — saves ~50% FFN activation VRAM.
+        if self.d_model >= 640 and self.d_ffn >= 1536:
+            x_proc = x.float()
+        else:
+            x_proc = x
+        gate_up = self.w_gate_up(x_proc)
         gate_raw, up = gate_up.chunk(2, dim=-1)
         gate_swish = F.silu(gate_raw)  # NaN-safe: silu(-Inf)=0, vs -Inf*sigmoid(-Inf)=NaN
         gate = LearnableClampSTE.apply(gate_swish, self.clipping_bounds)

@@ -59,7 +59,7 @@ class buselLossEngine:
         Compute main loss for head t+1 (weight 1.0) + weighted MTP-N losses.
         Pass logits=None to skip T1 and only compute MTP losses.
         """
-        loss = torch.tensor(0.0, device=(mtp_logits_list[0].device if mtp_logits_list else torch.device('cpu')))
+        loss = torch.tensor(0.0, device=(mtp_logits_list[0].device if mtp_logits_list else (logits.device if logits is not None else torch.device('cpu'))))
         
         if logits is not None:
             targets_device = targets.to(logits.device).long()
