@@ -15,15 +15,15 @@ pub struct BuselConfig {
     #[config(default = 3)] pub num_mtp_heads: usize,
     #[config(default = 32)] pub sct_rank: usize,
     #[config(default = 0.01)] pub weight_decay: f64,
-    #[config(default = 32)] pub batch_size: usize,
-    #[config(default = 1024)] pub chunk_size: usize,
+    #[config(default = 64)] pub batch_size: usize,
+    #[config(default = 256)] pub chunk_size: usize,
     #[config(default = 0.01)] pub learning_rate: f64,
     #[config(default = 500)] pub max_steps: usize,
     #[config(default = 0)] pub target_tok_per_param: usize,  // 0 = не использовать
     pub data_weights: Option<std::collections::HashMap<String, f64>>,
     #[config(default = 50)] pub warmup_steps: usize,
     #[config(default = 0.1)] pub wsd_decay_frac: f64,
-    #[config(default = 4)] pub grad_accum_steps: usize,
+    #[config(default = 1)] pub grad_accum_steps: usize,
     #[config(default = true)] pub use_moe: bool,
     #[config(default = 0)] pub dtopk_k: usize,
     #[config(default = true)] pub lotus: bool,
@@ -41,6 +41,13 @@ pub struct BuselConfig {
     #[config(default = false)] pub schedule_free: bool,
     #[config(default = 0.95)] pub sf_beta: f64,
     #[config(default = r#""pretrain".to_string()"#)] pub stage: String,
+    #[config(default = 0.0)] pub clip_norm: f64,
+    #[config(default = 128)] pub d_c: usize,
+    // DropBP + curriculum
+    #[config(default = 0.3)] pub dropbp_prob: f64,
+    #[config(default = false)] pub progressive_freeze: bool,
+    #[config(default = false)] pub ascii_curriculum: bool,
+    #[config(default = false)] pub chunk_growth: bool,
 }
 
 // Плоский YAML — только model / data / training секции, без global/profiles.
@@ -63,6 +70,9 @@ struct YamlModel {
     routing_free: Option<bool>,
     stage: Option<String>,
     lr_mult_embed: Option<f64>, lr_mult_router: Option<f64>,
+    d_c: Option<usize>,
+    dropbp_prob: Option<f64>, progressive_freeze: Option<bool>,
+    ascii_curriculum: Option<bool>, chunk_growth: Option<bool>,
 }
 #[allow(dead_code)]
 #[derive(serde::Deserialize, Default)]
@@ -81,6 +91,7 @@ struct YamlTraining {
     target_tok_per_param: Option<usize>,
     schedule_free: Option<bool>,
     sf_beta: Option<f64>,
+    clip_norm: Option<f64>,
 }
 #[allow(dead_code)]
 #[derive(serde::Deserialize, Default)]
@@ -169,6 +180,12 @@ impl BuselConfig {
         c.stage = m.stage.clone().unwrap_or_else(|| "pretrain".to_string());
         c.schedule_free = t.schedule_free.unwrap_or(false);
         c.sf_beta = t.sf_beta.unwrap_or(0.95);
+        c.clip_norm = t.clip_norm.unwrap_or(0.0);
+        c.d_c = m.d_c.unwrap_or(128);
+        c.dropbp_prob = m.dropbp_prob.unwrap_or(0.3);
+        c.progressive_freeze = m.progressive_freeze.unwrap_or(false);
+        c.ascii_curriculum = m.ascii_curriculum.unwrap_or(false);
+        c.chunk_growth = m.chunk_growth.unwrap_or(false);
         c
     }
 }

@@ -9,10 +9,13 @@ cuda = []
 
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 256
 strip = "symbols"
 panic = "abort"
+
+[patch.crates-io]
+burn-autodiff = { path = "vendor/burn-autodiff" }
 
 [dependencies]
 burn = { version = "0.21", default-features = false, features = ["std", "cuda", "autodiff", "train", "tui"] }
@@ -21,4 +24,9 @@ memmap2 = "0.9"
 rand = "0.10.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
+cubecl = { version = "0.10", default-features = false, features = ["cuda"] }
+burn-cubecl = { version = "0.21", default-features = false }
+half = "2.7.1"
+cubecl-zspace = "0.10.0"
+burn-backend = "0.21.0"
 

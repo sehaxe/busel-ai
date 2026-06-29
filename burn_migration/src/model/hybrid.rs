@@ -1,10 +1,12 @@
 // ⚙️ Гибридный оптимизатор: Muon+ (LOTUS rank-r momentum + NS + col_norm)
 // для 2D + AdamW для 1D. Все фичи через флаги. EMA встроена.
+// Gradient clipping: clip_norm > 0 включает — clip градиента по норме перед NS.
 use burn::{
     optim::{LearningRate, SimpleOptimizer},
     record::Record,
-    tensor::{backend::Backend, Tensor, Device},
+    tensor::{backend::Backend, Tensor, Device, Distribution},
 };
+use crate::grad_clip::clip_by_norm;
 
 // ── Настройки ──
 #[derive(Clone)]
@@ -20,6 +22,7 @@ pub struct HymCfg {
     pub lr_mult_router: f64,  // 0.5 — router
     pub d_byte: usize,        // для детекта embed по dims[1]
     pub num_experts: usize,   // для детекта router по dims[0]
+    pub clip_norm: f64,       // 0 = отключено, >0 = clip grad по norm перед NS
 }
 
 impl Default for HymCfg {
@@ -29,7 +32,7 @@ impl Default for HymCfg {
             adamw_1d: true, b1: 0.9, b2: 0.999, eps: 1e-8,
             ema: true, ema_decay: 0.999,
             lr_mult_embed: 0.5, lr_mult_router: 0.5,
-            d_byte: 128, num_experts: 6 }
+            d_byte: 128, num_experts: 6, clip_norm: 1.0 }
     }
 }
 
@@ -81,22 +84,38 @@ impl<B: Backend> SimpleOptimizer<B> for HymOpt {
             m: None, v: None, u: None, vt: None, ema: None, step: 0 });
         s.step += 1;
 
-        let new_param = if c.lotus && D == 2 {
-            // ── LOTUS rank-r + NS + col_norm ──
-            // Все ops на Tensor<B, D> — при D=2 matmul/transpose работают как 2D
+        let new_param = if D == 2 {
+            // ── Muon+: NS + col_norm → LOTUS rank-r ──
             let sh = grad.dims(); let (o, i) = (sh[0], sh[1]); let r = c.lotus_rank;
-            let lu = c.lr_muon * 0.01 / (i as f64).sqrt();
-            let lv = c.lr_muon * 0.01 / (o as f64).sqrt();
-            let u = s.u.clone().unwrap_or_else(|| Tensor::zeros([o, r], &grad.device()));
-            let v = s.vt.clone().unwrap_or_else(|| Tensor::zeros([i, r], &grad.device()));
-            let u2 = cn2(u + grad.clone().matmul(v.clone()) * lu);
-            let v2 = cn2(v + grad.clone().transpose().matmul(u2.clone()) * lv);
-            s.u = Some(u2.clone()); s.vt = Some(v2.clone());
-            let mom = u2.matmul(v2.transpose());
-            let upd = cn2(zpns(mom, c.ns_steps));
-            let adj = lr * c.lr_muon * (o as f64 / i as f64).max(1.0).sqrt();
-            tensor * (1.0 - lr * c.wd) - upd * adj
-        } else if c.adamw_1d && D < 2 {
+            // 0. Gradient clipping by norm (optional)
+            let grad = if c.clip_norm > 0.0 { clip_by_norm(grad, c.clip_norm) } else { grad };
+            // 1. Newton-Schulz orthogonalization of gradient (Muon)
+            let g = if c.ns_steps > 0 { zpns(grad.clone(), c.ns_steps) } else { grad.clone() };
+            // 2. Column norm (Muon+)
+            let g = cn2(g);
+            // 3. LOTUS rank-r momentum
+            if c.lotus {
+                let lu = c.lr_muon * 0.01 / (i as f64).sqrt();
+                let lv = c.lr_muon * 0.01 / (o as f64).sqrt();
+                if s.u.is_none() {
+                    let proj = Tensor::random([i, r], Distribution::Normal(0.0, 1.0), &grad.device());
+                    let u0 = cn2(grad.clone().matmul(proj));
+                    let v0 = cn2(grad.clone().transpose().matmul(u0.clone()));
+                    s.u = Some(u0); s.vt = Some(v0);
+                }
+                let u = s.u.as_ref().unwrap().clone();
+                let v = s.vt.as_ref().unwrap().clone();
+                let u2 = cn2(u + g.clone().matmul(v.clone()) * lu);
+                let v2 = cn2(v + g.clone().transpose().matmul(u2.clone()) * lv);
+                s.u = Some(u2.clone()); s.vt = Some(v2.clone());
+                let adj = lr * c.lr_muon * (o as f64 / i as f64).max(1.0).sqrt();
+                tensor * (1.0 - lr * c.wd) - u2.matmul(v2.transpose()) * adj
+            } else {
+                // Direct Muon+ (no rank-r compression)
+                let adj = lr * c.lr_muon;
+                tensor * (1.0 - lr * c.wd) - g * adj
+            }
+        } else if c.adamw_1d {
             // ── AdamW для 1D ──
             let b1 = c.b1; let b2 = c.b2; let ep = c.eps;
             let m = match s.m.clone() { Some(m) => m * b1 + grad.clone() * (1.0 - b1), None => grad.clone() };
@@ -152,8 +171,11 @@ fn zpns<B: Backend, const D: usize>(g: Tensor<B, D>, steps: usize) -> Tensor<B, 
     let dims = g.dims();
     let tall = dims[D - 2] > dims[D - 1];
     let mut x = if tall { g.swap_dims(D - 2, D - 1) } else { g };
-    let n = x.clone().powf_scalar(2.0).sum().sqrt().clamp_min(1e-7).into_scalar();
-    x = x.div_scalar(n);
+    // ponytail: tensor norm avoids GPU→CPU sync (was into_scalar = 54 drains/step).
+    let ns = x.clone().powf_scalar(2.0).sum().sqrt().clamp_min(1e-7);  // [1]
+    let ones: [usize; D] = core::array::from_fn(|_| 1);
+    let ns = ns.reshape(ones).expand(x.dims());
+    x = x / ns;
     for _ in 0..steps {
         let xt = x.clone().swap_dims(D - 2, D - 1);
         let a = x.clone().matmul(xt);

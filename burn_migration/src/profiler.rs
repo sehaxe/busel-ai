@@ -1,24 +1,6 @@
-// 📊 Профайлер: ms/step, GPU память, tok/s, loss per шаг. Всё в одном файле.
-// Использует std::time::Instant + nvidia-smi для GPU метрик.
+// 📊 Профайлер: ms/step, tok/s, loss per шаг.
 
 use std::time::Instant;
-use std::process::Command;
-
-static mut GPU_PEAK_MB: f64 = 0.0;
-
-fn gpu_mem_mb() -> f64 {
-    // nvidia-smi — самый надёжный способ без cuda-sys зависимостей
-    let out = Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.trim().parse::<f64>().unwrap_or(0.0)
-        }
-        Err(_) => 0.0,
-    }
-}
 
 pub struct Profiler {
     steps: usize,
@@ -55,14 +37,6 @@ impl Profiler {
         self.accum_tok += tok;
         self.step_start = Instant::now();
         self.losses.push(loss);
-
-        // GPU память (nvidia-smi вызов ~5ms, каждые 10 шагов)
-        if step % 10 == 0 {
-            let mem = gpu_mem_mb();
-            unsafe {
-                if mem > GPU_PEAK_MB { GPU_PEAK_MB = mem; }
-            }
-        }
     }
 
     pub fn finish(&self) {
@@ -70,7 +44,6 @@ impl Profiler {
         let n = self.losses.len().max(1);
         let avg_loss: f32 = self.losses.iter().sum::<f32>() / n as f32;
         let last_loss = self.losses.last().copied().unwrap_or(0.0);
-        let mem = unsafe { GPU_PEAK_MB };
 
         println!("\n═══ PROFILER ═══");
         println!("  шагов:      {} (из {})", n, self.steps);
@@ -79,7 +52,6 @@ impl Profiler {
         println!("  ms/step:    {:.1}", dt * 1000.0 / n as f64);
         println!("  loss avg:   {:.4}", avg_loss);
         println!("  loss last:  {:.4}", last_loss);
-        println!("  peak GPU:   {:.0} MB", mem);
         println!("═══ ═══════ ═══\n");
     }
 }

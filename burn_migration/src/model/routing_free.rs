@@ -1,7 +1,8 @@
-// Routing-Free MoE: 2 shared + N routed experts, blackboard, loss-free bias, entmax.
+// Routing-Free MoE: 2 shared + N routed experts, blackboard, loss-free bias.
+// ponytail: CPU argmax вместо topk_with_indices/argsort/one_hot — не реализованы в autodiff.
 use burn::{
-    module::Module,
-    tensor::{backend::Backend, IndexingUpdateOp, Tensor},
+    module::{Module, Param},
+    tensor::{backend::Backend, DType, Int, Tensor},
 };
 use super::bitlinear::BitLinear;
 use super::sct::SCTBitLinear;
@@ -16,18 +17,6 @@ fn gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
     burn::tensor::activation::gelu(x)
 }
 
-/// Entmax — sparse softmax on last dim.
-fn entmax<B: Backend, const D: usize>(logits: Tensor<B, D>) -> Tensor<B, D> {
-    let sorted = logits.clone().sort_descending(D - 1);
-    let css = sorted.clone().cumsum(D - 1);
-    let ks = Tensor::<B, D>::ones(logits.shape(), &logits.device()).cumsum(D - 1);
-    let tau = (css.clone() - 1.0) / ks.clamp_min(1.0);
-    let gt = sorted.greater(tau).float();
-    let sup = gt.clone().sum_dim(D - 1).clamp_min(1.0);
-    let tau_s = (css * gt).sum_dim(D - 1) - 1.0;
-    (logits - tau_s / sup).clamp_min(0.0)
-}
-
 #[derive(Module, Debug)]
 pub struct RoutingFreeMoE<B: Backend> {
     shared_a: [SCTBitLinear<B>; 3],
@@ -37,7 +26,7 @@ pub struct RoutingFreeMoE<B: Backend> {
     w_bb_read: BitLinear<B>,
     w_sh_gate: BitLinear<B>,
     w_router: BitLinear<B>,
-    pub expert_bias: Tensor<B, 1>,
+    pub expert_bias: Param<Tensor<B, 1>>,
     pub bias_delta: Option<Tensor<B, 1>>,
     pub ne: usize, pub tk: usize, pub eh: usize, pub dm: usize,
 }
@@ -50,7 +39,7 @@ impl<B: Backend> RoutingFreeMoE<B> {
             routed: (0..ne).map(|_| [sct(dm, eh, rank, dev), sct(dm, eh, rank, dev), sct(eh, dm, rank, dev)]).collect(),
             w_bb_gate: bl(dm, dm, dev), w_bb_read: bl(dm, dm, dev),
             w_sh_gate: bl(dm, dm, dev), w_router: bl(dm, ne, dev),
-            expert_bias: Tensor::zeros([ne], dev),
+            expert_bias: Param::from_tensor(Tensor::zeros([ne], dev)),
             bias_delta: None, ne, tk, eh, dm,
         }
     }
@@ -62,11 +51,12 @@ impl<B: Backend> RoutingFreeMoE<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 1>) {
         let [b, t, dm] = x.dims();
+        let ne = self.ne;
         let nt = b * t; let dev = x.device();
 
         // 1. Gated Shared Experts
         let gs = burn::tensor::activation::sigmoid(
-            self.w_sh_gate.forward(x.clone().detach()).mean_dim(2).unsqueeze::<3>()
+            self.w_sh_gate.forward(x.clone()).mean_dim(2).unsqueeze::<3>()
         );
         let h_sh = gs.clone() * Self::shared_ffn(&self.shared_a, x.clone())
             + (gs.neg().add_scalar(1.0)) * Self::shared_ffn(&self.shared_b, x.clone());
@@ -76,60 +66,72 @@ impl<B: Backend> RoutingFreeMoE<B> {
         let read_sig = self.w_bb_read.forward(h_sh.clone());
         let xe = x + gate_sig * read_sig;
 
-        // 3. Router + loss-free bias
-        let bias_bc = self.expert_bias.clone().unsqueeze::<3>();
+        // 3. Softmax router
+        let bias_bc = self.expert_bias.val().clone().unsqueeze::<3>();
         let logits = self.w_router.forward(xe.clone()) + bias_bc;
-        let rw = entmax(logits);
-        let (vals, idx) = rw.topk_with_indices(self.tk, 2);
-        let w = vals.clone() / (vals.clone().sum_dim(2).unsqueeze::<3>() + 1e-8);
+        let rw = burn::tensor::activation::softmax(logits, 2); // [B, T, ne]
 
-        // 4. Pre-sort dispatch
-        let n_total = nt * self.tk;
-        let all_tokens = xe.clone().unsqueeze::<4>().expand([b, t, self.tk, dm]).reshape([n_total, dm]);
-        let flat_idx = idx.reshape([n_total]);
-        let flat_w = w.reshape([n_total]);
+        // 4. Top-1 hard routing with CPU argmax
+        // differentiable weight = max of softmax per token
+        let max_w = rw.clone().max_dim(2); // [B, T, 1] — Burn сохраняет размерность
 
-        let sort_idx = flat_idx.clone().argsort(0);
-        let st = all_tokens.clone().select(0, sort_idx.clone());
-        let sw = flat_w.clone().select(0, sort_idx.clone());
+        // CPU argmax + sort (breaks autograd on routing decision)
+        let flat_rw: Vec<f32> = rw.clone().reshape([nt, ne])
+            .into_data().convert_dtype(DType::F32).to_vec().unwrap();
+        let mut expert_ids = vec![0i32; nt];
+        for i in 0..nt {
+            let base = i * ne;
+            let (ei, _) = (0..ne).map(|e| (e as i32, flat_rw[base + e]))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+            expert_ids[i] = ei;
+        }
+        // sort tokens by expert_id → contiguous blocks per expert
+        let mut order: Vec<usize> = (0..nt).collect();
+        order.sort_by_key(|&i| expert_ids[i]);
+        let perm: Vec<i32> = order.iter().map(|&i| i as i32).collect();
+        let inv_perm: Vec<i32> = {
+            let mut inv = vec![0i32; nt];
+            for (pos, &orig) in perm.iter().enumerate() {
+                inv[orig as usize] = pos as i32;
+            }
+            inv
+        };
+        // per-expert counts (CPU, used for slice ranges)
+        let mut counts = vec![0i32; ne];
+        for &e in &expert_ids { counts[e as usize] += 1; }
 
-        let counts = flat_idx.one_hot::<2>(self.ne).float().sum_dim(0);
-        // ponytail: CPU sync to get per-expert sizes for slice-based dispatch
-        let counts_cpu: Vec<i64> = counts.clone().reshape([self.ne]).int().into_data().to_vec().unwrap();
-        let mut out = Tensor::zeros([n_total, dm], &dev);
+        // dispatch tokens by permutation
+        let perm_t = Tensor::<B, 1, Int>::from_ints(perm.as_slice(), &dev);
+        let all_tokens = xe.reshape([nt, dm]);
+        let sorted_tokens = all_tokens.select(0, perm_t.clone());
+        // differentiable weights sorted the same way
+        let flat_max_w = max_w.reshape([nt, 1]);
+        let sorted_w = flat_max_w.select(0, perm_t.clone());
+
+        // per-expert FFN (contiguous slices in sorted order → cat avoids scatter/slice_assign)
+        let mut slices: Vec<Tensor<B, 2>> = Vec::new();
         let mut offset = 0usize;
-
-        for ei in 0..self.ne {
-            let n = counts_cpu[ei] as usize;
+        for ei in 0..ne {
+            let n = counts[ei] as usize;
             if n == 0 { continue; }
-            let batch = st.clone().slice([offset..(offset + n), 0..dm]);
-            let wgt = sw.clone().slice([offset..(offset + n)]).reshape([n, 1]);
-            let batch3 = batch.clone().unsqueeze::<3>();
+            let batch = sorted_tokens.clone().slice([offset..(offset + n), 0..dm]);
+            let wgt = sorted_w.clone().slice([offset..(offset + n)]).reshape([n, 1]);
+            let batch3 = batch.clone().unsqueeze_dim::<3>(1);
             let g = gelu(self.routed[ei][0].forward(batch3.clone()));
-            let result = self.routed[ei][2].forward(g * self.routed[ei][1].forward(batch3)).squeeze::<2>() * wgt;
-            let pos = sort_idx.clone().slice([offset..(offset + n)])
-                .reshape([n, 1]).expand([n, dm]);
-            out = out.scatter(0, pos, result, IndexingUpdateOp::Assign);
+            let result = self.routed[ei][2].forward(g * self.routed[ei][1].forward(batch3)).squeeze_dim::<2>(1) * wgt;
+            slices.push(result);
             offset += n;
         }
+        let sorted_out = Tensor::cat(slices, 0);
 
-        let dispatched = out.reshape([b, t, self.tk, dm]).sum_dim(2).squeeze::<3>();
-
-        // 5. Loss-free bias delta (stored for update_bias)
-        let f_i: Tensor<B, 1> = counts.reshape([self.ne]) / (nt as f64 + 1e-8);
-        let target = 1.0 / self.ne as f64;
-        let delta = (Tensor::ones_like(&f_i) * target - f_i) * 0.01;
-        unsafe {
-            let ptr = &self.bias_delta as *const Option<Tensor<B, 1>> as *mut Option<Tensor<B, 1>>;
-            ptr.write(Some(delta));
-        }
+        // unsort back to original token order
+        let inv_t = Tensor::<B, 1, Int>::from_ints(inv_perm.as_slice(), &dev);
+        let dispatched = sorted_out.select(0, inv_t).reshape([b, t, dm]);
 
         (h_sh + dispatched, Tensor::zeros([1], &dev))
     }
 
     pub fn update_bias(&mut self) {
-        if let Some(delta) = self.bias_delta.take() {
-            self.expert_bias = self.expert_bias.clone() * 0.99 + delta;
-        }
+        // ponytail: bias обновляется через softmax gradients — удалено CPU sync
     }
 }

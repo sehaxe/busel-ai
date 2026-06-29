@@ -1,7 +1,7 @@
 // Чекпоинты через Burn NamedMpkFileRecorder + best-loss tracking.
 use std::path::Path;
 use burn::{module::Module, record::{FullPrecisionSettings, NamedMpkFileRecorder}};
-use crate::types::Model;
+use crate::types::{Model, Optim};
 
 fn rec() -> NamedMpkFileRecorder<FullPrecisionSettings> {
     NamedMpkFileRecorder::<FullPrecisionSettings>::new()
@@ -22,10 +22,20 @@ pub fn load(profile: &str, mdl: Model) -> Model {
     }
 }
 
-/// Сохранить latest.
-pub fn save_latest(profile: &str, mdl: &Model) {
+/// Сохранить latest + состояние оптимизатора.
+pub fn save_latest(profile: &str, mdl: &Model, optim: &Optim) {
     std::fs::create_dir_all(dir(profile)).ok();
     mdl.clone().save_file(latest_path(profile), &rec()).ok();
+    optim.save_to_file(&format!("{}/optim.bin", dir(profile)));
+}
+
+/// Загрузить состояние оптимизатора.
+pub fn load_optim(profile: &str, optim: &mut Optim) {
+    let path = format!("{}/optim.bin", dir(profile));
+    if !Path::new(&path).exists() { return; }
+    if let Ok(cnt) = optim.load_from_file(&path) {
+        eprintln!("optim state loaded: {cnt} params");
+    }
 }
 
 /// Best-loss копия.

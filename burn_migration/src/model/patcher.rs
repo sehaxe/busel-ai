@@ -1,7 +1,7 @@
 // ByteFlow patcher: embed → GLU → boundary conv → pool → causal conv → norm.
 // Burn nn::Conv1d вместо ручного conv1d — 1 cuDNN вызов вместо k.
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::{RmsNorm, RmsNormConfig, conv::{Conv1d, Conv1dConfig}, PaddingConfig1d},
     tensor::{backend::Backend, Tensor, Int, Distribution},
 };
@@ -10,7 +10,7 @@ use super::bitlinear::BitLinear;
 
 #[derive(Module, Debug)]
 pub struct ByteFlowPatcher<B: Backend> {
-    embed: Tensor<B, 2>, gate_down: BitLinear<B>, gate_up: BitLinear<B>,
+    embed: Param<Tensor<B, 2>>, gate_down: BitLinear<B>, gate_up: BitLinear<B>,
     boundary_conv: Conv1d<B>, conv: Conv1d<B>,
     norm: RmsNorm<B>, n_patches: usize,
 }
@@ -19,7 +19,7 @@ impl<B: Backend> ByteFlowPatcher<B> {
     pub fn new(cfg: &BuselConfig, dev: &B::Device) -> Self {
         let d = cfg.d_byte; let dm = cfg.d_model; let g = (d / 4).max(1);
         Self {
-            embed: Tensor::random([cfg.vocab_size, d], Distribution::Normal(0.0, 0.02), dev),
+            embed: Param::from_tensor(Tensor::random([cfg.vocab_size, d], Distribution::Normal(0.0, 0.02), dev)),
             gate_down: BitLinear::new(g, d, false, dev),
             gate_up: BitLinear::new(d, g, false, dev),
             // boundary: d→1, k=3, same padding
@@ -35,7 +35,7 @@ impl<B: Backend> ByteFlowPatcher<B> {
     pub fn forward(&self, byte_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [b, t] = byte_ids.dims(); let d = self.embed.dims()[1];
         let flat = byte_ids.reshape([b * t, 1]);
-        let e = burn::tensor::module::embedding(self.embed.clone(), flat);
+        let e = burn::tensor::module::embedding(self.embed.val().clone(), flat);
         let mut x: Tensor<B, 3> = e.reshape([b, t, d]);
 
         // GLU gate
